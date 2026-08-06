@@ -148,18 +148,61 @@ impl Backend {
                 cmds
             }
 
-            // KWin has no CLI for activation; the supported route is a scripting call over
-            // D-Bus. We ship the script as an inline argument via kdotool when present, and
-            // fall back to wmctrl which works under KWin's X11 session.
+            // KWin activates windows through KWin scripting and nothing else. Its own D-Bus
+            // object `/KWin` offers `killWindow`, `queryWindowInfo` and friends but nothing
+            // that raises, and no tool shipping with Plasma raises a window from a command
+            // line. The supported route is: write a JavaScript file, `loadScript` it on
+            // `/Scripting` (`org.kde.kwin.Scripting`), then `run` it on the object the load
+            // returned — a temp file plus two D-Bus calls where the second needs the first
+            // one's return value. That cannot be expressed as independent commands tried until
+            // one succeeds, so we delegate to `kdotool`, which performs exactly that dance in
+            // a single invocation. It is third-party and unlikely to be installed, which is
+            // why `doctor` names it: on a Plasma Wayland session it is the whole ballgame.
+            //
+            // One dishonesty we cannot fix from here: kdotool exits zero when its search
+            // matched nothing, so once kdotool is installed the first command below always
+            // "succeeds" and the rest are only reached when kdotool is absent entirely.
+            //
+            // This backend is only ever picked for a *Wayland* Plasma session — a Plasma X11
+            // session detects as `x11` — so wmctrl comes last and is a long shot rather than
+            // the fallback it looks like. KWin still runs an X11 window manager for Xwayland
+            // under Wayland and honours `_NET_ACTIVE_WINDOW` from tools, so wmctrl does raise
+            // an Xwayland terminal; it simply cannot see a native Wayland one, which is what
+            // most terminals now are.
             Backend::KWin => {
                 let mut cmds = Vec::new();
                 if let Some(marker) = &target.title_marker {
-                    cmds.push(CommandSpec::new("kdotool", &["search", "--name", marker]));
+                    // `--limit 1` because without it kdotool activates every match in turn,
+                    // leaving whichever came last in front.
+                    cmds.push(CommandSpec::new(
+                        "kdotool",
+                        &[
+                            "search",
+                            "--limit",
+                            "1",
+                            "--name",
+                            &kdotool_pattern(marker),
+                            // `search` alone only prints window ids; activation is a chained
+                            // step and has to be asked for explicitly.
+                            "windowactivate",
+                        ],
+                    ));
                 }
                 cmds.push(CommandSpec::new(
                     "kdotool",
-                    &["search", "--class", &target.app_id],
+                    &[
+                        "search",
+                        "--limit",
+                        "1",
+                        "--class",
+                        // Anchored, so a configured `kitty` cannot activate `kitty-scratchpad`.
+                        &format!("^{}$", kdotool_pattern(&target.app_id)),
+                        "windowactivate",
+                    ],
                 ));
+                if let Some(marker) = &target.title_marker {
+                    cmds.push(CommandSpec::new("wmctrl", &["-a", marker]));
+                }
                 cmds.push(CommandSpec::new("wmctrl", &["-x", "-a", &target.app_id]));
                 cmds
             }
@@ -188,11 +231,52 @@ impl Backend {
             Backend::MacOs => &["open"],
             Backend::Hyprland => &["hyprctl"],
             Backend::Sway => &["swaymsg"],
-            Backend::KWin => &["kdotool", "wmctrl"],
+            // Deliberately not `wmctrl`: doctor treats this list as alternatives and goes green
+            // when any one of them is present, and a green tick for wmctrl alone would be a
+            // lie on the Wayland session this backend is chosen for.
+            Backend::KWin => &["kdotool"],
             Backend::X11 => &["wmctrl", "xdotool"],
             Backend::Unsupported => &[],
         }
     }
+}
+
+/// Make `text` safe to hand to `kdotool search`.
+///
+/// kdotool bakes the search term into the KWin script it generates as
+/// ``new RegExp(String.raw`<term>`)``, so the term is read twice: once as a JavaScript template
+/// literal, then as a regular expression. A bare backtick or `${` closes that literal and the
+/// script no longer parses — and a script that does not parse raises nothing while kdotool
+/// still exits zero, which is the worst failure we could ship. Backslash-escaping every regex
+/// metacharacter closes both holes at once: the character becomes literal to the regex, and
+/// `` \` `` / `\$` no longer terminate the template literal. `String.raw` is what makes this
+/// work, since it hands our backslashes to the regex engine untouched.
+fn kdotool_pattern(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '.' | '*'
+                | '+'
+                | '?'
+                | '^'
+                | '$'
+                | '{'
+                | '}'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '\\'
+                | '/'
+                | '`'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -225,7 +309,12 @@ mod tests {
 
     #[test]
     fn title_marker_is_tried_before_falling_back_to_the_application() {
-        for backend in [Backend::Hyprland, Backend::Sway, Backend::X11] {
+        for backend in [
+            Backend::Hyprland,
+            Backend::Sway,
+            Backend::KWin,
+            Backend::X11,
+        ] {
             let cmds = backend.raise_commands(&target_with_marker());
             assert!(
                 cmds.len() >= 2,
@@ -241,7 +330,12 @@ mod tests {
 
     #[test]
     fn without_a_marker_backends_fall_straight_through_to_app_matching() {
-        for backend in [Backend::Hyprland, Backend::Sway, Backend::X11] {
+        for backend in [
+            Backend::Hyprland,
+            Backend::Sway,
+            Backend::KWin,
+            Backend::X11,
+        ] {
             let cmds = backend.raise_commands(&target_without_marker());
             for cmd in &cmds {
                 let rendered = format!("{cmd:?}");
@@ -270,6 +364,72 @@ mod tests {
         let cmds = Backend::Sway.raise_commands(&target_without_marker());
         assert_eq!(cmds[0].program, "swaymsg");
         assert_eq!(cmds[0].args[0], "[app_id=\"com.mitchellh.ghostty\"] focus");
+    }
+
+    #[test]
+    fn kwin_tells_kdotool_to_activate_the_window_rather_than_merely_print_its_id() {
+        // `kdotool search …` on its own only lists matching windows. Activation is a chained
+        // step, and leaving it off is a raise that reports success and moves nothing.
+        let cmds = Backend::KWin.raise_commands(&target_with_marker());
+        for cmd in cmds.iter().filter(|c| c.program == "kdotool") {
+            assert!(
+                cmd.args.contains(&"windowactivate".to_string()),
+                "kdotool invocation does nothing: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kwin_reaches_for_kdotool_before_wmctrl_because_wmctrl_is_blind_to_wayland_windows() {
+        // The kwin backend is only chosen for a Plasma *Wayland* session, where wmctrl can
+        // only reach Xwayland clients. Preferring it would half-work at best.
+        let cmds = Backend::KWin.raise_commands(&target_with_marker());
+        let first_wmctrl = cmds.iter().position(|c| c.program == "wmctrl");
+        let last_kdotool = cmds.iter().rposition(|c| c.program == "kdotool");
+        assert!(last_kdotool < first_wmctrl, "{cmds:?}");
+    }
+
+    #[test]
+    fn kwin_anchors_the_class_pattern_so_a_prefix_cannot_activate_a_different_terminal() {
+        // kdotool's --class is a substring regex, so an unanchored `kitty` would also match
+        // `kitty-scratchpad`.
+        let cmds = Backend::KWin.raise_commands(&target_without_marker());
+        let class_pattern = cmds[0].args.iter().find(|a| a.contains("ghostty")).unwrap();
+        assert_eq!(class_pattern, r"^com\.mitchellh\.ghostty$");
+    }
+
+    #[test]
+    fn a_kwin_search_term_cannot_break_out_of_the_javascript_it_is_interpolated_into() {
+        // kdotool builds a KWin script containing new RegExp(String.raw`<term>`). A raw
+        // backtick would end that literal, and a script that fails to parse raises nothing
+        // while still exiting zero — a silent no-op, the one failure we refuse to ship.
+        let hostile = "`+workspace.windowList()[0].closeWindow()+`${x}";
+        let escaped = kdotool_pattern(hostile);
+        for (i, ch) in escaped.char_indices() {
+            if matches!(ch, '`' | '$' | '(' | ')' | '[' | ']') {
+                assert!(escaped[..i].ends_with('\\'), "unescaped {ch} in {escaped}");
+            }
+        }
+
+        // And the escaped form is what actually reaches the command line — only the anchors
+        // we add ourselves stay live.
+        let target = WindowTarget {
+            app_id: "ghostty".into(),
+            title_marker: Some(hostile.to_string()),
+        };
+        let cmds = Backend::KWin.raise_commands(&target);
+        assert_eq!(cmds[0].args[4], escaped);
+    }
+
+    #[test]
+    fn kwin_asks_doctor_only_for_kdotool_because_wmctrl_alone_would_be_false_reassurance() {
+        // doctor goes green when any one of the required tools is present. wmctrl is a
+        // last-resort Xwayland long shot here, not an alternative to kdotool.
+        assert_eq!(Backend::KWin.required_tools(), &["kdotool"]);
+        assert!(Backend::KWin
+            .raise_commands(&target_with_marker())
+            .iter()
+            .any(|c| c.program == "wmctrl"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ would be a command-injection hole.
 | `macos` | — | `open -b <bundle-id>` |
 | `hyprland` | `hyprctl` | `hyprctl dispatch focuswindow title:…` then `class:…` |
 | `sway` | `swaymsg` | `swaymsg '[title="…"] focus'` then `[app_id="…"] focus` |
-| `kwin` | `kdotool` or `wmctrl` | `kdotool search --name/--class`, then `wmctrl -x -a` |
+| `kwin` | `kdotool` | `kdotool search --name <marker> windowactivate`, then `--class`, then `wmctrl` as an Xwayland-only long shot |
 | `x11` | `wmctrl` or `xdotool` | `wmctrl -a <marker>`, `wmctrl -x -a <class>`, `xdotool search … windowactivate` |
 
 macOS uses `open -b` rather than AppleScript `activate` deliberately: `open` needs no Automation
@@ -40,6 +40,21 @@ macOS uses `open -b` rather than AppleScript `activate` deliberately: `open` nee
 
 If one helper is missing but another works, herdr-deck uses the one that works. It only reports a
 missing tool when none of the alternatives are installed.
+
+**KDE Plasma on Wayland needs `kdotool` installed, and there is no substitute.** KWin activates
+windows only through KWin scripting: a script file has to be written to disk, loaded over
+`org.kde.kwin.Scripting`, and then run on the object that load returns. Nothing shipping with
+Plasma does that from a command line, so herdr-deck delegates to [`kdotool`], which performs the
+whole dance per invocation. Without it, `doctor` says so and focus keys report that the window
+was not raised. `wmctrl` is still tried last, but under Wayland it can only reach Xwayland
+windows — if your terminal is a native Wayland client, and most now are, it will not find it. On
+a Plasma **X11** session none of this applies: that detects as the `x11` backend and `wmctrl`
+works normally.
+
+One caveat worth knowing: `kdotool` exits successfully even when its search matched no window, so
+a raise reported as successful can occasionally have moved nothing.
+
+[`kdotool`]: https://github.com/jinliu/kdotool
 
 ## Telling herdr-deck about your terminal
 
