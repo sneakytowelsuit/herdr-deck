@@ -1,9 +1,9 @@
 //! `herdr-deck doctor` — one command that explains why the deck is not doing what you expect.
 //!
 //! Every failure mode this project has is diagnosable from here: herdr not running, a protocol
-//! the daemon does not know, the daemon not started, a window-raise backend that cannot work in
-//! this session, a missing `wmctrl`. Each check reports what it found *and* what to do about it,
-//! because a diagnostic that only says "failed" just moves the problem.
+//! the daemon does not know, the daemon not started, no deck visible, a window-raise backend
+//! that cannot work in this session, a missing `wmctrl`. Each check reports what it found *and*
+//! what to do about it, because a diagnostic that only says "failed" just moves the problem.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use herdr_deck_core::config::Config;
 use herdr_deck_focus::{detect_or_override, Backend, FocusEnv};
 use herdr_deck_herdr::HerdrClient;
+
+use crate::hardware::{self, Detection};
 
 /// How a single check turned out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +137,23 @@ pub async fn run(config_path: &Path, config: &Config, session: Option<&str>) -> 
     report
         .checks
         .push(check_daemon_socket(&daemon_socket_path()).await);
+    report.checks.push(check_deck(&hardware::detect()));
     report.checks.extend(check_focus(config));
     report
+}
+
+/// Is there a deck, and can we reach it?
+///
+/// The wording lives in `hardware` because `install` has to say the same things; all this does
+/// is dress it as a check. Both callers must agree, or the two commands end up disagreeing
+/// about the same machine.
+fn check_deck(detection: &Detection) -> Check {
+    Check {
+        name: "deck".into(),
+        level: detection.level(),
+        detail: detection.summary(),
+        remedy: detection.remedy(),
+    }
 }
 
 fn check_config(path: &Path) -> Check {
@@ -463,6 +480,28 @@ mod tests {
         std::fs::write(&path, b"not a socket").unwrap();
         let check = check_daemon_socket(&path).await;
         assert_eq!(check.level, Level::Fail);
+    }
+
+    #[test]
+    fn a_deck_that_answered_is_reported_by_model_so_you_can_see_it_was_understood() {
+        let check = check_deck(&Detection::Found(vec![hardware::FoundDeck::new(
+            "Plus", "A1",
+        )]));
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.detail.contains("Stream Deck +"), "{}", check.detail);
+        assert_eq!(check.remedy, None);
+    }
+
+    #[test]
+    fn a_deck_nobody_can_see_warns_and_offers_the_udev_rule_as_the_first_thing_to_try() {
+        // "No deck found" on Linux is as likely to mean "wrong permissions" as "nothing plugged
+        // in", and the two are fixed completely differently.
+        let check = check_deck(&Detection::NothingFound {
+            udev_rule_installed: false,
+        });
+        assert_eq!(check.level, Level::Warn);
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("--write-udev"), "{remedy}");
     }
 
     #[test]

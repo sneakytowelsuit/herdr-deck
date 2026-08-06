@@ -7,8 +7,8 @@ Two binaries: `herdr-deck` (the tool you run) and `herdr-deckd` (the daemon).
 ### `doctor`
 
 The one command to run when something is wrong. It checks the config, herdr's socket and
-protocol version, whether the daemon is running, which window-raise backend was selected, and
-whether its helper tools are installed.
+protocol version, whether the daemon is running, whether a deck can be seen, which window-raise
+backend was selected, and whether its helper tools are installed.
 
 ```console
 $ herdr-deck doctor
@@ -16,6 +16,7 @@ $ herdr-deck doctor
 [ok  ] herdr socket: /home/you/.config/herdr/herdr.sock (via default session)
 [ok  ] herdr protocol: protocol 19, 4 agent(s) visible
 [ok  ] herdr-deckd: running, socket /run/user/1000/herdr-deck.sock
+[ok  ] deck: Stream Deck + — 4x2 keys (120px), 4 dials, touchstrip 800x100 (serial A00000000000)
 [ok  ] window raising: backend `hyprland`
 [ok  ] window tools: found hyprctl
 [ok  ] terminal: targeting `com.mitchellh.ghostty`
@@ -49,11 +50,41 @@ Models: `plus`, `original`/`mk2`, `mini`, `xl`, `neo`, `pedal`.
 
 ### `install`
 
-Writes a starter config, and on Linux prints the udev rule the deck needs.
+Writes a starter config, then checks that the hardware can actually be reached.
 
 ```sh
 herdr-deck install [--force]
+sudo herdr-deck install --write-udev
 ```
+
+| Flag | Meaning |
+|---|---|
+| `--force` | Overwrite an existing config. Without it, an existing config is left alone — but the hardware check still runs. |
+| `--write-udev` | Linux only. Install the udev rule to `/etc/udev/rules.d/` and reload udev. Needs root; without it, `install` says so and changes nothing. |
+
+On Linux it enumerates attached decks and reports the model, its keys and its dials:
+
+```console
+$ herdr-deck install
+wrote /home/you/.config/herdr-deck/config.toml
+...
+Found 1 deck:
+  Stream Deck + — 4x2 keys (120px), 4 dials, touchstrip 800x100 (serial A00000000000)
+```
+
+When it finds nothing it says what that might mean rather than stating it as fact, because
+without the udev rule an attached deck is invisible to enumeration:
+
+```console
+no deck found — but the udev rule is missing, which alone would hide one
+
+Install the rule with `sudo herdr-deck install --write-udev`, then unplug and replug the deck.
+...
+```
+
+Without `--write-udev` the rule is printed rather than installed — writing under `/etc` stays
+opt-in. On macOS there is nothing to enumerate: Elgato's app owns the device, so `install` says
+so and points at the [plugin step](../getting-started/install.md#macos) instead.
 
 ### `service`
 

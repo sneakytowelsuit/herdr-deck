@@ -63,6 +63,21 @@ The daemon drives the deck directly, so there is nothing else to install — but
 a udev rule to be reachable without root.
 
 ```sh
+sudo herdr-deck install --write-udev
+```
+
+That writes `/etc/udev/rules.d/70-herdr-deck.rules`, runs `udevadm control --reload-rules &&
+udevadm trigger`, and then looks for your deck and tells you what it found. Unplug and replug
+the deck afterwards — udev applies a rule to devices that appear *after* it is loaded.
+
+Run without root, it refuses and says so rather than dying on a permission error. Run without
+`--write-udev`, it prints the rule instead of installing it: writing under `/etc` stays
+something you ask for explicitly.
+
+<details>
+<summary>The same thing by hand</summary>
+
+```sh
 sudo tee /etc/udev/rules.d/70-herdr-deck.rules >/dev/null <<'EOF'
 # herdr-deck: let the logged-in user talk to Elgato Stream Deck hardware.
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
@@ -71,10 +86,12 @@ EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Then unplug and replug the deck.
+</details>
 
-`herdr-deck install` prints these commands too. It does not run them for you — installing a file
-under `/etc` needs root, and quietly escalating during an install would be a surprise.
+> **"No Stream Deck found" and "wrong permissions" look identical on Linux.**
+> Without the rule, an attached deck does not show up in enumeration at all — so herdr-deck
+> never reports "no deck found" without also telling you whether the rule is in place. Fix the
+> permissions first; only then is an empty result evidence that nothing is plugged in.
 
 ### Window raising needs a helper on X11
 
