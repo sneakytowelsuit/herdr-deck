@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / Stream Deck plugin
+node_modules/
+plugin/**/bin/
+plugin/*.streamDeckPlugin
+dist/
+
+# mdBook
+docs/book/
+
+# Local artifacts
+*.log
+.DS_Store
+/tmp-render/
