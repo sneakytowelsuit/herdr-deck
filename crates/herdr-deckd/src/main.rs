@@ -1,12 +1,6 @@
-//! `herdr-deckd` — the herdr-deck daemon.
+//! The `herdr-deckd` binary: argument parsing, wiring, and the dry-run renderer.
 //!
-//! Owns everything: the connection to herdr, the state cache, tile rendering, the layout, and
-//! the focus engine. Frontends (the macOS Stream Deck plugin, the Linux HID driver) connect to
-//! its unix socket and do nothing but forward input and draw what they are given.
-
-mod server;
-mod session;
-mod watcher;
+//! Everything with behaviour worth testing lives in the library next door (see `lib.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,8 +14,8 @@ use herdr_deck_core::Config;
 use herdr_deck_focus::FocusEngine;
 use herdr_deck_herdr::HerdrClient;
 
-use crate::server::ServerContext;
-use crate::watcher::Watcher;
+use herdr_deckd::server::{self, ServerContext};
+use herdr_deckd::watcher::Watcher;
 
 #[derive(Debug, Parser)]
 #[command(
