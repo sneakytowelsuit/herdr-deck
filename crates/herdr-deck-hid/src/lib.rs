@@ -28,6 +28,11 @@ mod driver;
 #[cfg(target_os = "linux")]
 pub use driver::{list_decks, run};
 
+/// Hardware bring-up self-test: talks to the deck directly, bypassing the daemon and herdr.
+/// See the module for why it exists and what it can and cannot tell you.
+#[cfg(target_os = "linux")]
+pub mod selftest;
+
 /// Elgato's USB vendor id, used by the udev rule.
 pub const ELGATO_VENDOR_ID: &str = "0fd9";
 

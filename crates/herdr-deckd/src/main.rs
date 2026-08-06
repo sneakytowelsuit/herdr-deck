@@ -50,12 +50,26 @@ struct Args {
     /// Hardware to assume for `--dry-run`.
     #[arg(long, default_value = "plus", value_name = "MODEL")]
     dry_run_model: String,
+
+    /// Talk to the first attached deck directly, bypassing the daemon and herdr entirely.
+    ///
+    /// For hardware bring-up: paints a numbered test pattern on every key (and touchstrip
+    /// segment, if any) so key numbering and dial mapping can be checked by eye, then prints
+    /// every input event as controls are pressed. Exits and resets the deck on Ctrl-C. Linux
+    /// only — on macOS the Elgato app owns the device, so there is nothing for this to open; use
+    /// the Stream Deck plugin instead. See docs/help/hardware-bringup.md.
+    #[arg(long)]
+    selftest: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_tracing(&args.log);
+
+    if args.selftest {
+        return run_selftest().await;
+    }
 
     let config_path = args
         .config
@@ -133,6 +147,26 @@ async fn main() -> anyhow::Result<()> {
     };
     let _ = std::fs::remove_file(&cleanup_path);
     result
+}
+
+/// Run the hardware self-test, on the platform where that is even possible.
+///
+/// On macOS the Stream Deck app has the device open exclusively; there is no HID path here at
+/// all, only the plugin. Saying so on the terminal — rather than failing with a confusing "no
+/// device found" — is the whole point of degrading loudly.
+#[cfg(target_os = "linux")]
+async fn run_selftest() -> anyhow::Result<()> {
+    herdr_deck_hid::selftest::run().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_selftest() -> anyhow::Result<()> {
+    println!(
+        "--selftest is Linux-only: on macOS, Elgato's Stream Deck app owns the device and there \
+         is no way for herdr-deckd to open it directly. Install the herdr-deck Stream Deck \
+         plugin instead — see docs/help/hardware-bringup.md."
+    );
+    Ok(())
 }
 
 fn init_tracing(filter: &str) {
