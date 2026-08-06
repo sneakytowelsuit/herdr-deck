@@ -104,6 +104,8 @@ impl Session {
         &self.capabilities
     }
 
+    /// Diagnostic accessor, also used by the tests below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn profile(&self) -> &Profile {
         &self.profile
     }
@@ -316,6 +318,7 @@ impl Session {
     }
 
     /// Which tile a key is currently showing. Test and diagnostic helper.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn tile_at(&self, index: usize, state: &DeckState) -> Tile {
         self.resolved(state).tile(index)
     }

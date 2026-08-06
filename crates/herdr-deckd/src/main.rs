@@ -105,6 +105,19 @@ async fn main() -> anyhow::Result<()> {
     let listener = server::bind(&socket_path).await?;
     tracing::info!(socket = %socket_path.display(), "listening for frontends");
 
+    // On Linux there is no Stream Deck application to plug into, so the daemon drives the
+    // hardware itself — as an ordinary frontend client of its own socket, so there is exactly
+    // one protocol and one set of semantics across both platforms.
+    #[cfg(target_os = "linux")]
+    {
+        let hid_socket = socket_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = herdr_deck_hid::run(hid_socket).await {
+                tracing::warn!(error = %e, "HID frontend stopped");
+            }
+        });
+    }
+
     let context = Arc::new(ServerContext {
         config,
         renderer,

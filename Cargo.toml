@@ -48,6 +48,8 @@ base64 = "0.22"
 resvg = "0.44"
 tiny-skia = "0.11"
 usvg = "0.44"
+image = { version = "0.25", default-features = false, features = ["png"] }
+elgato-streamdeck = { version = "0.13", features = ["async"] }
 
 [profile.release]
 lto = "thin"

@@ -24,6 +24,9 @@ serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+herdr-deck-hid.workspace = true
+
 [dev-dependencies]
 herdr-deck-herdr = { workspace = true, features = ["mock"] }
 tempfile = "3"

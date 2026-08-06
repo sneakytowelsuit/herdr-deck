@@ -205,8 +205,36 @@ fn install(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
         "\nherdr-deck adapts to whatever deck is plugged in, so there is nothing to configure \
          for your hardware. Run `herdr-deck doctor` to check the rest."
     );
+    report_udev_rule();
     Ok(())
 }
+
+/// On Linux, reaching the deck without root needs a udev rule.
+///
+/// We print it rather than writing it: the file lives under /etc and installing it needs root,
+/// and silently asking for a privilege escalation during `install` would be a surprise. Showing
+/// the exact two commands is faster than sending someone to the docs.
+#[cfg(target_os = "linux")]
+fn report_udev_rule() {
+    use std::path::Path;
+
+    if Path::new(herdr_deck_hid::UDEV_RULE_PATH).exists() {
+        println!("\nudev rule already installed at {}.", herdr_deck_hid::UDEV_RULE_PATH);
+        return;
+    }
+    println!(
+        "\nOne more step: the deck needs a udev rule to be reachable without root.\n\n\
+         sudo tee {path} >/dev/null <<'EOF'\n{rule}EOF\n\
+         sudo udevadm control --reload-rules && sudo udevadm trigger\n\n\
+         Then unplug and replug the deck.",
+        path = herdr_deck_hid::UDEV_RULE_PATH,
+        rule = herdr_deck_hid::UDEV_RULE,
+    );
+}
+
+/// macOS drives the deck through Elgato's application, so there is no device permission to set.
+#[cfg(not(target_os = "linux"))]
+fn report_udev_rule() {}
 
 fn parse_model(name: &str) -> anyhow::Result<DeckModel> {
     match name.to_ascii_lowercase().as_str() {
