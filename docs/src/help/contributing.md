@@ -60,6 +60,16 @@ Regenerate the plugin icons so they stay in step:
 cargo run -p herdr-deck-cli -- icons --out plugin/com.sneakytowelsuit.herdr-deck.sdPlugin/imgs
 ```
 
+`crates/herdr-deck-core/tests/golden.rs` pins what tiles actually look like — colours, glyphs,
+text wrapping, the focus ring — against PNG fixtures committed under
+`crates/herdr-deck-core/tests/golden/`. Any theme, layout, or font change will fail those tests;
+that is the point, not a bug. Once you have confirmed the new look is what you meant, regenerate
+the fixtures and eyeball the diff (with an image viewer, not `git diff --stat`) before committing:
+
+```sh
+UPDATE_GOLDEN=1 cargo test --offline -p herdr-deck-core --test golden
+```
+
 ## Re-checking the herdr protocol
 
 herdr-deck targets socket protocol 19. To see what a given herdr speaks:
