@@ -4,6 +4,7 @@
 //! whatever hardware is plugged in.
 
 mod doctor;
+mod hardware;
 mod icons;
 mod service;
 
@@ -46,11 +47,14 @@ enum Command {
         #[arg(long, default_value = "plus")]
         model: String,
     },
-    /// Write a starter config matched to the attached hardware.
+    /// Write a starter config, and check the deck can actually be reached.
     Install {
         /// Overwrite an existing config.
         #[arg(long)]
         force: bool,
+        /// Install the udev rule to /etc and reload udev. Linux only; needs root.
+        #[arg(long)]
+        write_udev: bool,
     },
     /// Regenerate the Stream Deck plugin's icon set from the theme.
     ///
@@ -87,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Status { json } => status(&config, args.session.as_deref(), json).await,
         Command::Layout { model } => layout(&model),
-        Command::Install { force } => install(&config_path, force),
+        Command::Install { force, write_udev } => install(&config_path, force, write_udev),
         Command::Icons { out } => {
             let written = icons::generate(&out)?;
             println!("wrote {} icons to {}", written.len(), out.display());
@@ -186,7 +190,31 @@ fn describe_key(binding: &KeyBinding) -> String {
     }
 }
 
-fn install(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
+fn install(config_path: &PathBuf, force: bool, write_udev: bool) -> anyhow::Result<()> {
+    write_starter_config(config_path, force)?;
+
+    // The rule goes in before we look: installing it is exactly what un-hides a deck that
+    // enumeration could not see, so detecting first would report a state we are about to fix.
+    if write_udev {
+        let outcome = hardware::install_udev_rule()?;
+        println!("\n{}", outcome.message());
+        if outcome.needs_manual_commands() {
+            report_udev_rule();
+        }
+    }
+
+    // Detection runs whether or not the config was written: an existing config is no reason to
+    // skip the one part of `install` that can tell you the deck is unreachable.
+    println!();
+    print!("{}", hardware::detect().report());
+
+    if !write_udev {
+        report_udev_rule();
+    }
+    Ok(())
+}
+
+fn write_starter_config(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
     if config_path.exists() && !force {
         println!(
             "{} already exists; leaving it alone (pass --force to overwrite).",
@@ -205,15 +233,14 @@ fn install(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
         "\nherdr-deck adapts to whatever deck is plugged in, so there is nothing to configure \
          for your hardware. Run `herdr-deck doctor` to check the rest."
     );
-    report_udev_rule();
     Ok(())
 }
 
 /// On Linux, reaching the deck without root needs a udev rule.
 ///
-/// We print it rather than writing it: the file lives under /etc and installing it needs root,
-/// and silently asking for a privilege escalation during `install` would be a surprise. Showing
-/// the exact two commands is faster than sending someone to the docs.
+/// Printed rather than written unless `--write-udev` is passed: the file lives under /etc, and
+/// an install that quietly writes there because it happened to be run under sudo would be a
+/// surprise. Showing the exact two commands is faster than sending someone to the docs.
 #[cfg(target_os = "linux")]
 fn report_udev_rule() {
     use std::path::Path;
@@ -297,7 +324,7 @@ mod tests {
     fn install_writes_a_config_that_loads_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        install(&path, false).unwrap();
+        write_starter_config(&path, false).unwrap();
         assert!(path.exists());
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded, Config::default());
@@ -308,10 +335,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "# mine\nreconcile_interval_ms = 4000\n").unwrap();
-        install(&path, false).unwrap();
+        write_starter_config(&path, false).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
 
-        install(&path, true).unwrap();
+        write_starter_config(&path, true).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("# mine"));
+    }
+
+    #[test]
+    fn install_still_checks_the_hardware_when_the_config_is_left_alone() {
+        // An existing config used to end the command early, which meant the person most likely
+        // to be debugging a dead deck — someone re-running `install` — was the one person who
+        // never got told whether their deck could be seen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n").unwrap();
+        install(&path, false, false).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
     }
 }
