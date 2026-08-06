@@ -106,6 +106,15 @@ impl TileRenderer {
         self.rasterise(&svg, width, height)
     }
 
+    /// Rasterise arbitrary SVG at a given size.
+    ///
+    /// Public so build tooling can generate the plugin's icon set from the same renderer the
+    /// deck uses — the icons are then reproducible from source rather than committed binaries
+    /// nobody can regenerate.
+    pub fn render_svg(&self, svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+        self.rasterise(svg, width, height)
+    }
+
     fn rasterise(&self, svg: &str, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
         let tree = usvg::Tree::from_str(svg, &self.options)
             .map_err(|e| anyhow::anyhow!("tile SVG failed to parse: {e}"))?;

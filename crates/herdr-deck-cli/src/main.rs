@@ -4,6 +4,7 @@
 //! whatever hardware is plugged in.
 
 mod doctor;
+mod icons;
 mod service;
 
 use std::path::PathBuf;
@@ -51,6 +52,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Regenerate the Stream Deck plugin's icon set from the theme.
+    ///
+    /// A build-time tool: the icons are rendered from SVG by the same renderer that draws the
+    /// deck, so they stay in step with the palette.
+    Icons {
+        /// Output directory, normally plugin/com.herdrdeck.sdPlugin/imgs.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
     /// Manage the background service.
     Service {
         #[command(subcommand)]
@@ -78,6 +88,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Status { json } => status(&config, args.session.as_deref(), json).await,
         Command::Layout { model } => layout(&model),
         Command::Install { force } => install(&config_path, force),
+        Command::Icons { out } => {
+            let written = icons::generate(&out)?;
+            println!("wrote {} icons to {}", written.len(), out.display());
+            Ok(())
+        }
         Command::Service { action } => service::run(action),
     }
 }

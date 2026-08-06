@@ -158,6 +158,24 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> a
                 };
 
                 let state = state_rx.borrow().clone();
+
+                // A frontend may re-announce mid-connection: the macOS plugin discovers dials
+                // as their actions appear, so the first hello can say "no dials" and a later
+                // one "four". Rebuild the layout rather than keeping a stale one.
+                if let FrontendMessage::Hello { device, .. } = &message {
+                    let rebuilt = Session::new(device, &context.config, Arc::clone(&context.renderer));
+                    if rebuilt.capabilities() != session.capabilities() {
+                        tracing::info!(
+                            device = %rebuilt.capabilities().describe(),
+                            "frontend re-announced different hardware; rebuilding layout"
+                        );
+                        session = rebuilt;
+                        let greeting = session.greet(&state);
+                        write_all(&mut write_half, &greeting).await?;
+                        continue;
+                    }
+                }
+
                 let outcome = session.handle(message, &state);
                 write_all(&mut write_half, &outcome.messages).await?;
 
