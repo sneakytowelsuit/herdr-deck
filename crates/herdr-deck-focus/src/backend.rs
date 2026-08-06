@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// Treat an empty stdout as failure, even when the command exits zero.
+    ///
+    /// Some tools report "I matched nothing" by printing nothing and exiting successfully.
+    /// `kdotool` is one: a search that matches no window runs its actions zero times and still
+    /// exits zero. Without this flag the engine would report "window raised" when nothing
+    /// happened — the exact silent half-success this project refuses to ship.
+    pub requires_output: bool,
 }
 
 impl CommandSpec {
@@ -28,6 +35,16 @@ impl CommandSpec {
         Self {
             program: program.to_string(),
             args: args.iter().map(|a| a.to_string()).collect(),
+            requires_output: false,
+        }
+    }
+
+    /// A command whose exit code alone does not prove it did anything. See
+    /// [`CommandSpec::requires_output`].
+    pub fn new_requiring_output(program: &str, args: &[&str]) -> Self {
+        Self {
+            requires_output: true,
+            ..Self::new(program, args)
         }
     }
 }
@@ -174,7 +191,7 @@ impl Backend {
                 if let Some(marker) = &target.title_marker {
                     // `--limit 1` because without it kdotool activates every match in turn,
                     // leaving whichever came last in front.
-                    cmds.push(CommandSpec::new(
+                    cmds.push(CommandSpec::new_requiring_output(
                         "kdotool",
                         &[
                             "search",
@@ -185,10 +202,16 @@ impl Backend {
                             // `search` alone only prints window ids; activation is a chained
                             // step and has to be asked for explicitly.
                             "windowactivate",
+                            // ...and the chain then ends in a per-window query purely so we can
+                            // tell a match from a miss. kdotool exits zero either way, and its
+                            // window-scoped steps iterate the match stack, so an empty stack
+                            // prints nothing. Without this the engine would believe every
+                            // kdotool invocation succeeded and never fall through to wmctrl.
+                            "getwindowid",
                         ],
                     ));
                 }
-                cmds.push(CommandSpec::new(
+                cmds.push(CommandSpec::new_requiring_output(
                     "kdotool",
                     &[
                         "search",
@@ -198,6 +221,7 @@ impl Backend {
                         // Anchored, so a configured `kitty` cannot activate `kitty-scratchpad`.
                         &format!("^{}$", kdotool_pattern(&target.app_id)),
                         "windowactivate",
+                        "getwindowid",
                     ],
                 ));
                 if let Some(marker) = &target.title_marker {
@@ -383,9 +407,18 @@ mod tests {
     fn kwin_reaches_for_kdotool_before_wmctrl_because_wmctrl_is_blind_to_wayland_windows() {
         // The kwin backend is only chosen for a Plasma *Wayland* session, where wmctrl can
         // only reach Xwayland clients. Preferring it would half-work at best.
+        // Unwrapped rather than compared as Options: if wmctrl were ever dropped from this
+        // backend, `None` would sort lowest and the ordering assertion would pass for entirely
+        // the wrong reason.
         let cmds = Backend::KWin.raise_commands(&target_with_marker());
-        let first_wmctrl = cmds.iter().position(|c| c.program == "wmctrl");
-        let last_kdotool = cmds.iter().rposition(|c| c.program == "kdotool");
+        let first_wmctrl = cmds
+            .iter()
+            .position(|c| c.program == "wmctrl")
+            .expect("wmctrl is kept as the Xwayland-only last resort");
+        let last_kdotool = cmds
+            .iter()
+            .rposition(|c| c.program == "kdotool")
+            .expect("kdotool is the only mechanism that reaches native Wayland windows");
         assert!(last_kdotool < first_wmctrl, "{cmds:?}");
     }
 
@@ -477,6 +510,48 @@ mod tests {
             assert_eq!(Backend::parse(backend.name()), Some(backend));
         }
         assert_eq!(Backend::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn kdotool_chains_end_in_a_query_so_a_miss_is_distinguishable_from_a_hit() {
+        // kdotool exits zero whether or not it matched anything. Its window-scoped steps
+        // iterate the match stack, so ending the chain in a per-window query means a miss
+        // prints nothing — which is the only signal we get that the window did not move.
+        let cmds = Backend::KWin.raise_commands(&target_with_marker());
+        let kdotool: Vec<_> = cmds.iter().filter(|c| c.program == "kdotool").collect();
+        assert!(!kdotool.is_empty());
+        for cmd in kdotool {
+            assert!(
+                cmd.requires_output,
+                "a kdotool command that is trusted on exit code alone will report \
+                 success when it matched nothing: {cmd:?}"
+            );
+            assert_eq!(
+                cmd.args.last().map(String::as_str),
+                Some("getwindowid"),
+                "the chain must end in a query or it prints nothing even on success: {cmd:?}"
+            );
+            assert!(
+                cmd.args.iter().any(|a| a == "windowactivate"),
+                "the query must not have replaced the activation: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backends_whose_exit_code_is_trustworthy_do_not_demand_output() {
+        // wmctrl and friends exit non-zero when they fail to match, so requiring output would
+        // only add a way for them to be wrongly judged.
+        for backend in [
+            Backend::MacOs,
+            Backend::Hyprland,
+            Backend::Sway,
+            Backend::X11,
+        ] {
+            for cmd in backend.raise_commands(&target_with_marker()) {
+                assert!(!cmd.requires_output, "{backend:?}: {cmd:?}");
+            }
+        }
     }
 
     #[test]

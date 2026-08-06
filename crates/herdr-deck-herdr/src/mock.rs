@@ -175,6 +175,49 @@ impl MockHerdr {
             .count()
     }
 
+    /// Serve `snapshot` and accept focus calls — what any consumer test needs to stand up a
+    /// working herdr.
+    ///
+    /// This exists so callers never have to spell a herdr method name. Everything above this
+    /// crate is supposed to hold no protocol knowledge, and a test that hand-writes
+    /// `"agent.focus"` quietly breaks that rule in the place people are least likely to look.
+    pub async fn serve_session(&self, snapshot: &crate::wire::SessionSnapshot) {
+        let value = serde_json::to_value(snapshot).expect("snapshot serialises");
+        self.reply("session.snapshot", value).await;
+        self.reply("agent.focus", json!({ "type": "ok" })).await;
+        self.reply("workspace.focus", json!({ "type": "ok" })).await;
+        self.reply("client.window_title.set", json!({ "type": "ok" }))
+            .await;
+    }
+
+    /// The target of each `agent.focus` call, in the order they arrived.
+    pub async fn agent_focus_targets(&self) -> Vec<String> {
+        self.observed_string_params("agent.focus", "target").await
+    }
+
+    /// The workspace id of each `workspace.focus` call, in order.
+    pub async fn workspace_focus_ids(&self) -> Vec<String> {
+        self.observed_string_params("workspace.focus", "workspace_id")
+            .await
+    }
+
+    /// How many times state was read.
+    pub async fn snapshot_count(&self) -> usize {
+        self.call_count("session.snapshot").await
+    }
+
+    async fn observed_string_params(&self, method: &str, field: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .observed
+            .iter()
+            .filter(|o| o.method == method)
+            .filter_map(|o| o.params.get(field).and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
     pub async fn connection_count(&self) -> usize {
         self.state.lock().await.connections
     }

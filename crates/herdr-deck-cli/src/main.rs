@@ -91,7 +91,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Status { json } => status(&config, args.session.as_deref(), json).await,
         Command::Layout { model } => layout(&model),
-        Command::Install { force, write_udev } => install(&config_path, force, write_udev),
+        Command::Install { force, write_udev } => {
+            install(&config_path, force, write_udev).map(|_| ())
+        }
         Command::Icons { out } => {
             let written = icons::generate(&out)?;
             println!("wrote {} icons to {}", written.len(), out.display());
@@ -190,8 +192,20 @@ fn describe_key(binding: &KeyBinding) -> String {
     }
 }
 
-fn install(config_path: &PathBuf, force: bool, write_udev: bool) -> anyhow::Result<()> {
-    write_starter_config(config_path, force)?;
+/// What `install` actually did.
+///
+/// Returned rather than kept internal purely so the tests can assert on it: the interesting
+/// property of `install` is *which steps ran*, and asserting on side effects alone gives you a
+/// test that passes just as happily when a step is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallOutcome {
+    config_written: bool,
+    udev_attempted: bool,
+    hardware_checked: bool,
+}
+
+fn install(config_path: &PathBuf, force: bool, write_udev: bool) -> anyhow::Result<InstallOutcome> {
+    let config_written = write_starter_config(config_path, force)?;
 
     // The rule goes in before we look: installing it is exactly what un-hides a deck that
     // enumeration could not see, so detecting first would report a state we are about to fix.
@@ -211,16 +225,21 @@ fn install(config_path: &PathBuf, force: bool, write_udev: bool) -> anyhow::Resu
     if !write_udev {
         report_udev_rule();
     }
-    Ok(())
+    Ok(InstallOutcome {
+        config_written,
+        udev_attempted: write_udev,
+        hardware_checked: true,
+    })
 }
 
-fn write_starter_config(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
+/// Returns whether a config was actually written.
+fn write_starter_config(config_path: &PathBuf, force: bool) -> anyhow::Result<bool> {
     if config_path.exists() && !force {
         println!(
             "{} already exists; leaving it alone (pass --force to overwrite).",
             config_path.display()
         );
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -233,7 +252,7 @@ fn write_starter_config(config_path: &PathBuf, force: bool) -> anyhow::Result<()
         "\nherdr-deck adapts to whatever deck is plugged in, so there is nothing to configure \
          for your hardware. Run `herdr-deck doctor` to check the rest."
     );
-    Ok(())
+    Ok(true)
 }
 
 /// On Linux, reaching the deck without root needs a udev rule.
@@ -346,11 +365,31 @@ mod tests {
     fn install_still_checks_the_hardware_when_the_config_is_left_alone() {
         // An existing config used to end the command early, which meant the person most likely
         // to be debugging a dead deck — someone re-running `install` — was the one person who
-        // never got told whether their deck could be seen.
+        // never got told whether their deck could be seen. Asserting only that the file was
+        // left alone would pass under that old behaviour too, so assert the step ran.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "# mine\n").unwrap();
-        install(&path, false, false).unwrap();
+
+        let outcome = install(&path, false, false).unwrap();
+        assert!(
+            outcome.hardware_checked,
+            "re-running install must still report whether the deck is visible"
+        );
+        assert!(
+            !outcome.config_written,
+            "an existing config must be left alone"
+        );
         assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
+    }
+
+    #[test]
+    fn install_writes_the_config_when_there_is_none_and_still_checks_hardware() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let outcome = install(&path, false, false).unwrap();
+        assert!(outcome.config_written);
+        assert!(outcome.hardware_checked);
+        assert!(!outcome.udev_attempted, "writing to /etc must stay opt-in");
     }
 }

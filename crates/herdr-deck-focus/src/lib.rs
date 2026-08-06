@@ -127,11 +127,43 @@ impl CommandRunner for ProcessRunner {
             let mut command = tokio::process::Command::new(&spec.program);
             command.args(&spec.args);
             command.stdin(std::process::Stdio::null());
-            command.stdout(std::process::Stdio::null());
             command.stderr(std::process::Stdio::null());
+            // Only capture stdout when the exit code alone cannot be trusted; otherwise let it
+            // go to /dev/null so a chatty tool cannot fill a pipe nobody drains.
+            if spec.requires_output {
+                command.stdout(std::process::Stdio::piped());
+            } else {
+                command.stdout(std::process::Stdio::null());
+            }
 
-            match tokio::time::timeout(RAISE_TIMEOUT, command.status()).await {
-                Ok(Ok(status)) if status.success() => RunResult::Success,
+            let finished = if spec.requires_output {
+                tokio::time::timeout(RAISE_TIMEOUT, command.output())
+                    .await
+                    .map(|result| {
+                        result.map(|out| {
+                            (out.status, !out.stdout.iter().all(u8::is_ascii_whitespace))
+                        })
+                    })
+            } else {
+                tokio::time::timeout(RAISE_TIMEOUT, command.status())
+                    .await
+                    .map(|result| result.map(|status| (status, true)))
+            };
+
+            match finished {
+                Ok(Ok((status, produced_output))) if status.success() => {
+                    if produced_output {
+                        RunResult::Success
+                    } else {
+                        // Exited zero but matched nothing. Reporting this as success is how a
+                        // user ends up being told the window was raised while nothing moved.
+                        tracing::debug!(
+                            program = %spec.program,
+                            "command exited zero but matched nothing; treating as failure"
+                        );
+                        RunResult::Failed
+                    }
+                }
                 Ok(Ok(_)) => RunResult::Failed,
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => RunResult::NotInstalled,
                 Ok(Err(e)) => {
@@ -368,6 +400,55 @@ mod tests {
             backend,
             runner,
         )
+    }
+
+    #[tokio::test]
+    async fn a_command_that_exits_zero_without_matching_anything_is_not_success() {
+        // Exercised against real processes, because this is precisely the behaviour that
+        // cannot be verified by inspecting a CommandSpec: `true` succeeds silently, which is
+        // indistinguishable from "kdotool matched nothing" unless we look at stdout.
+        let runner = ProcessRunner;
+
+        let silent = CommandSpec::new_requiring_output("true", &[]);
+        assert_eq!(
+            runner.run(&silent).await,
+            RunResult::Failed,
+            "a zero exit with no output must not be reported as a raised window"
+        );
+
+        let speaks = CommandSpec::new_requiring_output("echo", &["{aabbcc-window-id}"]);
+        assert_eq!(runner.run(&speaks).await, RunResult::Success);
+
+        // Whitespace is not output: a trailing newline alone means nothing matched.
+        let blank = CommandSpec::new_requiring_output("echo", &[""]);
+        assert_eq!(runner.run(&blank).await, RunResult::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_command_we_trust_on_exit_code_alone_is_unaffected_by_its_output() {
+        let runner = ProcessRunner;
+        assert_eq!(
+            runner.run(&CommandSpec::new("true", &[])).await,
+            RunResult::Success
+        );
+        assert_eq!(
+            runner.run(&CommandSpec::new("false", &[])).await,
+            RunResult::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_is_still_distinguished_from_a_failed_one() {
+        let runner = ProcessRunner;
+        assert_eq!(
+            runner
+                .run(&CommandSpec::new_requiring_output(
+                    "herdr-deck-no-such-tool",
+                    &[]
+                ))
+                .await,
+            RunResult::NotInstalled
+        );
     }
 
     #[tokio::test]

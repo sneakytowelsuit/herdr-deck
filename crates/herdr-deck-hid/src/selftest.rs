@@ -190,8 +190,15 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let _ = deck.reset().await;
-    println!("deck reset. self-test complete.");
+    // A diagnostic tool that reports a success it did not have is worse than one that reports
+    // nothing — the whole point of this mode is honest hardware reporting.
+    match deck.reset().await {
+        Ok(()) => println!("deck reset. self-test complete."),
+        Err(e) => println!(
+            "self-test complete, but the deck did not reset ({e}). \
+             It may still be showing the test pattern; unplug and replug it."
+        ),
+    }
     Ok(())
 }
 
@@ -345,11 +352,33 @@ mod tests {
     #[test]
     fn adjacent_keys_get_different_background_colours() {
         // The whole point of colouring the pattern is that neighbours read as distinct at a
-        // glance; two adjacent keys sharing a colour would defeat that.
+        // glance. Comparing whole SVGs would prove nothing — they always differ by the index
+        // number drawn on them — so this compares the fill colours themselves.
         for index in 0..7 {
-            let a = key_test_svg(index, 4, 120);
-            let b = key_test_svg(index + 1, 4, 120);
-            assert_ne!(a, b);
+            let a = background_of(&key_test_svg(index, 4, 120));
+            let b = background_of(&key_test_svg(index + 1, 4, 120));
+            assert_ne!(
+                a,
+                b,
+                "keys {index} and {} share the background {a}",
+                index + 1
+            );
+        }
+    }
+
+    /// The `fill` of the full-bleed background rect, which is the first fill in the document.
+    fn background_of(svg: &str) -> String {
+        let start = svg.find("fill=\"").expect("the tile has a background fill") + 6;
+        let rest = &svg[start..];
+        rest[..rest.find('"').expect("unterminated fill")].to_string()
+    }
+
+    #[test]
+    fn the_palette_itself_has_no_adjacent_duplicates() {
+        // The guarantee above only holds while the palette does; a copy-paste slip that
+        // repeated a colour would otherwise only surface on real hardware.
+        for pair in PALETTE.windows(2) {
+            assert_ne!(pair[0], pair[1], "adjacent palette entries must differ");
         }
     }
 

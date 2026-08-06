@@ -26,6 +26,7 @@ use herdr_deck_core::state::DeckState;
 use herdr_deck_core::Config;
 use herdr_deck_focus::FocusEngine;
 use herdr_deck_herdr::mock::MockHerdr;
+use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, WorkspaceInfo};
 use herdr_deck_herdr::{HerdrClient, SocketPath};
 use herdr_deckd::server::{self, ServerContext};
 use herdr_deckd::watcher::Watcher;
@@ -245,51 +246,58 @@ fn hello(dials: u8) -> serde_json::Value {
     })
 }
 
-fn agent(
-    terminal_id: &str,
-    pane_id: &str,
-    name: &str,
-    status: &str,
-    seq: u64,
-) -> serde_json::Value {
-    json!({
-        "terminal_id": terminal_id,
-        "agent_status": status,
-        "workspace_id": "w1",
-        "tab_id": "w1:t1",
-        "pane_id": pane_id,
-        "focused": false,
-        "revision": 1,
-        "agent": "claude",
-        "name": name,
-        "state_change_seq": seq,
-    })
+// Fixtures are built from herdr-deck-herdr's own wire types rather than hand-written JSON.
+// Everything above that crate is supposed to hold no herdr protocol knowledge, and spelling
+// field names here would put a second, unversioned copy of the protocol in a test file — the
+// place it would rot most quietly.
+fn agent(terminal_id: &str, pane_id: &str, name: &str, status: AgentStatus, seq: u64) -> AgentInfo {
+    AgentInfo {
+        terminal_id: terminal_id.to_string(),
+        agent_status: status,
+        workspace_id: "w1".to_string(),
+        tab_id: "w1:t1".to_string(),
+        pane_id: pane_id.to_string(),
+        agent: Some("claude".to_string()),
+        name: Some(name.to_string()),
+        state_change_seq: Some(seq),
+        revision: 1,
+        ..Default::default()
+    }
 }
 
-fn snapshot(agents: Vec<serde_json::Value>) -> serde_json::Value {
-    json!({
-        "type": "session_snapshot",
-        "protocol": 19,
-        "agents": agents,
-        "workspaces": [{"workspace_id": "w1", "label": "api", "agent_status": "blocked",
-                        "focused": true}],
-    })
+fn snapshot(agents: Vec<AgentInfo>) -> SessionSnapshot {
+    SessionSnapshot {
+        protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+        agents,
+        workspaces: vec![WorkspaceInfo {
+            workspace_id: "w1".to_string(),
+            label: Some("api".to_string()),
+            agent_status: AgentStatus::Blocked,
+            focused: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 /// A blocked agent first, an idle one behind it. The blocked one owns key 0.
-fn two_agents(second_status: &str) -> serde_json::Value {
+fn two_agents(second_status: AgentStatus) -> SessionSnapshot {
     snapshot(vec![
-        agent("term_a", "w1:p9", "refactor-auth", "blocked", 100),
+        agent(
+            "term_a",
+            "w1:p9",
+            "refactor-auth",
+            AgentStatus::Blocked,
+            100,
+        ),
         agent("term_b", "w1:p2", "flaky-tests", second_status, 50),
     ])
 }
 
 /// A mock herdr that answers a snapshot and accepts focus calls.
-async fn mock_herdr(snapshot: serde_json::Value) -> MockHerdr {
+async fn mock_herdr(snapshot: SessionSnapshot) -> MockHerdr {
     let mock = MockHerdr::start().await;
-    mock.reply("session.snapshot", snapshot).await;
-    mock.reply("agent.focus", json!({"type": "ok"})).await;
-    mock.reply("workspace.focus", json!({"type": "ok"})).await;
+    mock.serve_session(&snapshot).await;
     mock
 }
 
@@ -319,7 +327,7 @@ fn dial_indices(messages: &[DaemonMessage]) -> Vec<usize> {
 
 #[tokio::test]
 async fn a_hello_is_answered_with_ready_and_one_image_for_every_key_and_dial() {
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 
@@ -364,7 +372,7 @@ async fn a_hello_is_answered_with_ready_and_one_image_for_every_key_and_dial() {
 async fn a_frontend_speaking_a_different_protocol_is_told_so_and_disconnected() {
     // The macOS plugin installs separately from the daemon, so version skew is real. Failing
     // loudly here is the difference between "reinstall the plugin" and "the deck is broken".
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 
@@ -387,7 +395,7 @@ async fn a_frontend_speaking_a_different_protocol_is_told_so_and_disconnected() 
 async fn a_frontend_that_does_not_say_hello_first_is_rejected() {
     // Without a hello there is no hardware description, so there is no layout and nothing
     // sensible to paint. Dropping the connection is better than serving a guess.
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 
@@ -403,7 +411,7 @@ async fn a_frontend_that_does_not_say_hello_first_is_rejected() {
 
 #[tokio::test]
 async fn a_change_in_herdr_repaints_the_deck_unasked_and_resends_only_the_keys_that_changed() {
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 
@@ -414,7 +422,7 @@ async fn a_change_in_herdr_repaints_the_deck_unasked_and_resends_only_the_keys_t
 
     // The second agent starts working. It keeps its place in the attention order (blocked still
     // sorts first) and it is not an attention state, so exactly one tile can have changed.
-    mock.reply("session.snapshot", two_agents("working")).await;
+    mock.serve_session(&two_agents(AgentStatus::Working)).await;
 
     // Nobody asked for this: the frontend is not polling, the daemon pushes.
     let repaint = frontend.read(1).await;
@@ -437,7 +445,7 @@ async fn a_change_in_herdr_repaints_the_deck_unasked_and_resends_only_the_keys_t
 async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_terminal_id() {
     // herdr's `agent.focus` does not accept a terminal_id, and terminal ids are what the layout
     // binds to. Getting this resolution wrong focuses nothing at all.
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 
@@ -461,13 +469,10 @@ async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_term
         other => panic!("expected feedback on the pressed key, got {other:?}"),
     }
 
-    let params = mock
-        .observed_params("agent.focus")
-        .await
-        .expect("pressing an agent key must call agent.focus");
     assert_eq!(
-        params["target"], "w1:p9",
-        "agent.focus takes the pane id; the terminal id would not resolve"
+        mock.agent_focus_targets().await,
+        vec!["w1:p9"],
+        "focus takes the pane id; the terminal id the key is bound to would not resolve"
     );
 }
 
@@ -475,7 +480,7 @@ async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_term
 async fn a_re_hello_reporting_new_hardware_rebuilds_the_layout_and_greets_again() {
     // The macOS plugin discovers its dials as their actions appear, so the first hello can
     // honestly say "no dials" and a later one "four".
-    let mock = mock_herdr(two_agents("idle")).await;
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
     let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
     daemon.wait_until_online().await;
 

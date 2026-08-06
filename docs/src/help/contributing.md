@@ -27,9 +27,18 @@ On Linux the HID frontend needs `libudev-dev` (`pkg-config` too).
 
 ## The rules worth knowing
 
-**All herdr protocol knowledge stays in `herdr-deck-herdr`.** Nothing above it should construct a
-herdr method name or match on a herdr JSON field. That is what makes a herdr protocol change a
-one-crate fix.
+**All herdr protocol knowledge stays in `herdr-deck-herdr`.** No production code above it should
+construct a herdr method name or match on a herdr JSON field. That is what makes a herdr
+protocol change a one-crate fix.
+
+Tests are the one place this needs qualifying, because standing up a fake herdr inevitably
+touches its surface. The rule there is: build fixtures from the **typed wire structs**
+(`AgentInfo`, `SessionSnapshot`) rather than hand-written JSON, and reach for an intent-level
+helper on `MockHerdr` (`serve_session`, `agent_focus_targets`, …) rather than naming a method.
+When no helper fits, add one to `herdr-deck-herdr::mock` — that keeps new protocol knowledge
+accumulating in the crate that owns it. Some older tests still call `mock.reply("…")` with a
+raw method name; those are worth converting when you are next in the file, not worth a
+dedicated sweep.
 
 **Frontends stay dumb.** If you find yourself deciding what a key *means* in the plugin or the
 HID driver, it belongs in the daemon. Anything else and the two platforms drift apart one small
