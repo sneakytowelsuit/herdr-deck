@@ -50,7 +50,16 @@ impl DeckModel {
             DeckModel::Original => (5, 3, 72, 0, None),
             DeckModel::Mini => (3, 2, 80, 0, None),
             DeckModel::Xl => (8, 4, 96, 0, None),
-            DeckModel::Plus => (4, 2, 120, 4, Some(TouchStrip { width: 800, height: 100 })),
+            DeckModel::Plus => (
+                4,
+                2,
+                120,
+                4,
+                Some(TouchStrip {
+                    width: 800,
+                    height: 100,
+                }),
+            ),
             DeckModel::Neo => (4, 2, 96, 0, None),
             DeckModel::Pedal => (3, 1, 0, 0, None),
             DeckModel::Unknown => (5, 3, 72, 0, None),
@@ -184,10 +193,18 @@ mod tests {
 
     #[test]
     fn dial_less_models_report_no_dials() {
-        for model in [DeckModel::Original, DeckModel::Mini, DeckModel::Xl, DeckModel::Neo] {
+        for model in [
+            DeckModel::Original,
+            DeckModel::Mini,
+            DeckModel::Xl,
+            DeckModel::Neo,
+        ] {
             let caps = model.capabilities();
             assert!(!caps.has_dials(), "{model:?} should have no dials");
-            assert!(!caps.has_touchstrip(), "{model:?} should have no touchstrip");
+            assert!(
+                !caps.has_touchstrip(),
+                "{model:?} should have no touchstrip"
+            );
         }
     }
 

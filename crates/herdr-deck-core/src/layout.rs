@@ -73,11 +73,17 @@ impl ScrubTarget {
 pub enum KeyBinding {
     /// The Nth entry of the current mode's list. Contents change as agents come and go —
     /// this is what makes the deck useful with zero configuration.
-    Dynamic { rank: usize },
+    Dynamic {
+        rank: usize,
+    },
     /// Always this agent, whatever it is doing.
-    PinnedAgent { terminal_id: String },
+    PinnedAgent {
+        terminal_id: String,
+    },
     /// Always this workspace.
-    PinnedWorkspace { workspace_id: String },
+    PinnedWorkspace {
+        workspace_id: String,
+    },
     /// Jump straight to the top-ranked agent that wants you.
     NextAttention,
     /// Switch between agents and workspaces.
@@ -85,7 +91,10 @@ pub enum KeyBinding {
     PagePrev,
     PageNext,
     /// Dial degradation for hardware without encoders.
-    Scrub { target: ScrubTarget, delta: i32 },
+    Scrub {
+        target: ScrubTarget,
+        delta: i32,
+    },
     Empty,
 }
 
@@ -101,11 +110,20 @@ pub enum DialBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotAction {
     /// Focus an agent: herdr focus **and** raise the terminal window.
-    FocusAgent { terminal_id: String },
-    FocusWorkspace { workspace_id: String },
+    FocusAgent {
+        terminal_id: String,
+    },
+    FocusWorkspace {
+        workspace_id: String,
+    },
     ToggleMode,
-    ChangePage { delta: i32 },
-    Scrub { target: ScrubTarget, delta: i32 },
+    ChangePage {
+        delta: i32,
+    },
+    Scrub {
+        target: ScrubTarget,
+        delta: i32,
+    },
     /// Nothing bound, or nothing there right now.
     None,
 }
@@ -249,7 +267,9 @@ fn default_keys(caps: &DeckCapabilities, has_dials: bool) -> Vec<KeyBinding> {
     reserved.truncate(max_reserved);
 
     let dynamic = total - reserved.len();
-    let mut keys: Vec<KeyBinding> = (0..dynamic).map(|rank| KeyBinding::Dynamic { rank }).collect();
+    let mut keys: Vec<KeyBinding> = (0..dynamic)
+        .map(|rank| KeyBinding::Dynamic { rank })
+        .collect();
     keys.extend(reserved);
     keys
 }
@@ -338,11 +358,7 @@ impl<'a> ResolvedDeck<'a> {
                 active: self.page + 1 < self.page_count(),
             },
             KeyBinding::Scrub { target, delta } => Tile::Mode {
-                label: format!(
-                    "{} {}",
-                    if *delta < 0 { "◀" } else { "▶" },
-                    target.label()
-                ),
+                label: format!("{} {}", if *delta < 0 { "◀" } else { "▶" }, target.label()),
                 active: true,
             },
             KeyBinding::Empty => Tile::Empty,
@@ -351,7 +367,11 @@ impl<'a> ResolvedDeck<'a> {
 
     fn list_tile(&self, index: usize) -> Tile {
         match self.mode {
-            Mode::Agents => self.state.agent_at(index).map(agent_tile).unwrap_or(Tile::Empty),
+            Mode::Agents => self
+                .state
+                .agent_at(index)
+                .map(agent_tile)
+                .unwrap_or(Tile::Empty),
             Mode::Workspaces => self
                 .state
                 .workspaces
@@ -477,7 +497,10 @@ impl<'a> ResolvedDeck<'a> {
     }
 
     /// Title and value for the touchstrip segment above `dial`.
-    pub fn dial_feedback(&self, dial: usize) -> (String, String, Option<herdr_deck_herdr::wire::AgentStatus>) {
+    pub fn dial_feedback(
+        &self,
+        dial: usize,
+    ) -> (String, String, Option<herdr_deck_herdr::wire::AgentStatus>) {
         let Some(DialBinding::Scrub { target }) = self.profile.dials.get(dial) else {
             return (String::new(), String::new(), None);
         };
@@ -805,7 +828,10 @@ mod tests {
     fn scrubbing_wraps_at_both_ends_so_a_dial_never_gets_stuck() {
         let mut sel = Selection::default();
         sel.scrub(ScrubTarget::Agents, -1, 3);
-        assert_eq!(sel.agents, 2, "scrolling back from the top wraps to the end");
+        assert_eq!(
+            sel.agents, 2,
+            "scrolling back from the top wraps to the end"
+        );
         sel.scrub(ScrubTarget::Agents, 1, 3);
         assert_eq!(sel.agents, 0, "scrolling past the end wraps to the top");
         sel.scrub(ScrubTarget::Agents, 7, 3);

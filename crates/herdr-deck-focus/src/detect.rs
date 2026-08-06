@@ -155,7 +155,11 @@ mod tests {
             current_desktop: Some("KDE".into()),
             ..linux()
         };
-        assert_eq!(detect(&env), Backend::Hyprland, "the first unambiguous signal wins");
+        assert_eq!(
+            detect(&env),
+            Backend::Hyprland,
+            "the first unambiguous signal wins"
+        );
     }
 
     #[test]
@@ -250,7 +254,10 @@ mod tests {
             hyprland_signature: Some("abc".into()),
             ..linux()
         };
-        assert_eq!(detect_or_override(&env, Some("nonsense")), Backend::Hyprland);
+        assert_eq!(
+            detect_or_override(&env, Some("nonsense")),
+            Backend::Hyprland
+        );
     }
 
     #[test]

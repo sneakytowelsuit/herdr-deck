@@ -280,8 +280,14 @@ mod tests {
     fn the_launchd_plist_is_well_formed_xml() {
         let plist = launchd_plist(Path::new("/usr/local/bin/herdr-deckd"));
         assert!(plist.starts_with("<?xml"));
-        assert_eq!(plist.matches("<dict>").count(), plist.matches("</dict>").count());
-        assert_eq!(plist.matches("<array>").count(), plist.matches("</array>").count());
+        assert_eq!(
+            plist.matches("<dict>").count(),
+            plist.matches("</dict>").count()
+        );
+        assert_eq!(
+            plist.matches("<array>").count(),
+            plist.matches("</array>").count()
+        );
         assert!(plist.trim_end().ends_with("</plist>"));
     }
 

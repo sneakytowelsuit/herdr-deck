@@ -141,7 +141,14 @@ impl TileRenderer {
                 focused,
             } => {
                 let style = self.theme.status(*status);
-                self.agent_svg(s, label, sublabel.as_deref(), workspace.as_deref(), style, *focused)
+                self.agent_svg(
+                    s,
+                    label,
+                    sublabel.as_deref(),
+                    workspace.as_deref(),
+                    style,
+                    *focused,
+                )
             }
             Tile::Workspace {
                 label,
@@ -499,8 +506,8 @@ pub fn wrap_text(text: &str, max_px: f32, font_px: f32, max_lines: usize) -> Vec
 
     // Anything that did not fit gets folded into an ellipsis on the final line.
     if lines.len() == max_lines {
-        let consumed: usize = lines.iter().map(|l| l.chars().count()).sum::<usize>()
-            + lines.len().saturating_sub(1);
+        let consumed: usize =
+            lines.iter().map(|l| l.chars().count()).sum::<usize>() + lines.len().saturating_sub(1);
         if consumed < text.chars().count() {
             if let Some(last) = lines.last_mut() {
                 *last = truncate_to_width(&format!("{last}…"), max_px, font_px);
@@ -611,7 +618,13 @@ mod tests {
     fn renders_a_touchstrip_segment() {
         let r = renderer();
         let png = r
-            .render_strip("agent", "refactor-auth", Some(AgentStatus::Blocked), 200, 100)
+            .render_strip(
+                "agent",
+                "refactor-auth",
+                Some(AgentStatus::Blocked),
+                200,
+                100,
+            )
             .expect("strip renders");
         assert!(is_png(&png));
     }
@@ -660,7 +673,9 @@ mod tests {
             status: AgentStatus::Working,
             focused: false,
         };
-        let png = r.render_key(&tile, 120).expect("renders despite metacharacters");
+        let png = r
+            .render_key(&tile, 120)
+            .expect("renders despite metacharacters");
         assert!(is_png(&png));
     }
 
@@ -720,7 +735,10 @@ mod tests {
     fn a_separator_too_early_in_the_word_is_ignored_to_avoid_wasting_a_line() {
         let narrow = 10.0 * 16.0 * AVG_ADVANCE;
         let lines = wrap_text("a-verylongwordhere", narrow, 16.0, 2);
-        assert_ne!(lines[0], "a-", "breaking there would waste most of the line");
+        assert_ne!(
+            lines[0], "a-",
+            "breaking there would waste most of the line"
+        );
     }
 
     #[test]

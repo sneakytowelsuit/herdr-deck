@@ -99,7 +99,13 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for check in &self.checks {
-            let _ = writeln!(out, "[{}] {}: {}", check.level.marker(), check.name, check.detail);
+            let _ = writeln!(
+                out,
+                "[{}] {}: {}",
+                check.level.marker(),
+                check.name,
+                check.detail
+            );
             if let Some(remedy) = &check.remedy {
                 for line in wrap(remedy, 76) {
                     let _ = writeln!(out, "         → {line}");
@@ -126,7 +132,9 @@ pub async fn run(config_path: &Path, config: &Config, session: Option<&str>) -> 
     if let Some(check) = check_herdr_protocol(&client).await {
         report.checks.push(check);
     }
-    report.checks.push(check_daemon_socket(&daemon_socket_path()).await);
+    report
+        .checks
+        .push(check_daemon_socket(&daemon_socket_path()).await);
     report.checks.extend(check_focus(config));
     report
 }
@@ -277,7 +285,11 @@ fn check_backend_tools(backend: Backend) -> Check {
         // Backends list alternatives, so a partial set is fine.
         Check::ok(
             "window tools",
-            format!("found some of {} (missing: {})", required.join(", "), missing.join(", ")),
+            format!(
+                "found some of {} (missing: {})",
+                required.join(", "),
+                missing.join(", ")
+            ),
         )
     }
 }
@@ -368,11 +380,7 @@ mod tests {
             ],
         };
         for check in &report.checks {
-            assert!(
-                check.remedy.is_some(),
-                "{} has no remedy",
-                check.name
-            );
+            assert!(check.remedy.is_some(), "{} has no remedy", check.name);
         }
     }
 
@@ -434,7 +442,11 @@ mod tests {
             .await;
         let client = HerdrClient::new(mock.socket_path());
         let check = check_herdr_protocol(&client).await.unwrap();
-        assert_eq!(check.level, Level::Warn, "additive changes are usually harmless");
+        assert_eq!(
+            check.level,
+            Level::Warn,
+            "additive changes are usually harmless"
+        );
     }
 
     #[tokio::test]

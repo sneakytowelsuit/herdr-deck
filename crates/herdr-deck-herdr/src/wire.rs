@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 /// Caveat worth knowing: herdr only marks `Blocked` when a live screen snapshot matches a known
 /// approval/question/permission UI. An unrecognised prompt shape falls back to `Idle`. The deck
 /// can only ever be as accurate as herdr's detection; `herdr agent explain <target>` diagnoses it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Idle,
@@ -29,7 +31,9 @@ pub enum AgentStatus {
     Blocked,
     Done,
     /// herdr could not confidently classify the state. Also the landing spot for any status
-    /// string a future herdr adds that we do not know about yet.
+    /// string a future herdr adds that we do not know about yet — and therefore the safest
+    /// default.
+    #[default]
     #[serde(other)]
     Unknown,
 }
@@ -59,12 +63,6 @@ impl AgentStatus {
             AgentStatus::Done => "done",
             AgentStatus::Unknown => "unknown",
         }
-    }
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self {
-        AgentStatus::Unknown
     }
 }
 

@@ -270,7 +270,10 @@ impl<R: CommandRunner> FocusEngine<R> {
         let commands = self.backend.raise_commands(&target);
         if commands.is_empty() {
             return RaiseOutcome::Unsupported {
-                reason: format!("no window-raise commands for backend {}", self.backend.name()),
+                reason: format!(
+                    "no window-raise commands for backend {}",
+                    self.backend.name()
+                ),
             };
         }
 
@@ -394,7 +397,10 @@ mod tests {
         assert!(!report.herdr_focused);
         assert!(!report.fully_succeeded());
         assert!(report.error.as_deref().unwrap().contains("pane not found"));
-        assert!(runner.ran().is_empty(), "must not raise a window on failure");
+        assert!(
+            runner.ran().is_empty(),
+            "must not raise a window on failure"
+        );
     }
 
     #[tokio::test]

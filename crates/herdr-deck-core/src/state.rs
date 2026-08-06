@@ -35,7 +35,7 @@ impl DeckState {
             protocol: snapshot.protocol,
             offline_reason: None,
         };
-        state.agents.sort_by(|a, b| attention_order(a, b));
+        state.agents.sort_by(attention_order);
         state
     }
 
@@ -280,8 +280,12 @@ mod tests {
     fn lookups_by_stable_terminal_id_survive_a_pane_moving_workspace() {
         // pane_id changes on a cross-workspace move; terminal_id does not. A key bound to an
         // agent must keep working after the user reorganises.
-        let before = DeckState::from_snapshot(snapshot(vec![agent("term_x", AgentStatus::Idle, 1)]));
-        assert_eq!(before.agent_by_terminal_id("term_x").unwrap().pane_id, "w1:term_x");
+        let before =
+            DeckState::from_snapshot(snapshot(vec![agent("term_x", AgentStatus::Idle, 1)]));
+        assert_eq!(
+            before.agent_by_terminal_id("term_x").unwrap().pane_id,
+            "w1:term_x"
+        );
 
         let mut moved = agent("term_x", AgentStatus::Idle, 2);
         moved.pane_id = "w7:p4".into();

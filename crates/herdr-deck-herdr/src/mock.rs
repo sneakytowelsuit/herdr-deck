@@ -21,7 +21,10 @@ use crate::socket::{SocketOrigin, SocketPath};
 #[derive(Debug, Clone)]
 enum Behaviour {
     Result(serde_json::Value),
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
     /// Close the connection without answering.
     HangUp,
 }
@@ -218,10 +221,7 @@ async fn handle(
             method: method.clone(),
             params,
         });
-        (
-            guard.behaviours.get(&method).cloned(),
-            guard.events.clone(),
-        )
+        (guard.behaviours.get(&method).cloned(), guard.events.clone())
     };
 
     // `events.subscribe` is one of only two methods that keep the connection open.

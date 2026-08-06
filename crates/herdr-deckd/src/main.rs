@@ -74,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
         return dry_run(&config, dir, &args.dry_run_model);
     }
 
-    let session_name = args.session.clone().or_else(|| config.herdr_session.clone());
+    let session_name = args
+        .session
+        .clone()
+        .or_else(|| config.herdr_session.clone());
     let client = HerdrClient::from_env(session_name.as_deref());
     tracing::info!(
         socket = %client.socket().display(),

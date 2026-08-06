@@ -137,7 +137,9 @@ impl Session {
                 Outcome::just(self.repaint(state))
             }
             // Acting on key *down* rather than up makes the deck feel immediate.
-            FrontendMessage::KeyDown { index } => self.act(self.resolved(state).key_action(index), Some(index), state),
+            FrontendMessage::KeyDown { index } => {
+                self.act(self.resolved(state).key_action(index), Some(index), state)
+            }
             FrontendMessage::KeyUp { .. } => Outcome::default(),
             FrontendMessage::DialRotate { dial, ticks } => {
                 let action = self.resolved(state).dial_rotate_action(dial, ticks);
@@ -408,7 +410,11 @@ mod tests {
             }
             other => panic!("expected ready first, got {other:?}"),
         }
-        assert_eq!(key_indices(&messages).len(), 8, "first paint covers every key");
+        assert_eq!(
+            key_indices(&messages).len(),
+            8,
+            "first paint covers every key"
+        );
     }
 
     #[test]
@@ -611,7 +617,10 @@ mod tests {
         let offline = DeckState::offline("herdr not running");
         session.greet(&offline);
         for index in 0..8 {
-            assert!(matches!(session.tile_at(index, &offline), Tile::Offline { .. }));
+            assert!(matches!(
+                session.tile_at(index, &offline),
+                Tile::Offline { .. }
+            ));
         }
         let outcome = session.handle(FrontendMessage::KeyDown { index: 0 }, &offline);
         assert!(outcome.action.is_none());

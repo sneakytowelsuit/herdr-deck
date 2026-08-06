@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (for a dry run)
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p herdr-deckd -p herdr-deck-cli
+
+      - name: Package
+        run: |
+          staging="herdr-deck-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/herdr-deckd" "$staging/"
+          cp "target/${{ matrix.target }}/release/herdr-deck" "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-deck-${{ matrix.target }}
+          path: herdr-deck-*.tar.gz
+
+  plugin:
+    name: Stream Deck plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Build and validate
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+          npx --yes @elgato/cli@latest validate com.sneakytowelsuit.herdr-deck.sdPlugin
+
+      # `streamdeck pack` produces the .streamDeckPlugin a user can double-click to install.
+      - name: Pack
+        working-directory: plugin
+        run: npx --yes @elgato/cli@latest pack com.sneakytowelsuit.herdr-deck.sdPlugin --force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamdeck-plugin
+          path: plugin/*.streamDeckPlugin
+
+  release:
+    needs: [binaries, plugin]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.streamDeckPlugin
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **Linux** — extract the archive for your architecture, then:
+
+            ```sh
+            ./herdr-deck service install
+            ```
+
+            and add the udev rule it prints so the deck is reachable without root.
+
+            **macOS** — extract the archive, run `./herdr-deck service install`, then
+            double-click `herdr-deck.streamDeckPlugin` and drag **herdr Agent** onto your keys.
+
+            Run `herdr-deck doctor` afterwards; it checks everything and prints a fix for
+            anything that is wrong.
+
+            Full documentation: https://sneakytowelsuit.github.io/herdr-deck/

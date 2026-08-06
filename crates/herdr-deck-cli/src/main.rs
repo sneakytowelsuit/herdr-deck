@@ -219,7 +219,10 @@ fn report_udev_rule() {
     use std::path::Path;
 
     if Path::new(herdr_deck_hid::UDEV_RULE_PATH).exists() {
-        println!("\nudev rule already installed at {}.", herdr_deck_hid::UDEV_RULE_PATH);
+        println!(
+            "\nudev rule already installed at {}.",
+            herdr_deck_hid::UDEV_RULE_PATH
+        );
         return;
     }
     println!(
@@ -260,8 +263,12 @@ mod tests {
         // debug output would be a poor answer.
         let bindings = [
             KeyBinding::Dynamic { rank: 0 },
-            KeyBinding::PinnedAgent { terminal_id: "t".into() },
-            KeyBinding::PinnedWorkspace { workspace_id: "w".into() },
+            KeyBinding::PinnedAgent {
+                terminal_id: "t".into(),
+            },
+            KeyBinding::PinnedWorkspace {
+                workspace_id: "w".into(),
+            },
             KeyBinding::NextAttention,
             KeyBinding::ModeToggle,
             KeyBinding::PagePrev,

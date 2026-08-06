@@ -38,7 +38,11 @@ pub fn default_socket_path() -> PathBuf {
         }
     }
     directories::BaseDirs::new()
-        .map(|dirs| dirs.data_local_dir().join("herdr-deck").join("herdr-deck.sock"))
+        .map(|dirs| {
+            dirs.data_local_dir()
+                .join("herdr-deck")
+                .join("herdr-deck.sock")
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp/herdr-deck.sock"))
 }
 
@@ -57,15 +61,14 @@ pub async fn bind(path: &Path) -> anyhow::Result<UnixListener> {
                 path.display()
             ),
             Err(_) => {
-                std::fs::remove_file(path).with_context(|| {
-                    format!("could not remove stale socket {}", path.display())
-                })?;
+                std::fs::remove_file(path)
+                    .with_context(|| format!("could not remove stale socket {}", path.display()))?;
             }
         }
     }
 
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("could not bind {}", path.display()))?;
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("could not bind {}", path.display()))?;
     restrict_permissions(path)?;
     Ok(listener)
 }

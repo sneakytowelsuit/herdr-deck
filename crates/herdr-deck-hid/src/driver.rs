@@ -103,7 +103,9 @@ async fn attach_once(socket_path: &Path) -> anyhow::Result<()> {
                 }
             };
             for update in updates {
-                let Some(event) = to_event(update) else { continue };
+                let Some(event) = to_event(update) else {
+                    continue;
+                };
                 let Some(message) = translate(event, dials, strip_width) else {
                     continue;
                 };

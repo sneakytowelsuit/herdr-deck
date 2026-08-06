@@ -115,12 +115,20 @@ impl Backend {
                 if let Some(marker) = &target.title_marker {
                     cmds.push(CommandSpec::new(
                         "hyprctl",
-                        &["dispatch", "focuswindow", &format!("title:^(.*{marker}.*)$")],
+                        &[
+                            "dispatch",
+                            "focuswindow",
+                            &format!("title:^(.*{marker}.*)$"),
+                        ],
                     ));
                 }
                 cmds.push(CommandSpec::new(
                     "hyprctl",
-                    &["dispatch", "focuswindow", &format!("class:^({})$", target.app_id)],
+                    &[
+                        "dispatch",
+                        "focuswindow",
+                        &format!("class:^({})$", target.app_id),
+                    ],
                 ));
                 cmds
             }
@@ -242,7 +250,10 @@ mod tests {
                     "{backend:?} emitted a marker command with no marker set"
                 );
             }
-            assert!(!cmds.is_empty(), "{backend:?} still needs an app-level path");
+            assert!(
+                !cmds.is_empty(),
+                "{backend:?} still needs an app-level path"
+            );
         }
     }
 

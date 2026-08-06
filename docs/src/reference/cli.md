@@ -1,0 +1,103 @@
+# CLI
+
+Two binaries: `herdr-deck` (the tool you run) and `herdr-deckd` (the daemon).
+
+## `herdr-deck`
+
+### `doctor`
+
+The one command to run when something is wrong. It checks the config, herdr's socket and
+protocol version, whether the daemon is running, which window-raise backend was selected, and
+whether its helper tools are installed.
+
+```console
+$ herdr-deck doctor
+[ok  ] config: no file at /home/you/.config/herdr-deck/config.toml — using defaults
+[ok  ] herdr socket: /home/you/.config/herdr/herdr.sock (via default session)
+[ok  ] herdr protocol: protocol 19, 4 agent(s) visible
+[ok  ] herdr-deckd: running, socket /run/user/1000/herdr-deck.sock
+[ok  ] window raising: backend `hyprland`
+[ok  ] window tools: found hyprctl
+[ok  ] terminal: targeting `com.mitchellh.ghostty`
+
+Everything looks good.
+```
+
+Every problem it reports comes with the command that fixes it. It exits non-zero only on a real
+failure — a warning (say, GNOME Wayland) still exits `0`, so a health check does not call a
+working deck broken.
+
+### `status`
+
+What herdr currently reports, in the same order the deck uses.
+
+```sh
+herdr-deck status
+herdr-deck status --json    # includes terminal_id, for pinning keys
+```
+
+### `layout`
+
+What each control would do on a given deck. Needs no hardware.
+
+```sh
+herdr-deck layout --model plus
+herdr-deck layout --model xl
+```
+
+Models: `plus`, `original`/`mk2`, `mini`, `xl`, `neo`, `pedal`.
+
+### `install`
+
+Writes a starter config, and on Linux prints the udev rule the deck needs.
+
+```sh
+herdr-deck install [--force]
+```
+
+### `service`
+
+Manages the daemon under `launchd` (macOS) or `systemd --user` (Linux).
+
+```sh
+herdr-deck service install     # write the unit and start it
+herdr-deck service start|stop|restart|status
+herdr-deck service show        # print the unit without writing it
+herdr-deck service uninstall
+```
+
+### `icons`
+
+Regenerates the Stream Deck plugin's icon set from the theme. A build-time tool.
+
+```sh
+herdr-deck icons --out plugin/com.sneakytowelsuit.herdr-deck.sdPlugin/imgs
+```
+
+## `herdr-deckd`
+
+Normally started by the service manager. Run it directly to watch what it is doing:
+
+```sh
+herdr-deckd --log debug
+```
+
+| Flag | Meaning |
+|---|---|
+| `--config PATH` | Config file. |
+| `--socket PATH` | Frontend socket path. |
+| `--session NAME` | herdr session to attach to. |
+| `--log FILTER` | Log filter (also `HERDR_DECK_LOG`). |
+| `--dry-run DIR` | Render the layout to PNGs and exit. |
+| `--dry-run-model M` | Hardware to assume for `--dry-run`. |
+
+### `--dry-run`
+
+Renders every key and dial image for a model into a directory, using a sample state that
+exercises all five agent statuses. No herdr, no hardware, no deck:
+
+```sh
+herdr-deckd --dry-run /tmp/tiles --dry-run-model plus
+```
+
+Useful for checking a theme change, and how the docs and CI get their images.

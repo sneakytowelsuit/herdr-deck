@@ -85,7 +85,8 @@ impl Watcher {
                     tokio::time::sleep(COALESCE).await;
                     while let Ok(Ok(Some(_))) =
                         tokio::time::timeout(Duration::from_millis(1), events.next()).await
-                    {}
+                    {
+                    }
                     self.reconcile(tx).await?;
                 }
                 // herdr closed the subscription.
@@ -177,7 +178,8 @@ mod tests {
     #[tokio::test]
     async fn publishes_state_from_the_bootstrap_snapshot() {
         let mock = MockHerdr::start().await;
-        mock.reply("session.snapshot", snapshot_with("blocked")).await;
+        mock.reply("session.snapshot", snapshot_with("blocked"))
+            .await;
         let config = Config::default();
         let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &config);
         let mut rx = watcher.spawn();
@@ -208,7 +210,8 @@ mod tests {
     #[tokio::test]
     async fn an_event_triggers_a_fresh_snapshot() {
         let mock = MockHerdr::start().await;
-        mock.reply("session.snapshot", snapshot_with("working")).await;
+        mock.reply("session.snapshot", snapshot_with("working"))
+            .await;
         mock.queue_events(vec![json!({
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "blocked"
@@ -324,9 +327,7 @@ mod tests {
     #[test]
     fn offline_messages_are_short_enough_for_a_key_and_say_what_is_wrong() {
         let cases = [
-            HerdrError::SocketMissing {
-                path: "/x".into(),
-            },
+            HerdrError::SocketMissing { path: "/x".into() },
             HerdrError::Rpc {
                 method: "m".into(),
                 code: "denied".into(),
