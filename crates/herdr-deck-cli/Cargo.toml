@@ -1,7 +1,30 @@
 [package]
 name = "herdr-deck-cli"
+description = "The herdr-deck command line tool: doctor, status, layout and install"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "herdr-deck"
+path = "src/main.rs"
 
 [dependencies]
+herdr-deck-herdr.workspace = true
+herdr-deck-core.workspace = true
+herdr-deck-focus.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+herdr-deck-herdr = { workspace = true, features = ["mock"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -9,6 +9,7 @@
 pub mod capabilities;
 pub mod config;
 pub mod layout;
+pub mod protocol;
 pub mod render;
 pub mod state;
 pub mod theme;
@@ -18,6 +19,7 @@ pub use config::Config;
 pub use layout::{
     DialBinding, KeyBinding, Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction,
 };
+pub use protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 pub use render::{Tile, TileRenderer};
 pub use state::{DeckState, StatusCounts};
 pub use theme::Theme;

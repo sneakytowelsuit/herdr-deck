@@ -1,1 +1,267 @@
-fn main() {}
+//! `herdr-deck` — the command-line companion to the daemon.
+//!
+//! Diagnostics, a look at what the deck currently shows, and the installer that adapts to
+//! whatever hardware is plugged in.
+
+mod doctor;
+mod service;
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use herdr_deck_core::capabilities::DeckModel;
+use herdr_deck_core::layout::{KeyBinding, Profile};
+use herdr_deck_core::Config;
+use herdr_deck_herdr::HerdrClient;
+
+#[derive(Debug, Parser)]
+#[command(name = "herdr-deck", about = "Stream Deck control for herdr", version)]
+struct Args {
+    /// Config file. Defaults to ~/.config/herdr-deck/config.toml.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// herdr session name, equivalent to `herdr --session <name>`.
+    #[arg(long, global = true, value_name = "NAME")]
+    session: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Check everything and explain anything that is wrong.
+    Doctor,
+    /// Show what herdr currently reports, in attention order.
+    Status {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the layout that would be used for a given deck.
+    Layout {
+        /// Hardware model: plus, original, mini, xl, neo, pedal.
+        #[arg(long, default_value = "plus")]
+        model: String,
+    },
+    /// Write a starter config matched to the attached hardware.
+    Install {
+        /// Overwrite an existing config.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Manage the background service.
+    Service {
+        #[command(subcommand)]
+        action: service::Action,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let config_path = args
+        .config
+        .clone()
+        .or_else(Config::default_path)
+        .unwrap_or_else(|| PathBuf::from("herdr-deck.toml"));
+    // Doctor has to run even when the config is broken — diagnosing that is its job.
+    let config = Config::load(&config_path).unwrap_or_default();
+
+    match args.command {
+        Command::Doctor => {
+            let report = doctor::run(&config_path, &config, args.session.as_deref()).await;
+            print!("{}", report.render());
+            std::process::exit(report.exit_code());
+        }
+        Command::Status { json } => status(&config, args.session.as_deref(), json).await,
+        Command::Layout { model } => layout(&model),
+        Command::Install { force } => install(&config_path, force),
+        Command::Service { action } => service::run(action),
+    }
+}
+
+async fn status(config: &Config, session: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let client = HerdrClient::from_env(session.or(config.herdr_session.as_deref()));
+    let snapshot = client.session_snapshot().await?;
+    let state = herdr_deck_core::state::DeckState::from_snapshot(snapshot);
+
+    if json {
+        let agents: Vec<_> = state
+            .attention_order()
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "terminal_id": a.terminal_id,
+                    "pane_id": a.pane_id,
+                    "workspace_id": a.workspace_id,
+                    "status": a.agent_status.as_str(),
+                    "label": a.label(),
+                    "focused": a.focused,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&agents)?);
+        return Ok(());
+    }
+
+    let counts = state.status_counts();
+    println!(
+        "{} agent(s): {} blocked, {} done, {} working, {} idle, {} unknown\n",
+        counts.total(),
+        counts.blocked,
+        counts.done,
+        counts.working,
+        counts.idle,
+        counts.unknown
+    );
+    // Attention order, so the top line is always what to look at first.
+    for agent in state.attention_order() {
+        println!(
+            "  {:<8} {:<24} {:<10} {}",
+            agent.agent_status.as_str(),
+            agent.label(),
+            agent.workspace_id,
+            agent.pane_id
+        );
+    }
+    if counts.needing_attention() == 0 {
+        println!("\nNothing is waiting on you.");
+    }
+    Ok(())
+}
+
+fn layout(model: &str) -> anyhow::Result<()> {
+    let model = parse_model(model)?;
+    let capabilities = model.capabilities();
+    let profile = Profile::for_capabilities(&capabilities);
+
+    println!("{}\n", capabilities.describe());
+    for (index, binding) in profile.keys.iter().enumerate() {
+        println!("  key {index:>2}  {}", describe_key(binding));
+    }
+    for (dial, binding) in profile.dials.iter().enumerate() {
+        let text = match binding {
+            herdr_deck_core::layout::DialBinding::Scrub { target } => {
+                format!("scrub {} (press to focus)", target.label())
+            }
+            herdr_deck_core::layout::DialBinding::Unused => "unused".to_string(),
+        };
+        println!("  dial {dial}   {text}");
+    }
+    Ok(())
+}
+
+fn describe_key(binding: &KeyBinding) -> String {
+    match binding {
+        KeyBinding::Dynamic { rank } => format!("agent #{rank} in attention order"),
+        KeyBinding::PinnedAgent { terminal_id } => format!("pinned agent {terminal_id}"),
+        KeyBinding::PinnedWorkspace { workspace_id } => format!("pinned workspace {workspace_id}"),
+        KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
+        KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
+        KeyBinding::PagePrev => "previous page".to_string(),
+        KeyBinding::PageNext => "next page".to_string(),
+        KeyBinding::Scrub { target, delta } => format!(
+            "{} {}",
+            if *delta < 0 { "previous" } else { "next" },
+            target.label()
+        ),
+        KeyBinding::Empty => "—".to_string(),
+    }
+}
+
+fn install(config_path: &PathBuf, force: bool) -> anyhow::Result<()> {
+    if config_path.exists() && !force {
+        println!(
+            "{} already exists; leaving it alone (pass --force to overwrite).",
+            config_path.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let config = Config::default();
+    let text = toml::to_string_pretty(&config)?;
+    std::fs::write(config_path, &text)?;
+    println!("wrote {}", config_path.display());
+    println!(
+        "\nherdr-deck adapts to whatever deck is plugged in, so there is nothing to configure \
+         for your hardware. Run `herdr-deck doctor` to check the rest."
+    );
+    Ok(())
+}
+
+fn parse_model(name: &str) -> anyhow::Result<DeckModel> {
+    match name.to_ascii_lowercase().as_str() {
+        "plus" | "+" => Ok(DeckModel::Plus),
+        "original" | "mk2" | "mk.2" => Ok(DeckModel::Original),
+        "mini" => Ok(DeckModel::Mini),
+        "xl" => Ok(DeckModel::Xl),
+        "neo" => Ok(DeckModel::Neo),
+        "pedal" => Ok(DeckModel::Pedal),
+        other => {
+            anyhow::bail!("unknown model `{other}` (try: plus, original, mini, xl, neo, pedal)")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_key_binding_has_a_human_description() {
+        // `herdr-deck layout` is how people learn what their deck does; a binding rendered as
+        // debug output would be a poor answer.
+        let bindings = [
+            KeyBinding::Dynamic { rank: 0 },
+            KeyBinding::PinnedAgent { terminal_id: "t".into() },
+            KeyBinding::PinnedWorkspace { workspace_id: "w".into() },
+            KeyBinding::NextAttention,
+            KeyBinding::ModeToggle,
+            KeyBinding::PagePrev,
+            KeyBinding::PageNext,
+            KeyBinding::Scrub {
+                target: herdr_deck_core::layout::ScrubTarget::Agents,
+                delta: 1,
+            },
+            KeyBinding::Empty,
+        ];
+        for binding in bindings {
+            let text = describe_key(&binding);
+            assert!(!text.is_empty());
+            assert!(!text.contains('{'), "{text} looks like debug output");
+        }
+    }
+
+    #[test]
+    fn layout_renders_for_every_supported_model() {
+        for model in ["plus", "original", "mini", "xl", "neo", "pedal"] {
+            layout(model).unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
+        }
+    }
+
+    #[test]
+    fn install_writes_a_config_that_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        install(&path, false).unwrap();
+        assert!(path.exists());
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, Config::default());
+    }
+
+    #[test]
+    fn install_does_not_clobber_an_existing_config_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\nreconcile_interval_ms = 4000\n").unwrap();
+        install(&path, false).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
+
+        install(&path, true).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("# mine"));
+    }
+}

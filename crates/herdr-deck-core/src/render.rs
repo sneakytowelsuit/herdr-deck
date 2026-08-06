@@ -27,7 +27,10 @@ const FONT_FAMILY: &str = "DejaVu Sans";
 const AVG_ADVANCE: f32 = 0.60;
 
 /// What a tile should say.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Hash` matters: the daemon hashes tiles to send only the keys that actually changed,
+/// rather than repainting the whole deck on every reconcile.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Tile {
     /// An agent: the main event.
     Agent {
@@ -465,12 +468,14 @@ pub fn wrap_text(text: &str, max_px: f32, font_px: f32, max_lines: usize) -> Vec
                 break;
             }
         }
-        // A single word too long for a line: hard-split it across lines.
+        // A single word too long for a line gets split. Agent names are nearly always
+        // kebab- or snake-case, so breaking after a separator ("refactor-" / "auth") reads far
+        // better than a blind cut mid-syllable ("refactor-au" / "th").
         let mut rest: String = word.to_string();
         while rest.chars().count() > limit && lines.len() < max_lines {
-            let head: String = rest.chars().take(limit).collect();
-            lines.push(head);
-            rest = rest.chars().skip(limit).collect();
+            let cut = split_point(&rest, limit);
+            lines.push(rest.chars().take(cut).collect());
+            rest = rest.chars().skip(cut).collect();
         }
         if lines.len() == max_lines {
             current.clear();
@@ -495,6 +500,25 @@ pub fn wrap_text(text: &str, max_px: f32, font_px: f32, max_lines: usize) -> Vec
     }
 
     lines
+}
+
+/// Where to break an over-long word, in characters.
+///
+/// Prefers just after the last `-` or `_` inside the limit, so `refactor-auth` becomes
+/// `refactor-` / `auth`. Falls back to a hard cut when there is no separator, or when the
+/// separator is so early that breaking there would waste most of the line.
+fn split_point(word: &str, limit: usize) -> usize {
+    let chars: Vec<char> = word.chars().collect();
+    let window = chars.len().min(limit);
+    // Requiring the break past the halfway mark stops `a-verylongword` from becoming a lonely
+    // "a-" on its own line.
+    let earliest = limit / 2;
+    for i in (earliest..window).rev() {
+        if chars[i] == '-' || chars[i] == '_' {
+            return i + 1;
+        }
+    }
+    limit
 }
 
 fn escape(text: &str) -> String {
@@ -660,6 +684,43 @@ mod tests {
                 line.chars().count() <= limit,
                 "line {line:?} exceeds {limit} chars"
             );
+        }
+    }
+
+    #[test]
+    fn a_kebab_case_agent_name_breaks_at_the_hyphen() {
+        // Agent names are nearly always kebab- or snake-case; "write-do/cs" reads badly.
+        let limit_px = 11.0 * 16.0 * AVG_ADVANCE; // room for 11 characters
+        let lines = wrap_text("write-docs", limit_px, 16.0, 2);
+        assert_eq!(lines, vec!["write-docs"], "it fits on one line here");
+
+        let narrow = 8.0 * 16.0 * AVG_ADVANCE;
+        let lines = wrap_text("write-docs", narrow, 16.0, 2);
+        assert_eq!(lines[0], "write-", "should break after the hyphen");
+        assert_eq!(lines[1], "docs");
+    }
+
+    #[test]
+    fn snake_case_breaks_at_the_underscore_too() {
+        let narrow = 9.0 * 16.0 * AVG_ADVANCE;
+        let lines = wrap_text("migrate_database", narrow, 16.0, 2);
+        assert_eq!(lines[0], "migrate_");
+    }
+
+    #[test]
+    fn a_separator_too_early_in_the_word_is_ignored_to_avoid_wasting_a_line() {
+        let narrow = 10.0 * 16.0 * AVG_ADVANCE;
+        let lines = wrap_text("a-verylongwordhere", narrow, 16.0, 2);
+        assert_ne!(lines[0], "a-", "breaking there would waste most of the line");
+    }
+
+    #[test]
+    fn a_word_with_no_separator_still_hard_splits_within_the_limit() {
+        let narrow = 8.0 * 16.0 * AVG_ADVANCE;
+        let limit = max_chars(narrow, 16.0);
+        let lines = wrap_text("abcdefghijklmnopqrstuvwxyz", narrow, 16.0, 2);
+        for line in &lines {
+            assert!(line.chars().count() <= limit);
         }
     }
 
