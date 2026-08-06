@@ -90,6 +90,7 @@ herdr-deckd --log debug
 | `--log FILTER` | Log filter (also `HERDR_DECK_LOG`). |
 | `--dry-run DIR` | Render the layout to PNGs and exit. |
 | `--dry-run-model M` | Hardware to assume for `--dry-run`. |
+| `--selftest` | Talk to the first attached deck directly and exit. Linux only. |
 
 ### `--dry-run`
 
@@ -101,3 +102,17 @@ herdr-deckd --dry-run /tmp/tiles --dry-run-model plus
 ```
 
 Useful for checking a theme change, and how the docs and CI get their images.
+
+### `--selftest`
+
+The opposite of `--dry-run`: real hardware, but no herdr and no daemon logic. Opens the first
+deck it finds over HID, paints a numbered test pattern on every key and touchstrip segment, then
+prints every input event as you press things, until Ctrl-C resets the deck and exits.
+
+```sh
+herdr-deckd --selftest
+```
+
+For first-time hardware bring-up — see [Hardware bring-up](../help/hardware-bringup.md). Linux
+only: on macOS the Elgato app owns the device, so there is nothing for this to open; use the
+Stream Deck plugin instead.

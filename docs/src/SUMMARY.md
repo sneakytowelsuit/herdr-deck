@@ -31,4 +31,5 @@
 # Help
 
 - [Troubleshooting](./help/troubleshooting.md)
+- [Hardware bring-up](./help/hardware-bringup.md)
 - [Contributing](./help/contributing.md)
