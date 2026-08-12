@@ -88,17 +88,26 @@ If herdr grew an answerable primitive tomorrow, wiring a deck key straight to "a
 reproduce the exact failure collie already shipped and reverted — just with less screen than the
 UI that was judged too blind to keep.
 
-### What would have to change upstream
+### This is a product boundary, not a waiting room
 
-The one thing that would move this position is herdr exposing an **answerable, held permission
-request** — structurally like Claude Code's `PermissionRequest` hook: a call that blocks, with a
-bounded timeout and a defined auto-deny, until herdr-deck sends back yes or no. That would let a
-press answer a specific, still-open question instead of typing blind into a pane that may have
-moved on. Nothing in the methods table above is that primitive, and it's the complete list of
-what `herdr-deck-herdr` knows how to call — see the crate-boundary rule at the top of this file.
+An earlier draft of this section framed the position as conditional: that an answerable, held
+permission primitive upstream — structurally like Claude Code's `PermissionRequest` hook, with a
+bounded timeout and a defined auto-deny — would unlock a deck approval key. That framing was
+wrong, and no such request has been filed.
 
-This has not been filed as a feature request against `herdrdev/herdr` yet. Noting it here so the
-ask stays visible instead of getting lost, rather than filing something half-thought-through.
+herdr-deck controls **herdr**. It shows you which agent needs you and takes you there; the
+conversation with the agent happens where you can read it. Approving, denying, replying and
+interrupting are all interaction with the agent inside a pane, and they stay out of scope even
+if herdr grows a primitive that would make them technically safe. The deck's job ends at the
+moment your attention arrives.
+
+That boundary is also what keeps this project from competing with the tools in the
+[herdr ecosystem](https://github.com/topics/herdr-plugin) that exist precisely to drive agents
+from away-from-desk surfaces. They solve "answer it from wherever I am". herdr-deck solves
+"notice it instantly and get there", which is a different problem and wants a different device.
+
+Write access to herdr itself — workspaces, tabs, panes, layouts — is a separate question and is
+squarely in scope; it is herdr-centric control, not agent interaction.
 
 ## Subscribing
 
