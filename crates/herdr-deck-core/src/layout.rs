@@ -511,8 +511,17 @@ impl<'a> ResolvedDeck<'a> {
         if self.state.is_offline() {
             return SlotAction::None;
         }
-        let acknowledge = |agent: &AgentInfo| SlotAction::AcknowledgeAgent {
-            terminal_id: agent.terminal_id.clone(),
+        // Only an agent that is actually asking for attention can be dismissed. Storing an
+        // acknowledgement for a working agent would do nothing visible now but arm a mute for
+        // the moment it blocks — a dismissal the user never made, for a state they never saw.
+        let acknowledge = |agent: &AgentInfo| {
+            if agent.agent_status.needs_attention() {
+                SlotAction::AcknowledgeAgent {
+                    terminal_id: agent.terminal_id.clone(),
+                }
+            } else {
+                SlotAction::None
+            }
         };
         match self.profile.keys.get(index) {
             Some(KeyBinding::Dynamic { rank }) if self.mode == Mode::Agents => self

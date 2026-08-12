@@ -64,6 +64,17 @@ impl Outcome {
     }
 }
 
+/// A key that is currently held, and what it meant when it went down.
+///
+/// Carrying the actions rather than re-deriving them at release is the whole point: state moves
+/// underneath a held key, and the gesture must act on what the user was actually looking at.
+#[derive(Debug, Clone)]
+struct Press {
+    at: Instant,
+    short: SlotAction,
+    long: SlotAction,
+}
+
 /// Per-connection state for one frontend.
 pub struct Session {
     capabilities: DeckCapabilities,
@@ -78,7 +89,7 @@ pub struct Session {
     sent_dials: Vec<Option<u64>>,
     /// When each key that has a second action went down, so the release can tell a tap from a
     /// hold. Only ever set for keys that *have* a second action — see [`Session::handle`].
-    pressed_at: Vec<Option<Instant>>,
+    pressed: Vec<Option<Press>>,
     /// Agents this frontend has dismissed from its attention queue.
     ///
     /// Per connection, not per daemon: acknowledgement is a statement about what *this* person
@@ -122,7 +133,7 @@ impl Session {
             selection: Selection::default(),
             sent_keys: vec![None; key_count],
             sent_dials: vec![None; dial_count],
-            pressed_at: vec![None; key_count],
+            pressed: vec![None; key_count],
             acked: Acknowledged::default(),
             greeted: false,
         }
@@ -176,7 +187,12 @@ impl Session {
                     self.forget_press(index);
                     self.act(short, Some(index), state)
                 } else {
-                    self.remember_press(index, now);
+                    // Both meanings are captured HERE, at the press, and replayed on release.
+                    // The deck repaints while a key is held — a newly blocked agent reorders the
+                    // attention list and takes rank 0 — so re-resolving at release would act on
+                    // whichever agent moved under the finger, acknowledging one the user never
+                    // looked at. The key belongs to whatever it showed when it was pressed.
+                    self.remember_press(index, now, short, long);
                     Outcome::default()
                 }
             }
@@ -184,12 +200,15 @@ impl Session {
             FrontendMessage::KeyUp { index } => {
                 // No recorded press means this key acted on the way down and has nothing left to
                 // do — or the frontend connected mid-press, which is the same thing to us.
-                let Some(pressed_at) = self.forget_press(index) else {
+                let Some(press) = self.forget_press(index) else {
                     return Outcome::default();
                 };
-                let (short, long) = self.key_actions(index, state);
-                let held = now.saturating_duration_since(pressed_at);
-                let action = if held >= LONG_PRESS { long } else { short };
+                let held = now.saturating_duration_since(press.at);
+                let action = if held >= LONG_PRESS {
+                    press.long
+                } else {
+                    press.short
+                };
                 self.act(action, Some(index), state)
             }
             FrontendMessage::DialRotate { dial, ticks } => {
@@ -225,22 +244,26 @@ impl Session {
 
     /// Both meanings of one key: what a tap does, and what a hold does.
     ///
-    /// Resolved together so a press and its release can never disagree about which key they were
-    /// talking about, and taken by value so the borrow ends before anything acts.
+    /// Resolved together and taken by value, so the borrow of state ends before anything acts.
+    /// Callers must resolve at the PRESS and hold the result — see [`Press`].
     fn key_actions(&self, index: usize, state: &DeckState) -> (SlotAction, SlotAction) {
         let deck = self.resolved(state);
         (deck.key_action(index), deck.key_long_press_action(index))
     }
 
-    fn remember_press(&mut self, index: usize, now: Instant) {
-        if let Some(slot) = self.pressed_at.get_mut(index) {
-            *slot = Some(now);
+    fn remember_press(&mut self, index: usize, now: Instant, short: SlotAction, long: SlotAction) {
+        if let Some(slot) = self.pressed.get_mut(index) {
+            *slot = Some(Press {
+                at: now,
+                short,
+                long,
+            });
         }
     }
 
     /// Take the press timer for a key, leaving it clear.
-    fn forget_press(&mut self, index: usize) -> Option<Instant> {
-        self.pressed_at.get_mut(index).and_then(Option::take)
+    fn forget_press(&mut self, index: usize) -> Option<Press> {
+        self.pressed.get_mut(index).and_then(Option::take)
     }
 
     fn act(&mut self, action: SlotAction, key: Option<usize>, state: &DeckState) -> Outcome {
@@ -506,6 +529,146 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_repaint_under_a_held_key_cannot_move_the_acknowledgement_to_another_agent() {
+        // The deck repaints while a key is held, and a newly blocked agent takes rank 0 — so the
+        // key under the finger changes owner mid-hold. Re-resolving the gesture at release would
+        // dismiss an agent the user never looked at, which is this product's worst failure: an
+        // agent that needs you but whose key looks calm.
+        let mut session = session();
+        let before = state(vec![agent("alice", AgentStatus::Blocked, 1)]);
+        session.greet(&before);
+
+        let down = Instant::now();
+        session.handle(FrontendMessage::KeyDown { index: 0 }, &before, down);
+
+        // Mid-hold, `bob` blocks and displaces `alice` from key 0.
+        let during = state(vec![
+            agent("alice", AgentStatus::Blocked, 1),
+            agent("bob", AgentStatus::Blocked, 9),
+        ]);
+        session.repaint(&during);
+        assert_eq!(
+            during.attention_order()[0].terminal_id,
+            "bob",
+            "precondition: the newcomer must really have taken key 0"
+        );
+
+        session.handle(
+            FrontendMessage::KeyUp { index: 0 },
+            &during,
+            down + LONG_PRESS,
+        );
+
+        // Asserted by name, not by key index: dismissing an agent reorders the list, so a
+        // positional check here would pass for the wrong reason when the wrong agent is taken.
+        assert_eq!(
+            acknowledged_labels(&session, &during),
+            vec!["alice"],
+            "the hold must dismiss the agent that was on the key when it went down, not \
+             whoever moved under the finger while it was held"
+        );
+    }
+
+    #[test]
+    fn a_short_press_also_acts_on_the_agent_that_was_there_when_it_went_down() {
+        // Same hazard, cheaper gesture: a tap that focuses whoever moved under the finger would
+        // take the user to a pane they did not choose.
+        let mut session = session();
+        let before = state(vec![agent("alice", AgentStatus::Blocked, 1)]);
+        session.greet(&before);
+
+        let down = Instant::now();
+        session.handle(FrontendMessage::KeyDown { index: 0 }, &before, down);
+        let during = state(vec![
+            agent("alice", AgentStatus::Blocked, 1),
+            agent("bob", AgentStatus::Blocked, 9),
+        ]);
+        session.repaint(&during);
+
+        let released = session.handle(
+            FrontendMessage::KeyUp { index: 0 },
+            &during,
+            down + Duration::from_millis(50),
+        );
+        assert_eq!(
+            released.action,
+            Some(PendingAction::FocusAgent {
+                pane_id: "w1:pane-alice".into(),
+                key: Some(0)
+            })
+        );
+    }
+
+    #[test]
+    fn an_agent_that_vanishes_mid_hold_says_so_rather_than_doing_nothing_quietly() {
+        // The press is real, so the release owes the user an answer. Silence here would look
+        // exactly like a dead key.
+        let mut session = session();
+        let before = state(vec![agent("alice", AgentStatus::Blocked, 1)]);
+        session.greet(&before);
+
+        let down = Instant::now();
+        session.handle(FrontendMessage::KeyDown { index: 0 }, &before, down);
+        let gone = state(vec![]);
+        let released = session.handle(
+            FrontendMessage::KeyUp { index: 0 },
+            &gone,
+            down + Duration::from_millis(50),
+        );
+        assert!(released.action.is_none());
+        assert!(
+            released
+                .messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::Alert { index: 0, .. })),
+            "expected an alert on the pressed key, got {:?}",
+            released.messages
+        );
+    }
+
+    #[test]
+    fn holding_the_key_of_a_calm_agent_arms_no_dismissal_for_later() {
+        // Acknowledging something that is not asking for attention would store a mute that fires
+        // the moment it blocks — a dismissal the user never made for a state they never saw.
+        let mut session = session();
+        let calm = state(vec![agent("busy", AgentStatus::Working, 1)]);
+        session.greet(&calm);
+
+        // A calm key has no hold meaning, so it acts on the way down like any plain key — that
+        // is not what this test is about. What matters is that nothing was stored.
+        press_for(&mut session, 0, LONG_PRESS, &calm);
+
+        // Same agent, now blocked at the same seq: it must still be asking for attention.
+        let blocked = state(vec![agent("busy", AgentStatus::Blocked, 1)]);
+        session.repaint(&blocked);
+        assert_eq!(
+            attention_count(&session, &blocked),
+            1,
+            "a calm-key hold must not have muted this agent in advance"
+        );
+    }
+
+    #[test]
+    fn acknowledgements_survive_herdr_briefly_going_away() {
+        // An offline state carries no agents, so pruning against it would silently empty the
+        // dismissal set and refill a queue the user had just cleared. The wait clock is built to
+        // survive the same blip; these two must agree.
+        let mut session = session();
+        let live = state(vec![agent("alice", AgentStatus::Done, 1)]);
+        session.greet(&live);
+        press_for(&mut session, 0, LONG_PRESS, &live);
+
+        session.repaint(&DeckState::offline("herdr not running"));
+        session.repaint(&live);
+
+        assert!(
+            tile_is_acknowledged(&session, 0, &live),
+            "the dismissal must survive herdr blinking; got {:?}",
+            session.tile_at(0, &live)
+        );
+    }
+
     /// Send one message at a moment the test does not care about.
     fn send(session: &mut Session, message: FrontendMessage, state: &DeckState) -> Outcome {
         session.handle(message, state, Instant::now())
@@ -555,6 +718,23 @@ mod tests {
             Tile::Attention { count } => count,
             other => panic!("expected the attention tile, got {other:?}"),
         }
+    }
+
+    /// The labels of every agent currently drawn as dismissed, in key order.
+    ///
+    /// Dismissing an agent reorders the attention list, so any assertion about *which* agent was
+    /// dismissed has to be made by name — a positional one moves with the thing it is measuring.
+    fn acknowledged_labels(session: &Session, state: &DeckState) -> Vec<String> {
+        (0..session.profile().keys.len())
+            .filter_map(|index| match session.tile_at(index, state) {
+                Tile::Agent {
+                    label,
+                    acknowledged: true,
+                    ..
+                } => Some(label),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether key `index` is drawing an agent that has been dismissed.

@@ -222,6 +222,12 @@ impl Acknowledged {
     /// Not required for correctness — [`Self::contains`] already answers `false` for both — but
     /// without it a long-lived connection accumulates an entry per agent it ever dismissed.
     pub fn forget_stale(&mut self, state: &DeckState) {
+        // An offline state has no agents at all, so pruning against it would drop every
+        // dismissal the moment herdr blinked — and the user would watch a queue they had just
+        // cleared refill itself. The wait clock survives the same blip; these should agree.
+        if state.is_offline() {
+            return;
+        }
         self.entries.retain(|terminal_id, seq| {
             state
                 .agent_by_terminal_id(terminal_id)
