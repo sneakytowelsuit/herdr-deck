@@ -38,6 +38,67 @@ The only methods that hold a connection open are `events.subscribe` and `pane.gr
 | `ping` | Liveness. |
 | `notification.show` | Optional toast; its `reason` doubles as "is a TUI attached". |
 
+## Why herdr-deck doesn't approve prompts
+
+**herdr-deck's entire write surface to herdr is focus.** The table above is not a partial list —
+it is every method the daemon calls. There is no `agent.approve`, no `pane.send_keys`, no
+structured yes/no of any kind. A key can turn red the moment `session.snapshot` reports an agent
+`blocked` on approval; it deliberately cannot make that need go away. This is not an
+unimplemented feature. It is a refusal, and the reasoning is worth writing down so it does not
+look like an oversight next to tools whose feature table has an Approve row and ours doesn't.
+
+The blocker isn't hardware — a key is exactly as capable of sending `y\n` into a pane as a phone
+button is of POSTing a reply. The blocker is what answering blind means, and three pieces of
+prior art make the case better than we could from first principles alone.
+
+- **[collie](https://github.com/AltanS/collie) 0.3.0** (2026-07-03) shipped one-tap approve/deny
+  as push-notification quick replies: "Needs-you pushes now carry up to two quick-reply action
+  buttons... Tapping one POSTs the reply straight from the service worker... no app open needed."
+  Six days later, **0.9.1** (2026-07-09) removed them under a `### Security` heading: "Removed
+  one-tap yes/no reply buttons from push notifications — they POSTed to the terminal without
+  opening the app, i.e. approving blind." That sentence is the whole argument: a button that
+  answers before you've read the question isn't approval, it's a guess wearing your name.
+- **collie [ADR 0009](https://github.com/AltanS/collie/blob/main/.adr/0009-a-generic-menu-is-driven-by-the-keys-it-names.md)**
+  (accepted 2026-08-05) goes further and bans *digit* keys standing in for numbered menu rows,
+  after live-probing Claude Code's `/model` picker on a real pane: pressing a digit didn't just
+  pick a model, it "**Set model to Haiku 4.5 and saved as your default for new sessions**" — a
+  side effect the picker's own UI never announced anywhere. A key face cannot show you what
+  pressing it will actually do to a screen it doesn't fully understand, and herdr-deck's key
+  glyphs are no more informative than collie's digit buttons were.
+- **[paultyng/agentsd](https://github.com/paultyng/agentsd)** does ship a working Approve key —
+  but only because it has something answerable to press it against. Claude Code's
+  `PermissionRequest` hook "hold[s] the HTTP response open (up to 120 s) so you can approve or
+  deny directly from a button press," with a documented "Permission timeout: 120s. Auto-denies if
+  no response." That's a *held, answerable request* with a defined shape and a defined timeout —
+  a real primitive to answer, not a blind keystroke into a terminal that may not even be showing
+  the prompt by the time it arrives.
+
+herdr has no equivalent primitive. If herdr-deck tried to answer a prompt through the surface it
+actually has, the only mechanism available is keystroke injection into a pane — the same blind
+mechanism collie shipped in 0.3.0 and deleted six days later for exactly this reason.
+
+### Worse than the thing that already got deleted
+
+A deck key is a worse instrument for this than the phone notification collie removed, not a
+better one. Even the smallest quick-reply button in a notification tray sits next to text you
+could, in principle, glance at first. A Stream Deck key's icon is a 72–120px square (see
+[Hardware](../concepts/hardware.md)) with room for a glyph and a sliver of label, not a prompt.
+If herdr grew an answerable primitive tomorrow, wiring a deck key straight to "approve" would
+reproduce the exact failure collie already shipped and reverted — just with less screen than the
+UI that was judged too blind to keep.
+
+### What would have to change upstream
+
+The one thing that would move this position is herdr exposing an **answerable, held permission
+request** — structurally like Claude Code's `PermissionRequest` hook: a call that blocks, with a
+bounded timeout and a defined auto-deny, until herdr-deck sends back yes or no. That would let a
+press answer a specific, still-open question instead of typing blind into a pane that may have
+moved on. Nothing in the methods table above is that primitive, and it's the complete list of
+what `herdr-deck-herdr` knows how to call — see the crate-boundary rule at the top of this file.
+
+This has not been filed as a feature request against `herdrdev/herdr` yet. Noting it here so the
+ask stays visible instead of getting lost, rather than filing something half-thought-through.
+
 ## Subscribing
 
 `pane.agent_status_changed` exists in **two** forms: a per-pane filtered subscription that
