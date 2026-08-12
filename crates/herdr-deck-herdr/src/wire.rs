@@ -124,6 +124,21 @@ impl AgentInfo {
             .unwrap_or(&self.terminal_id)
     }
 
+    /// The last component of the agent's working directory, which is nearly always the project.
+    ///
+    /// The leading components are shared by every agent on the machine (`~/src/…`), so they cost
+    /// horizontal room without distinguishing anything — and a key is only 72px wide at worst.
+    pub fn cwd_basename(&self) -> Option<&str> {
+        // Trailing slashes turn up in anything a human typed or a shell completed; splitting
+        // without stripping them first hands back an empty name and loses one we actually have.
+        self.cwd
+            .as_deref()?
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+    }
+
     /// A per-state descriptive label if herdr supplied one for the current state.
     pub fn state_label(&self) -> Option<&str> {
         self.state_labels
@@ -155,10 +170,15 @@ pub struct WorkspaceInfo {
 
 impl WorkspaceInfo {
     pub fn label(&self) -> &str {
-        self.label
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.workspace_id)
+        self.explicit_label().unwrap_or(&self.workspace_id)
+    }
+
+    /// The name herdr actually knows for this workspace, or `None` when it only knows the id.
+    ///
+    /// [`Self::label`] papers over that difference because a tile must draw *something*; a
+    /// caller with a better fallback of its own needs to be able to tell the two apart.
+    pub fn explicit_label(&self) -> Option<&str> {
+        self.label.as_deref().filter(|s| !s.is_empty())
     }
 }
 
@@ -391,6 +411,36 @@ mod tests {
         assert_eq!(s.agents.len(), 1);
         assert_eq!(s.agents[0].state_change_seq, Some(42));
         assert_eq!(s.workspaces[0].label(), "api");
+    }
+
+    #[test]
+    fn cwd_basename_survives_trailing_slashes_and_refuses_to_invent_a_name() {
+        let basename = |cwd: Option<&str>| {
+            AgentInfo {
+                cwd: cwd.map(str::to_string),
+                ..Default::default()
+            }
+            .cwd_basename()
+            .map(str::to_string)
+        };
+        assert_eq!(basename(Some("/home/dev/src/api")).as_deref(), Some("api"));
+        assert_eq!(basename(Some("/home/dev/src/api/")).as_deref(), Some("api"));
+        assert_eq!(basename(Some("api")).as_deref(), Some("api"));
+        // Nothing here is a project name, so callers must be free to fall back.
+        assert_eq!(basename(Some("/")), None);
+        assert_eq!(basename(Some("")), None);
+        assert_eq!(basename(None), None);
+    }
+
+    #[test]
+    fn an_unlabelled_workspace_admits_it_rather_than_passing_its_id_off_as_a_name() {
+        let w = WorkspaceInfo {
+            workspace_id: "w3".into(),
+            label: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(w.explicit_label(), None);
+        assert_eq!(w.label(), "w3");
     }
 
     #[test]

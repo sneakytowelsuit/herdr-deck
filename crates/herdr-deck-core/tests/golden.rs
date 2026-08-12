@@ -159,6 +159,21 @@ fn a_working_unfocused_agent_tile_at_the_smallest_key_size_has_no_ring() {
 }
 
 #[test]
+fn a_real_project_name_in_the_footer_stays_legible_on_the_smallest_key() {
+    // The footer used to hold a two-character workspace id; it now carries a real project name,
+    // which is the longest text that row has ever had to fit. 72px with a sublabel present is
+    // where it is tightest — all three rows competing for the same key at the smallest size.
+    let tile = Tile::Agent {
+        label: "refactor-auth".into(),
+        sublabel: Some("claude".into()),
+        workspace: Some("payments-api".into()),
+        status: AgentStatus::Blocked,
+        focused: true,
+    };
+    assert_key_matches_golden("agent_project_footer_72", &tile, 72);
+}
+
+#[test]
 fn a_focused_workspace_tile_pins_its_layout_without_a_sublabel_or_footer() {
     // Workspace reuses the agent layout but never carries a sublabel or workspace footer, so it
     // needs its own fixture to pin that the label alone still centres correctly.

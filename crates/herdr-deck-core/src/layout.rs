@@ -340,7 +340,7 @@ impl<'a> ResolvedDeck<'a> {
             KeyBinding::PinnedAgent { terminal_id } => self
                 .state
                 .agent_by_terminal_id(terminal_id)
-                .map(agent_tile)
+                .map(|agent| agent_tile(self.state, agent))
                 .unwrap_or(Tile::Empty),
             KeyBinding::PinnedWorkspace { workspace_id } => self
                 .state
@@ -375,7 +375,7 @@ impl<'a> ResolvedDeck<'a> {
             Mode::Agents => self
                 .state
                 .agent_at(index)
-                .map(agent_tile)
+                .map(|agent| agent_tile(self.state, agent))
                 .unwrap_or(Tile::Empty),
             Mode::Workspaces => self
                 .state
@@ -547,11 +547,13 @@ impl<'a> ResolvedDeck<'a> {
     }
 }
 
-fn agent_tile(agent: &herdr_deck_herdr::wire::AgentInfo) -> Tile {
+/// Needs the whole state, not just the agent: the footer names the agent's *project*, and only
+/// the state knows what herdr calls the workspace the agent happens to be in.
+fn agent_tile(state: &DeckState, agent: &herdr_deck_herdr::wire::AgentInfo) -> Tile {
     Tile::Agent {
         label: agent.label().to_string(),
         sublabel: agent.state_label().map(str::to_string),
-        workspace: Some(agent.workspace_id.clone()).filter(|w| !w.is_empty()),
+        workspace: state.project_label(agent).map(str::to_string),
         status: agent.agent_status,
         focused: agent.focused,
     }
@@ -928,5 +930,78 @@ mod tests {
     fn mode_toggles_back_and_forth() {
         assert_eq!(Mode::Agents.toggled(), Mode::Workspaces);
         assert_eq!(Mode::Workspaces.toggled(), Mode::Agents);
+    }
+
+    // --- The project footer ------------------------------------------------------------------
+    //
+    // The bottom row is the only thing on an agent tile that says *where* the work is, so these
+    // pin the whole fallback chain rather than just its happy path.
+
+    /// The footer the deck would draw for the state's single agent.
+    fn project_footer(state: &DeckState) -> Option<String> {
+        let agent = state.agents.first().expect("state has an agent");
+        match agent_tile(state, agent) {
+            Tile::Agent { workspace, .. } => workspace,
+            other => panic!("expected an agent tile, got {other:?}"),
+        }
+    }
+
+    fn state_with_workspace(agent: AgentInfo, workspace: WorkspaceInfo) -> DeckState {
+        DeckState::from_snapshot(SessionSnapshot {
+            agents: vec![agent],
+            workspaces: vec![workspace],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_tile_names_the_project_by_its_workspace_label_rather_than_the_raw_id() {
+        let state = state_with_workspace(
+            agent("a", AgentStatus::Blocked, 1),
+            WorkspaceInfo {
+                workspace_id: "w1".into(),
+                label: Some("payments-api".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(project_footer(&state).as_deref(), Some("payments-api"));
+    }
+
+    #[test]
+    fn an_agent_in_an_unlabelled_workspace_is_named_by_the_directory_it_works_in() {
+        let mut a = agent("a", AgentStatus::Blocked, 1);
+        a.cwd = Some("/home/dev/src/payments-api".into());
+        let state = state_with_workspace(
+            a,
+            WorkspaceInfo {
+                workspace_id: "w1".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            project_footer(&state).as_deref(),
+            Some("payments-api"),
+            "only the basename: a full path is illegible on a 72px key"
+        );
+    }
+
+    #[test]
+    fn the_raw_workspace_id_survives_as_a_footer_when_nothing_better_is_known() {
+        // Better a bare id than a blank row — an empty footer would read as "no project", which
+        // is a stronger and wronger claim than "the project is whatever w1 is".
+        let state = state_with(vec![agent("a", AgentStatus::Blocked, 1)]);
+        assert_eq!(project_footer(&state).as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn a_working_directory_with_a_trailing_slash_still_names_its_project() {
+        let mut a = agent("a", AgentStatus::Blocked, 1);
+        a.cwd = Some("/home/dev/src/payments-api/".into());
+        let state = state_with(vec![a]);
+        assert_eq!(
+            project_footer(&state).as_deref(),
+            Some("payments-api"),
+            "a naive split on `/` would hand back an empty name and fall through to the id"
+        );
     }
 }

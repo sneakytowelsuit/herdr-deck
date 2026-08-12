@@ -90,6 +90,21 @@ impl DeckState {
             .find(|w| w.workspace_id == workspace_id)
     }
 
+    /// The best human name for the project an agent is working on.
+    ///
+    /// A raw workspace id is honest but useless: when four agents are blocked across four
+    /// repositories, `w1`/`w2`/`w3`/`w4` does not tell you which one is asking for you. herdr's
+    /// own workspace label is the intended answer; failing that the directory the agent is
+    /// sitting in names the project just as well, because that is how people organise work.
+    /// The id survives as the last resort so a tile is never left with nothing at all.
+    pub fn project_label<'a>(&'a self, agent: &'a AgentInfo) -> Option<&'a str> {
+        self.workspace_by_id(&agent.workspace_id)
+            .and_then(WorkspaceInfo::explicit_label)
+            .or_else(|| agent.cwd_basename())
+            .or(Some(agent.workspace_id.as_str()))
+            .filter(|label| !label.is_empty())
+    }
+
     /// Count of agents in each status, for summary tiles.
     pub fn status_counts(&self) -> StatusCounts {
         let mut counts = StatusCounts::default();
