@@ -4,6 +4,8 @@
 //! interesting piece of logic here is the **attention order**, which decides what lands on the
 //! deck when nothing is pinned.
 
+use std::collections::HashMap;
+
 use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
 
 /// A point-in-time view of every agent and workspace herdr knows about.
@@ -59,7 +61,25 @@ impl DeckState {
         &self.agents
     }
 
+    /// The same order, with acknowledged agents demoted out of the attention band.
+    ///
+    /// Acknowledgement is per-frontend and the state is shared, so this cannot be folded into the
+    /// sort in [`Self::from_snapshot`]: two decks looking at the same herdr may legitimately
+    /// disagree about what has been dismissed.
+    pub fn attention_order_with<'a>(&'a self, acked: &Acknowledged) -> Vec<&'a AgentInfo> {
+        let mut order: Vec<&AgentInfo> = self.agents.iter().collect();
+        // `self.agents` is already in attention order, so a *stable* sort on the acknowledged-aware
+        // band moves the dismissed agents down without disturbing anything else about the order.
+        order.sort_by_key(|agent| acked.effective_rank(agent));
+        order
+    }
+
     /// Only the agents that actually want a human: `blocked` and `done`.
+    ///
+    /// This and the three below are herdr's view, before any frontend has dismissed anything.
+    /// Anything driving a deck wants [`crate::layout::ResolvedDeck`] instead, which applies that
+    /// frontend's acknowledgements — counting a dismissed agent here would put it back on the
+    /// attention key the user just cleared.
     pub fn needing_attention(&self) -> impl Iterator<Item = &AgentInfo> {
         self.agents
             .iter()
@@ -118,6 +138,87 @@ impl DeckState {
             }
         }
         counts
+    }
+}
+
+/// Agents the user has dismissed from the attention queue without focusing them.
+///
+/// # Why this is keyed on the state, not the agent
+///
+/// An entry is `terminal_id -> state_change_seq`: the agent *and the exact state it was in* when
+/// it was acknowledged. herdr bumps that sequence on every state change, so the moment an
+/// acknowledged agent blocks again — or finishes, or starts working — the key stops matching and
+/// the agent is back in the queue on its own.
+///
+/// Keying on the id alone would be a false negative machine: an agent dismissed while `done`
+/// would stay silently hidden the next time it blocked, which is the worst thing a tool whose
+/// entire job is "tell me which agent needs me" can do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Acknowledged {
+    entries: HashMap<String, u64>,
+}
+
+impl Acknowledged {
+    /// Dismiss `agent` in its current state, reporting whether the acknowledgement took.
+    ///
+    /// It is refused when herdr gave us no `state_change_seq`, because nothing would then ever
+    /// expire it — the map cannot hold an acknowledgement that outlives its state, by
+    /// construction. Callers are expected to say so out loud rather than pretend it worked.
+    pub fn acknowledge(&mut self, agent: &AgentInfo) -> bool {
+        let Some(seq) = agent.state_change_seq else {
+            return false;
+        };
+        // One entry per agent: acknowledging it again in a newer state replaces the old key,
+        // which is the only sensible reading — you cannot have dismissed two states at once.
+        self.entries.insert(agent.terminal_id.clone(), seq);
+        true
+    }
+
+    /// Is this agent, in the state it is in *now*, acknowledged?
+    pub fn contains(&self, agent: &AgentInfo) -> bool {
+        match (self.entries.get(&agent.terminal_id), agent.state_change_seq) {
+            (Some(acknowledged), Some(current)) => *acknowledged == current,
+            _ => false,
+        }
+    }
+
+    /// Does this agent still want a human?
+    pub fn wants_attention(&self, agent: &AgentInfo) -> bool {
+        agent.agent_status.needs_attention() && !self.contains(agent)
+    }
+
+    /// Where an agent sits in the attention order once acknowledgement is applied.
+    ///
+    /// A dismissed agent ranks with the calm ones, but only its *rank* moves: its tile still
+    /// draws the status herdr reports, so the deck never claims an agent stopped being blocked
+    /// just because you looked away from it.
+    fn effective_rank(&self, agent: &AgentInfo) -> u8 {
+        if self.contains(agent) && agent.agent_status.needs_attention() {
+            AgentStatus::Idle.attention_rank()
+        } else {
+            agent.agent_status.attention_rank()
+        }
+    }
+
+    /// Drop acknowledgements that can no longer match: the agent moved on, or vanished.
+    ///
+    /// Not required for correctness — [`Self::contains`] already answers `false` for both — but
+    /// without it a long-lived connection accumulates an entry per agent it ever dismissed.
+    pub fn forget_stale(&mut self, state: &DeckState) {
+        self.entries.retain(|terminal_id, seq| {
+            state
+                .agent_by_terminal_id(terminal_id)
+                .and_then(|agent| agent.state_change_seq)
+                == Some(*seq)
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -307,6 +408,105 @@ mod tests {
         moved.workspace_id = "w7".into();
         let after = DeckState::from_snapshot(snapshot(vec![moved]));
         assert!(after.agent_by_terminal_id("term_x").is_some());
+    }
+
+    // --- Acknowledgement -----------------------------------------------------------------------
+    //
+    // The rule these pin is the one the whole feature stands on: an acknowledgement is about a
+    // *state*, not an agent, so it can never outlive the state it dismissed.
+
+    #[test]
+    fn an_acknowledged_agent_stops_wanting_a_human_but_keeps_its_reported_status() {
+        let blocked = agent("stuck", AgentStatus::Blocked, 7);
+        let mut acked = Acknowledged::default();
+        assert!(acked.acknowledge(&blocked));
+        assert!(acked.contains(&blocked));
+        assert!(!acked.wants_attention(&blocked));
+        assert_eq!(
+            blocked.agent_status,
+            AgentStatus::Blocked,
+            "acknowledging must not rewrite what herdr says the agent is doing"
+        );
+    }
+
+    #[test]
+    fn an_acknowledgement_expires_the_moment_the_agent_changes_state() {
+        // The whole safety property. If this ever passes for the wrong reason, an agent that
+        // blocks again after being dismissed stays hidden and nobody ever knows.
+        let done = agent("worker", AgentStatus::Done, 7);
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(&done);
+
+        let blocked_again = agent("worker", AgentStatus::Blocked, 8);
+        assert!(!acked.contains(&blocked_again));
+        assert!(acked.wants_attention(&blocked_again));
+    }
+
+    #[test]
+    fn an_agent_with_no_state_sequence_cannot_be_acknowledged_at_all() {
+        // Nothing would ever expire such an acknowledgement, so refusing it loudly is the only
+        // safe answer — a permanently muted agent is worse than a gesture that did not take.
+        let mut sequenceless = agent("mystery", AgentStatus::Blocked, 0);
+        sequenceless.state_change_seq = None;
+        let mut acked = Acknowledged::default();
+        assert!(!acked.acknowledge(&sequenceless));
+        assert!(!acked.contains(&sequenceless));
+        assert!(acked.is_empty());
+    }
+
+    #[test]
+    fn acknowledging_demotes_an_agent_out_of_the_attention_band_without_removing_it() {
+        let state = DeckState::from_snapshot(snapshot(vec![
+            agent("dismissed", AgentStatus::Blocked, 9),
+            agent("still_blocked", AgentStatus::Blocked, 8),
+            agent("busy", AgentStatus::Working, 7),
+        ]));
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("dismissed").unwrap());
+
+        let order: Vec<_> = state
+            .attention_order_with(&acked)
+            .iter()
+            .map(|a| a.terminal_id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["still_blocked", "busy", "dismissed"],
+            "a dismissed agent ranks with the calm ones, but it is still on the deck"
+        );
+    }
+
+    #[test]
+    fn acknowledging_one_agent_leaves_every_other_agents_place_alone() {
+        let state = DeckState::from_snapshot(snapshot(vec![
+            agent("first", AgentStatus::Blocked, 9),
+            agent("second", AgentStatus::Blocked, 8),
+            agent("third", AgentStatus::Done, 7),
+        ]));
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("second").unwrap());
+
+        let order: Vec<_> = state
+            .attention_order_with(&acked)
+            .iter()
+            .map(|a| a.terminal_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["first", "third", "second"]);
+    }
+
+    #[test]
+    fn acknowledgements_for_agents_that_moved_on_are_forgotten_rather_than_accumulating() {
+        let before =
+            DeckState::from_snapshot(snapshot(vec![agent("worker", AgentStatus::Done, 7)]));
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(before.agent_by_terminal_id("worker").unwrap());
+        acked.forget_stale(&before);
+        assert_eq!(acked.len(), 1, "a live, unchanged agent keeps its entry");
+
+        let after =
+            DeckState::from_snapshot(snapshot(vec![agent("worker", AgentStatus::Blocked, 8)]));
+        acked.forget_stale(&after);
+        assert!(acked.is_empty());
     }
 
     #[test]

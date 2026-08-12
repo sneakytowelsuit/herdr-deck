@@ -97,6 +97,7 @@ fn an_idle_agent_tile_pins_the_dim_calm_palette() {
         workspace: None,
         status: AgentStatus::Idle,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_idle", &tile, 120);
 }
@@ -109,6 +110,7 @@ fn a_done_agent_tile_pins_the_amber_completion_palette() {
         workspace: None,
         status: AgentStatus::Done,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_done", &tile, 120);
 }
@@ -123,8 +125,25 @@ fn an_unknown_status_agent_tile_pins_the_fallback_palette() {
         workspace: None,
         status: AgentStatus::Unknown,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_unknown", &tile, 120);
+}
+
+#[test]
+fn an_acknowledged_agent_tile_pins_the_calm_palette_and_its_dismissed_glyph() {
+    // A blocked agent the user has dismissed with a long press. It must read as calm — that is
+    // the whole point of dismissing it — while still carrying a glyph of its own, so it can never
+    // be mistaken for an agent that simply has nothing to say.
+    let tile = Tile::Agent {
+        label: "refactor-auth".into(),
+        sublabel: Some("claude".into()),
+        workspace: Some("api".into()),
+        status: AgentStatus::Blocked,
+        focused: false,
+        acknowledged: true,
+    };
+    assert_key_matches_golden("agent_acknowledged", &tile, 120);
 }
 
 // --- Focus ring, key size, sublabel/workspace footer ---------------------------------------
@@ -140,6 +159,7 @@ fn a_blocked_focused_agent_tile_pins_the_alert_palette_footer_and_focus_ring() {
         workspace: Some("api".into()),
         status: AgentStatus::Blocked,
         focused: true,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_blocked_focused_120", &tile, 120);
 }
@@ -154,6 +174,7 @@ fn a_working_unfocused_agent_tile_at_the_smallest_key_size_has_no_ring() {
         workspace: None,
         status: AgentStatus::Working,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_working_unfocused_72", &tile, 72);
 }
@@ -169,6 +190,7 @@ fn a_real_project_name_in_the_footer_stays_legible_on_the_smallest_key() {
         workspace: Some("payments-api".into()),
         status: AgentStatus::Blocked,
         focused: true,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_project_footer_72", &tile, 72);
 }
@@ -258,6 +280,7 @@ fn a_long_kebab_case_agent_name_pins_its_hyphen_aware_wrap() {
         workspace: Some("api".into()),
         status: AgentStatus::Working,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_long_kebab_case_name", &tile, 96);
 }
@@ -272,6 +295,7 @@ fn an_agent_name_with_no_separators_pins_its_hard_split_wrap() {
         workspace: None,
         status: AgentStatus::Working,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_name_with_no_separators", &tile, 96);
 }
@@ -286,6 +310,7 @@ fn an_agent_name_with_xml_metacharacters_pins_correctly_escaped_output() {
         workspace: Some("it's".into()),
         status: AgentStatus::Working,
         focused: false,
+        acknowledged: false,
     };
     assert_key_matches_golden("agent_xml_metacharacters", &tile, 120);
 }

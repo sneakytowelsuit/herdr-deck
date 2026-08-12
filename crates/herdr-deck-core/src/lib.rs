@@ -21,5 +21,5 @@ pub use layout::{
 };
 pub use protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 pub use render::{Tile, TileRenderer};
-pub use state::{DeckState, StatusCounts};
+pub use state::{Acknowledged, DeckState, StatusCounts};
 pub use theme::Theme;

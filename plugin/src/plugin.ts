@@ -188,7 +188,9 @@ export class HerdrKey extends SingletonAction {
 		}
 	}
 
-	// Acting on key *down* rather than up makes the deck feel immediate.
+	// Both edges are forwarded and neither is interpreted here. The daemon times the gap between
+	// them, because how long a key was held is part of what the press *means* — and meaning is
+	// not something a frontend is allowed to decide.
 	override onKeyDown(event: KeyDownEvent): void {
 		const coordinates = coordsOf(event.payload);
 		if (coordinates) {

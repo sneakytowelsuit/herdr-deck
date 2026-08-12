@@ -39,6 +39,10 @@ pub enum Tile {
         workspace: Option<String>,
         status: AgentStatus,
         focused: bool,
+        /// The user dismissed this agent's attention state without focusing it, so the tile is
+        /// drawn calm. `status` still says what herdr reports, because that is what an
+        /// acknowledgement is *about* and the deck must not start inventing states.
+        acknowledged: bool,
     },
     /// A workspace, for the navigation page.
     Workspace {
@@ -139,8 +143,13 @@ impl TileRenderer {
                 workspace,
                 status,
                 focused,
+                acknowledged,
             } => {
-                let style = self.theme.status(*status);
+                let style = if *acknowledged {
+                    self.theme.acknowledged()
+                } else {
+                    self.theme.status(*status)
+                };
                 self.agent_svg(
                     s,
                     label,
@@ -574,6 +583,7 @@ mod tests {
                 workspace: Some("api".into()),
                 status: AgentStatus::Blocked,
                 focused: true,
+                acknowledged: false,
             },
             Tile::Workspace {
                 label: "api".into(),
@@ -607,6 +617,7 @@ mod tests {
             workspace: None,
             status: AgentStatus::Working,
             focused: false,
+            acknowledged: false,
         };
         for size in [72, 80, 96, 120] {
             let png = r.render_key(&tile, size).expect("renders");
@@ -638,6 +649,7 @@ mod tests {
             workspace: Some("api".into()),
             status: AgentStatus::Blocked,
             focused: false,
+            acknowledged: false,
         };
         let a = r.render_key(&tile, 120).unwrap();
         let b = r.render_key(&tile, 120).unwrap();
@@ -656,6 +668,7 @@ mod tests {
             workspace: None,
             status,
             focused: false,
+            acknowledged: false,
         };
         let blocked = r.render_key(&make(AgentStatus::Blocked), 120).unwrap();
         let idle = r.render_key(&make(AgentStatus::Idle), 120).unwrap();
@@ -672,6 +685,7 @@ mod tests {
             workspace: Some("it's".into()),
             status: AgentStatus::Working,
             focused: false,
+            acknowledged: false,
         };
         let png = r
             .render_key(&tile, 120)

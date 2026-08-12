@@ -7,7 +7,7 @@ lays itself out to fit.
 
 | Control | What it does |
 |---|---|
-| Keys 1–6 | The first six agents **in attention order**. Press to focus. |
+| Keys 1–6 | The first six agents **in attention order**. Press to focus, hold to acknowledge. |
 | Key 7 | *Next attention* — jumps to the agent that needs you most. Dark when nothing does. |
 | Key 8 | Toggles the deck between agents and workspaces. |
 | Dial 1 | Rotate: scrub all agents. Press: focus. |
@@ -32,10 +32,21 @@ glyph:
 | `working` | dark, blue accent | `▶` | Running. |
 | `idle` | dim | `·` | Finished or waiting, and already seen. |
 | `unknown` | dim | `?` | herdr could not classify it. |
+| *acknowledged* | dim | `×` | You dismissed it with a long press; see [attention](../concepts/attention.md). |
 
 Status is never carried by colour alone — every state has its own glyph too.
 
 A focused agent gets a bright ring around its key, so you can see where herdr currently is.
+
+## Pressing and holding
+
+Every agent key has two actions. A press focuses the agent, taking you there and raising the
+terminal window. **Holding it for half a second acknowledges it instead**: it leaves the attention
+queue, herdr is never called, and nothing moves on your screen. That is how you clear a row of
+finished agents without your terminal jumping to the front once per key.
+
+Nothing else on the deck has a second action, so every other key still acts the moment you press
+it.
 
 ## Other hardware
 

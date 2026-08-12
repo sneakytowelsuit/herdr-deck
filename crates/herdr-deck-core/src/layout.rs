@@ -14,7 +14,8 @@
 
 use crate::capabilities::DeckCapabilities;
 use crate::render::Tile;
-use crate::state::DeckState;
+use crate::state::{Acknowledged, DeckState};
+use herdr_deck_herdr::wire::AgentInfo;
 use serde::{Deserialize, Serialize};
 
 /// Which list the deck is currently showing.
@@ -120,6 +121,11 @@ pub enum SlotAction {
     /// many tabs, and landing on the workspace's current one is not where the user pointed.
     FocusTab {
         tab_id: String,
+    },
+    /// Dismiss an agent from the attention queue. Pointedly **not** a focus: herdr is never
+    /// called and no window moves, which is the entire reason this gesture exists.
+    AcknowledgeAgent {
+        terminal_id: String,
     },
     ToggleMode,
     ChangePage {
@@ -287,6 +293,10 @@ pub struct ResolvedDeck<'a> {
     mode: Mode,
     page: usize,
     selection: Selection,
+    acked: &'a Acknowledged,
+    /// Agents in attention order with the acknowledged ones demoted. Held rather than recomputed
+    /// because every key, dial and count on the deck asks for it.
+    order: Vec<&'a AgentInfo>,
 }
 
 impl<'a> ResolvedDeck<'a> {
@@ -296,6 +306,7 @@ impl<'a> ResolvedDeck<'a> {
         mode: Mode,
         page: usize,
         selection: Selection,
+        acked: &'a Acknowledged,
     ) -> Self {
         Self {
             profile,
@@ -303,6 +314,8 @@ impl<'a> ResolvedDeck<'a> {
             mode,
             page,
             selection,
+            acked,
+            order: state.attention_order_with(acked),
         }
     }
 
@@ -313,8 +326,50 @@ impl<'a> ResolvedDeck<'a> {
 
     fn list_len(&self) -> usize {
         match self.mode {
-            Mode::Agents => self.state.agents.len(),
+            Mode::Agents => self.order.len(),
             Mode::Workspaces => self.state.workspaces.len(),
+        }
+    }
+
+    /// The Nth agent, in the order this deck is actually showing them.
+    fn agent_at(&self, index: usize) -> Option<&'a AgentInfo> {
+        self.order.get(index).copied()
+    }
+
+    /// Only the agents still asking for a human — acknowledged ones have stopped asking.
+    fn needing_attention(&self) -> impl Iterator<Item = &'a AgentInfo> + '_ {
+        self.order
+            .iter()
+            .copied()
+            .filter(|agent| self.acked.wants_attention(agent))
+    }
+
+    /// How many agents the attention key should be counting.
+    pub fn attention_count(&self) -> usize {
+        self.needing_attention().count()
+    }
+
+    /// Lengths for every scrub target, in the order [`Selection`] wants them.
+    ///
+    /// Cursors have to be clamped against the same lists the keys resolve against, so handing
+    /// them out together is what stops the two drifting apart.
+    pub fn list_lengths(&self) -> (usize, usize, usize, usize) {
+        (
+            self.order.len(),
+            self.state.workspaces.len(),
+            self.state.tabs.len(),
+            self.attention_count(),
+        )
+    }
+
+    /// How long the list behind one scrub target is right now.
+    pub fn scrub_len(&self, target: ScrubTarget) -> usize {
+        let (agents, workspaces, tabs, attention) = self.list_lengths();
+        match target {
+            ScrubTarget::Agents => agents,
+            ScrubTarget::Workspaces => workspaces,
+            ScrubTarget::Tabs => tabs,
+            ScrubTarget::Attention => attention,
         }
     }
 
@@ -340,7 +395,7 @@ impl<'a> ResolvedDeck<'a> {
             KeyBinding::PinnedAgent { terminal_id } => self
                 .state
                 .agent_by_terminal_id(terminal_id)
-                .map(|agent| agent_tile(self.state, agent))
+                .map(|agent| agent_tile(self.state, agent, self.acked))
                 .unwrap_or(Tile::Empty),
             KeyBinding::PinnedWorkspace { workspace_id } => self
                 .state
@@ -348,7 +403,7 @@ impl<'a> ResolvedDeck<'a> {
                 .map(workspace_tile)
                 .unwrap_or(Tile::Empty),
             KeyBinding::NextAttention => Tile::Attention {
-                count: self.state.attention_count(),
+                count: self.attention_count(),
             },
             KeyBinding::ModeToggle => Tile::Mode {
                 label: self.mode.toggled().label().to_string(),
@@ -373,9 +428,8 @@ impl<'a> ResolvedDeck<'a> {
     fn list_tile(&self, index: usize) -> Tile {
         match self.mode {
             Mode::Agents => self
-                .state
                 .agent_at(index)
-                .map(|agent| agent_tile(self.state, agent))
+                .map(|agent| agent_tile(self.state, agent, self.acked))
                 .unwrap_or(Tile::Empty),
             Mode::Workspaces => self
                 .state
@@ -409,8 +463,8 @@ impl<'a> ResolvedDeck<'a> {
                 workspace_id: workspace_id.clone(),
             },
             KeyBinding::NextAttention => self
-                .state
-                .top_attention()
+                .needing_attention()
+                .next()
                 .map(|a| SlotAction::FocusAgent {
                     terminal_id: a.terminal_id.clone(),
                 })
@@ -429,7 +483,6 @@ impl<'a> ResolvedDeck<'a> {
     fn list_action(&self, index: usize) -> SlotAction {
         match self.mode {
             Mode::Agents => self
-                .state
                 .agent_at(index)
                 .map(|a| SlotAction::FocusAgent {
                     terminal_id: a.terminal_id.clone(),
@@ -443,6 +496,35 @@ impl<'a> ResolvedDeck<'a> {
                     workspace_id: w.workspace_id.clone(),
                 })
                 .unwrap_or(SlotAction::None),
+        }
+    }
+
+    /// What *holding* key `index` should do.
+    ///
+    /// Only keys that name an agent have a second action. Acknowledging is a statement about one
+    /// agent — there is nothing a page key or a mode toggle could mean by it — so every other
+    /// binding deliberately reports nothing rather than growing a gesture nobody asked for.
+    ///
+    /// A [`SlotAction::None`] here is also what tells the daemon a key is a plain one, and so may
+    /// keep acting the instant it is pressed.
+    pub fn key_long_press_action(&self, index: usize) -> SlotAction {
+        if self.state.is_offline() {
+            return SlotAction::None;
+        }
+        let acknowledge = |agent: &AgentInfo| SlotAction::AcknowledgeAgent {
+            terminal_id: agent.terminal_id.clone(),
+        };
+        match self.profile.keys.get(index) {
+            Some(KeyBinding::Dynamic { rank }) if self.mode == Mode::Agents => self
+                .agent_at(self.list_index(*rank))
+                .map(acknowledge)
+                .unwrap_or(SlotAction::None),
+            Some(KeyBinding::PinnedAgent { terminal_id }) => self
+                .state
+                .agent_by_terminal_id(terminal_id)
+                .map(acknowledge)
+                .unwrap_or(SlotAction::None),
+            _ => SlotAction::None,
         }
     }
 
@@ -468,14 +550,12 @@ impl<'a> ResolvedDeck<'a> {
         let cursor = self.selection.get(*target);
         match target {
             ScrubTarget::Agents => self
-                .state
                 .agent_at(cursor)
                 .map(|a| SlotAction::FocusAgent {
                     terminal_id: a.terminal_id.clone(),
                 })
                 .unwrap_or(SlotAction::None),
             ScrubTarget::Attention => self
-                .state
                 .needing_attention()
                 .nth(cursor)
                 .map(|a| SlotAction::FocusAgent {
@@ -515,12 +595,10 @@ impl<'a> ResolvedDeck<'a> {
         let cursor = self.selection.get(*target);
         let (value, status) = match target {
             ScrubTarget::Agents => self
-                .state
                 .agent_at(cursor)
                 .map(|a| (a.label().to_string(), Some(a.agent_status)))
                 .unwrap_or_else(|| ("—".to_string(), None)),
             ScrubTarget::Attention => self
-                .state
                 .needing_attention()
                 .nth(cursor)
                 .map(|a| (a.label().to_string(), Some(a.agent_status)))
@@ -549,13 +627,16 @@ impl<'a> ResolvedDeck<'a> {
 
 /// Needs the whole state, not just the agent: the footer names the agent's *project*, and only
 /// the state knows what herdr calls the workspace the agent happens to be in.
-fn agent_tile(state: &DeckState, agent: &herdr_deck_herdr::wire::AgentInfo) -> Tile {
+fn agent_tile(state: &DeckState, agent: &AgentInfo, acked: &Acknowledged) -> Tile {
     Tile::Agent {
         label: agent.label().to_string(),
         sublabel: agent.state_label().map(str::to_string),
         workspace: state.project_label(agent).map(str::to_string),
         status: agent.agent_status,
         focused: agent.focused,
+        // Only an *attention* state can be dismissed. Marking a working agent acknowledged
+        // would repaint a perfectly ordinary tile for no reason a user could explain.
+        acknowledged: agent.agent_status.needs_attention() && acked.contains(agent),
     }
 }
 
@@ -662,7 +743,15 @@ mod tests {
             agent("calm", AgentStatus::Idle, 1),
             agent("stuck", AgentStatus::Blocked, 2),
         ]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         // Blocked sorts first, so key 0 shows it.
         assert_eq!(
             deck.key_action(0),
@@ -670,6 +759,238 @@ mod tests {
                 terminal_id: "stuck".into()
             }
         );
+    }
+
+    // --- The second action on a key --------------------------------------------------------
+    //
+    // Holding an agent key dismisses it from the attention queue. Nothing else on the deck has a
+    // second action, and these pin that it stays that way.
+
+    /// The deck a Stream Deck + would resolve to, with `acked` applied.
+    fn plus_deck<'a>(
+        profile: &'a Profile,
+        state: &'a DeckState,
+        acked: &'a Acknowledged,
+    ) -> ResolvedDeck<'a> {
+        ResolvedDeck::new(profile, state, Mode::Agents, 0, Selection::default(), acked)
+    }
+
+    #[test]
+    fn holding_a_dynamic_key_acknowledges_the_agent_it_shows_rather_than_focusing_it() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![agent("stuck", AgentStatus::Blocked, 2)]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::AcknowledgeAgent {
+                terminal_id: "stuck".into()
+            }
+        );
+    }
+
+    #[test]
+    fn holding_a_pinned_agent_key_acknowledges_that_agent_too() {
+        // A pinned key names an agent just as squarely as a dynamic one does; there is no reason
+        // for the gesture to work on one and not the other.
+        let profile = Profile {
+            keys: vec![KeyBinding::PinnedAgent {
+                terminal_id: "pinned".into(),
+            }],
+            dials: vec![],
+        };
+        let state = state_with(vec![agent("pinned", AgentStatus::Done, 4)]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::AcknowledgeAgent {
+                terminal_id: "pinned".into()
+            }
+        );
+    }
+
+    #[test]
+    fn holding_anything_that_is_not_an_agent_key_does_nothing_at_all() {
+        // Every one of these keys must keep acting the instant it is pressed, so none of them may
+        // claim a long press — a page key that went dead when you held it would read as broken.
+        let caps = DeckModel::Xl.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![agent("stuck", AgentStatus::Blocked, 1)]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        for binding in [
+            KeyBinding::NextAttention,
+            KeyBinding::ModeToggle,
+            KeyBinding::PagePrev,
+            KeyBinding::PageNext,
+        ] {
+            let index = profile
+                .keys
+                .iter()
+                .position(|k| *k == binding)
+                .unwrap_or_else(|| panic!("this profile has a {binding:?} key"));
+            assert_eq!(
+                deck.key_long_press_action(index),
+                SlotAction::None,
+                "{binding:?} must have no second action"
+            );
+        }
+    }
+
+    #[test]
+    fn holding_a_key_in_workspace_mode_does_nothing_because_workspaces_do_not_want_you() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let mut state = state_with(vec![]);
+        state.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w2".into(),
+            ..Default::default()
+        }];
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Workspaces,
+            0,
+            Selection::default(),
+            &acked,
+        );
+        assert_eq!(deck.key_long_press_action(0), SlotAction::None);
+    }
+
+    #[test]
+    fn holding_an_empty_slot_does_nothing_rather_than_acknowledging_something_random() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![agent("only", AgentStatus::Blocked, 1)]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        assert_eq!(deck.key_long_press_action(3), SlotAction::None);
+    }
+
+    #[test]
+    fn an_offline_deck_has_no_second_action_either() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = DeckState::offline("herdr socket not found");
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        for index in 0..profile.keys.len() {
+            assert_eq!(deck.key_long_press_action(index), SlotAction::None);
+        }
+    }
+
+    #[test]
+    fn an_acknowledged_agent_stops_counting_towards_the_attention_key() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![
+            agent("finished", AgentStatus::Done, 2),
+            agent("stuck", AgentStatus::Blocked, 1),
+        ]);
+        let next_key = profile
+            .keys
+            .iter()
+            .position(|k| *k == KeyBinding::NextAttention)
+            .unwrap();
+
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("finished").unwrap());
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(deck.tile(next_key), Tile::Attention { count: 1 });
+        assert_eq!(
+            deck.key_action(next_key),
+            SlotAction::FocusAgent {
+                terminal_id: "stuck".into()
+            },
+            "the attention key must skip what you already dismissed"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_agent_keeps_its_key_and_is_drawn_calm() {
+        // Dropping it off the deck would be the wrong trade entirely: you dismissed the alarm,
+        // not the agent, and you still need to be able to reach it.
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![agent("finished", AgentStatus::Done, 2)]);
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("finished").unwrap());
+        let deck = plus_deck(&profile, &state, &acked);
+
+        match deck.tile(0) {
+            Tile::Agent {
+                label,
+                status,
+                acknowledged,
+                ..
+            } => {
+                assert_eq!(label, "finished");
+                assert!(acknowledged, "the tile must draw calm");
+                assert_eq!(
+                    status,
+                    AgentStatus::Done,
+                    "and must still carry what herdr actually reports"
+                );
+            }
+            other => panic!("the agent should still be on its key, got {other:?}"),
+        }
+        assert_eq!(
+            deck.key_action(0),
+            SlotAction::FocusAgent {
+                terminal_id: "finished".into()
+            },
+            "a short press must still take you there"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_agent_drops_below_the_ones_still_asking_for_you() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![
+            agent("dismissed", AgentStatus::Blocked, 9),
+            agent("stuck", AgentStatus::Blocked, 8),
+        ]);
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("dismissed").unwrap());
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_action(0),
+            SlotAction::FocusAgent {
+                terminal_id: "stuck".into()
+            },
+            "key 0 belongs to whichever agent is loudest, and it is no longer the dismissed one"
+        );
+    }
+
+    #[test]
+    fn the_attention_dial_skips_acknowledged_agents_the_same_way_the_keys_do() {
+        // The dial and the keys read the same queue; letting them disagree would mean the deck
+        // told you two different things about the same agent at the same time.
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![
+            agent("dismissed", AgentStatus::Blocked, 9),
+            agent("stuck", AgentStatus::Blocked, 8),
+        ]);
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("dismissed").unwrap());
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(deck.scrub_len(ScrubTarget::Attention), 1);
+        assert_eq!(
+            deck.dial_press_action(3),
+            SlotAction::FocusAgent {
+                terminal_id: "stuck".into()
+            }
+        );
+        let (_, value, _) = deck.dial_feedback(3);
+        assert_eq!(value, "stuck");
     }
 
     #[test]
@@ -681,7 +1002,15 @@ mod tests {
             agent("older_block", AgentStatus::Blocked, 1),
             agent("fresh_block", AgentStatus::Blocked, 9),
         ]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         let next_key = profile
             .keys
             .iter()
@@ -700,7 +1029,15 @@ mod tests {
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let state = state_with(vec![agent("calm", AgentStatus::Idle, 1)]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         let next_key = profile
             .keys
             .iter()
@@ -715,7 +1052,15 @@ mod tests {
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let state = state_with(vec![agent("only", AgentStatus::Idle, 1)]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         assert_eq!(deck.tile(3), Tile::Empty);
         assert_eq!(deck.key_action(3), SlotAction::None);
     }
@@ -725,7 +1070,15 @@ mod tests {
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let state = DeckState::offline("herdr socket not found");
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         for index in 0..profile.keys.len() {
             assert!(matches!(deck.tile(index), Tile::Offline { .. }));
             assert_eq!(deck.key_action(index), SlotAction::None);
@@ -743,7 +1096,15 @@ mod tests {
             agent_status: AgentStatus::Working,
             ..Default::default()
         }];
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Workspaces, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Workspaces,
+            0,
+            Selection::default(),
+            &acked,
+        );
         assert_eq!(
             deck.key_action(0),
             SlotAction::FocusWorkspace {
@@ -762,7 +1123,15 @@ mod tests {
             .map(|i| agent(&format!("a{i:02}"), AgentStatus::Idle, 0))
             .collect();
         let state = state_with(agents);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 1, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            1,
+            Selection::default(),
+            &acked,
+        );
         assert_eq!(
             deck.key_action(0),
             SlotAction::FocusAgent {
@@ -784,7 +1153,8 @@ mod tests {
             agents: 1,
             ..Default::default()
         };
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
         assert_eq!(
             deck.dial_press_action(0),
             SlotAction::FocusAgent {
@@ -806,7 +1176,8 @@ mod tests {
             attention: 1,
             ..Default::default()
         };
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
         // Index 1 of the attention list is the `done` agent — the working one is skipped.
         assert_eq!(
             deck.dial_press_action(3),
@@ -839,7 +1210,8 @@ mod tests {
             tabs: 1,
             ..Default::default()
         };
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
         assert_eq!(
             deck.dial_press_action(2),
             SlotAction::FocusTab {
@@ -853,7 +1225,15 @@ mod tests {
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let state = state_with(vec![]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         assert_eq!(
             deck.dial_rotate_action(1, 2),
             SlotAction::Scrub {
@@ -909,7 +1289,15 @@ mod tests {
         let mut blocked = agent("refactor", AgentStatus::Blocked, 1);
         blocked.name = Some("refactor".into());
         let state = state_with(vec![blocked]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         let (title, value, status) = deck.dial_feedback(0);
         assert_eq!(title, "agent");
         assert_eq!(value, "refactor");
@@ -921,7 +1309,15 @@ mod tests {
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let state = state_with(vec![agent("busy", AgentStatus::Working, 1)]);
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
         let (_, value, _) = deck.dial_feedback(3);
         assert_eq!(value, "all clear");
     }
@@ -940,7 +1336,7 @@ mod tests {
     /// The footer the deck would draw for the state's single agent.
     fn project_footer(state: &DeckState) -> Option<String> {
         let agent = state.agents.first().expect("state has an agent");
-        match agent_tile(state, agent) {
+        match agent_tile(state, agent, &Acknowledged::default()) {
             Tile::Agent { workspace, .. } => workspace,
             other => panic!("expected an agent tile, got {other:?}"),
         }

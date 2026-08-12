@@ -179,7 +179,9 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> a
                     }
                 }
 
-                let outcome = session.handle(message, &state);
+                // The session times key presses, so it needs a clock; taking it here keeps the
+                // session itself a pure function of its inputs.
+                let outcome = session.handle(message, &state, std::time::Instant::now());
                 write_all(&mut write_half, &outcome.messages).await?;
 
                 if let Some(action) = outcome.action {

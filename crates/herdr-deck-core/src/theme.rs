@@ -75,6 +75,21 @@ impl Theme {
         }
     }
 
+    /// An attention state the user has dismissed with a long press.
+    ///
+    /// Calm, because that is the whole point of dismissing it, but marked with a glyph of its own
+    /// rather than borrowed from `idle`: the agent may still be blocked, and a tile that claimed
+    /// otherwise would be lying about the one thing this deck exists to report.
+    pub fn acknowledged(self) -> StatusStyle {
+        StatusStyle {
+            background: "#131418",
+            foreground: "#8A8F99",
+            accent: "#6E7480",
+            glyph: "×",
+            emphatic: false,
+        }
+    }
+
     /// Background for tiles that are not showing an agent.
     pub fn neutral_background(self) -> &'static str {
         "#0E0F12"
@@ -162,5 +177,24 @@ mod tests {
         ] {
             assert_ne!(theme.status(status).glyph, offline.glyph);
         }
+    }
+
+    #[test]
+    fn an_acknowledged_tile_is_calm_but_still_tells_you_it_was_dismissed() {
+        // Reusing idle's glyph would make a dismissed blocked agent indistinguishable from one
+        // that genuinely has nothing to say — the colour is calm, the shape has to differ.
+        let theme = Theme::Dark;
+        let acknowledged = theme.acknowledged();
+        assert!(!acknowledged.emphatic);
+        for status in [
+            AgentStatus::Blocked,
+            AgentStatus::Done,
+            AgentStatus::Working,
+            AgentStatus::Idle,
+            AgentStatus::Unknown,
+        ] {
+            assert_ne!(theme.status(status).glyph, acknowledged.glyph);
+        }
+        assert_ne!(theme.offline().glyph, acknowledged.glyph);
     }
 }

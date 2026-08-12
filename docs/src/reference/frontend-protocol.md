@@ -59,6 +59,11 @@ layout and repaints.
 
 Keys are numbered in reading order: `index = row * columns + column`.
 
+**Send `key_up` for every `key_down`.** The daemon times the gap: half a second or more is a long
+press, which on an agent key acknowledges it instead of focusing it. A frontend that only reports
+presses will leave agent keys apparently dead, because a key with two meanings cannot be resolved
+until it is released. Keys with a single meaning still act on `key_down`, as they always have.
+
 Send `refresh` after connecting and whenever a control appears with no image — the daemon only
 sends what changed, so it will not otherwise repaint a key it believes is already correct.
 

@@ -9,7 +9,7 @@ use clap::Parser;
 use herdr_deck_core::capabilities::{DeckCapabilities, DeckModel};
 use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, Selection};
 use herdr_deck_core::render::TileRenderer;
-use herdr_deck_core::state::DeckState;
+use herdr_deck_core::state::{Acknowledged, DeckState};
 use herdr_deck_core::Config;
 use herdr_deck_focus::FocusEngine;
 use herdr_deck_herdr::HerdrClient;
@@ -202,7 +202,17 @@ fn dry_run(config: &Config, dir: &std::path::Path, model_name: &str) -> anyhow::
     let state = sample_state();
 
     std::fs::create_dir_all(dir)?;
-    let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, Selection::default());
+    // A dry run has no frontend and therefore nothing acknowledged: it shows the deck as it
+    // looks when everything that wants you is still asking.
+    let nothing_acknowledged = Acknowledged::default();
+    let deck = ResolvedDeck::new(
+        &profile,
+        &state,
+        Mode::Agents,
+        0,
+        Selection::default(),
+        &nothing_acknowledged,
+    );
 
     if capabilities.has_display() {
         for index in 0..profile.keys.len() {

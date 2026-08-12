@@ -2,23 +2,32 @@
 //!
 //! # Pure state machine, async executor
 //!
-//! [`Session`] is deliberately synchronous and side-effect free: it takes a frontend message
-//! plus the current state and returns the bytes to send back, plus at most one [`PendingAction`]
-//! for the caller to perform. All the interesting behaviour — what a key means, when to
-//! repaint, how the dials move — is therefore testable without a socket, a deck, or a herdr.
+//! [`Session`] is deliberately synchronous and side-effect free: it takes a frontend message,
+//! the current state and the current time, and returns the bytes to send back plus at most one
+//! [`PendingAction`] for the caller to perform. All the interesting behaviour — what a key
+//! means, when to repaint, how the dials move, how long a press lasted — is therefore testable
+//! without a socket, a deck, a herdr, or a sleep.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use herdr_deck_core::capabilities::DeckCapabilities;
 use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
 use herdr_deck_core::protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 use herdr_deck_core::render::{Tile, TileRenderer};
-use herdr_deck_core::state::DeckState;
+use herdr_deck_core::state::{Acknowledged, DeckState};
 use herdr_deck_core::Config;
 
 use base64::Engine as _;
+
+/// How long a key must be held to count as a long press.
+///
+/// Half a second is the usual touch-interface figure: comfortably longer than any tap, short
+/// enough that holding for it does not feel like waiting. It lives here rather than in the
+/// frontends because the frontends are not allowed to know what a gesture *means*.
+const LONG_PRESS: Duration = Duration::from_millis(500);
 
 /// Something the connection loop must do asynchronously.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +76,16 @@ pub struct Session {
     /// nothing. Without this the deck would be repainted on every timer tick.
     sent_keys: Vec<Option<u64>>,
     sent_dials: Vec<Option<u64>>,
+    /// When each key that has a second action went down, so the release can tell a tap from a
+    /// hold. Only ever set for keys that *have* a second action — see [`Session::handle`].
+    pressed_at: Vec<Option<Instant>>,
+    /// Agents this frontend has dismissed from its attention queue.
+    ///
+    /// Per connection, not per daemon: acknowledgement is a statement about what *this* person
+    /// looking at *this* deck has seen. Two decks attached at once therefore each keep their own,
+    /// which is the honest reading — dismissing an alert on the deck in front of you should not
+    /// silence the one in the next room.
+    acked: Acknowledged,
     greeted: bool,
 }
 
@@ -103,6 +122,8 @@ impl Session {
             selection: Selection::default(),
             sent_keys: vec![None; key_count],
             sent_dials: vec![None; dial_count],
+            pressed_at: vec![None; key_count],
+            acked: Acknowledged::default(),
             greeted: false,
         }
     }
@@ -130,8 +151,8 @@ impl Session {
         messages
     }
 
-    /// Handle one frontend message.
-    pub fn handle(&mut self, message: FrontendMessage, state: &DeckState) -> Outcome {
+    /// Handle one frontend message. `now` is the clock the press timer runs on.
+    pub fn handle(&mut self, message: FrontendMessage, state: &DeckState, now: Instant) -> Outcome {
         match message {
             FrontendMessage::Hello { .. } => {
                 // A second hello means the frontend reconnected in place; repaint everything.
@@ -143,11 +164,34 @@ impl Session {
                 self.force_full_repaint();
                 Outcome::just(self.repaint(state))
             }
-            // Acting on key *down* rather than up makes the deck feel immediate.
+
+            // A key with only one action still acts on the press, because that is what makes the
+            // deck feel immediate — and because a page key that did nothing until you let go
+            // would simply read as broken. Only a key that has a *second* action has anything to
+            // wait for, and for those the press cannot be interpreted until the release: focusing
+            // is not something we could take back on discovering the user meant to hold.
             FrontendMessage::KeyDown { index } => {
-                self.act(self.resolved(state).key_action(index), Some(index), state)
+                let (short, long) = self.key_actions(index, state);
+                if long == SlotAction::None {
+                    self.forget_press(index);
+                    self.act(short, Some(index), state)
+                } else {
+                    self.remember_press(index, now);
+                    Outcome::default()
+                }
             }
-            FrontendMessage::KeyUp { .. } => Outcome::default(),
+
+            FrontendMessage::KeyUp { index } => {
+                // No recorded press means this key acted on the way down and has nothing left to
+                // do — or the frontend connected mid-press, which is the same thing to us.
+                let Some(pressed_at) = self.forget_press(index) else {
+                    return Outcome::default();
+                };
+                let (short, long) = self.key_actions(index, state);
+                let held = now.saturating_duration_since(pressed_at);
+                let action = if held >= LONG_PRESS { long } else { short };
+                self.act(action, Some(index), state)
+            }
             FrontendMessage::DialRotate { dial, ticks } => {
                 let action = self.resolved(state).dial_rotate_action(dial, ticks);
                 self.act(action, None, state)
@@ -169,7 +213,34 @@ impl Session {
     }
 
     fn resolved<'a>(&'a self, state: &'a DeckState) -> ResolvedDeck<'a> {
-        ResolvedDeck::new(&self.profile, state, self.mode, self.page, self.selection)
+        ResolvedDeck::new(
+            &self.profile,
+            state,
+            self.mode,
+            self.page,
+            self.selection,
+            &self.acked,
+        )
+    }
+
+    /// Both meanings of one key: what a tap does, and what a hold does.
+    ///
+    /// Resolved together so a press and its release can never disagree about which key they were
+    /// talking about, and taken by value so the borrow ends before anything acts.
+    fn key_actions(&self, index: usize, state: &DeckState) -> (SlotAction, SlotAction) {
+        let deck = self.resolved(state);
+        (deck.key_action(index), deck.key_long_press_action(index))
+    }
+
+    fn remember_press(&mut self, index: usize, now: Instant) {
+        if let Some(slot) = self.pressed_at.get_mut(index) {
+            *slot = Some(now);
+        }
+    }
+
+    /// Take the press timer for a key, leaving it clear.
+    fn forget_press(&mut self, index: usize) -> Option<Instant> {
+        self.pressed_at.get_mut(index).and_then(Option::take)
     }
 
     fn act(&mut self, action: SlotAction, key: Option<usize>, state: &DeckState) -> Outcome {
@@ -188,12 +259,23 @@ impl Session {
                             key,
                         }),
                     },
-                    None => Outcome::just(key.map_or(vec![], |index| {
-                        vec![DaemonMessage::Alert {
-                            index,
-                            message: "that agent is gone".to_string(),
-                        }]
-                    })),
+                    None => Outcome::just(alert(key, "that agent is gone")),
+                }
+            }
+
+            // The point of this action is what it does *not* do: no herdr call, no window raised,
+            // no focus. The attention queue simply stops counting this agent, until herdr says
+            // the agent's state moved.
+            SlotAction::AcknowledgeAgent { terminal_id } => {
+                match state.agent_by_terminal_id(&terminal_id) {
+                    Some(agent) if self.acked.acknowledge(agent) => {
+                        Outcome::just(self.repaint(state))
+                    }
+                    // herdr gave us nothing that could ever expire the acknowledgement, so we
+                    // refuse it and say so. Silently muting an agent that might never come back
+                    // is the one failure this deck must not have.
+                    Some(_) => Outcome::just(alert(key, "herdr reported no state sequence")),
+                    None => Outcome::just(alert(key, "that agent is gone")),
                 }
             }
 
@@ -232,23 +314,18 @@ impl Session {
     }
 
     fn list_len(&self, target: ScrubTarget, state: &DeckState) -> usize {
-        match target {
-            ScrubTarget::Agents => state.agents.len(),
-            ScrubTarget::Workspaces => state.workspaces.len(),
-            ScrubTarget::Tabs => state.tabs.len(),
-            ScrubTarget::Attention => state.attention_count(),
-        }
+        self.resolved(state).scrub_len(target)
     }
 
     /// Repaint, sending only what changed.
     pub fn repaint(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
+        // An acknowledgement whose agent moved on can never match again, so drop it here rather
+        // than letting a long-lived connection hoard one entry per agent it ever dismissed.
+        self.acked.forget_stale(state);
+
         // Keep cursors valid: agents come and go underneath us constantly.
-        self.selection.clamp(
-            state.agents.len(),
-            state.workspaces.len(),
-            state.tabs.len(),
-            state.attention_count(),
-        );
+        let (agents, workspaces, tabs, attention) = self.resolved(state).list_lengths();
+        self.selection.clamp(agents, workspaces, tabs, attention);
         let pages = self.resolved(state).page_count();
         if self.page >= pages {
             self.page = pages - 1;
@@ -265,8 +342,13 @@ impl Session {
     fn repaint_keys(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
         let mut messages = Vec::new();
         let size = self.capabilities.key_image_px;
-        for index in 0..self.profile.keys.len() {
-            let tile = self.resolved(state).tile(index);
+        // Resolve every tile up front: one pass over the deck rather than one per key, and the
+        // borrow is over before anything below needs to record what was sent.
+        let tiles: Vec<Tile> = {
+            let deck = self.resolved(state);
+            (0..self.profile.keys.len()).map(|i| deck.tile(i)).collect()
+        };
+        for (index, tile) in tiles.into_iter().enumerate() {
             let hash = hash_of(&tile);
             if self.sent_keys.get(index).copied().flatten() == Some(hash) {
                 continue;
@@ -295,8 +377,13 @@ impl Session {
         let mut messages = Vec::new();
         let strip = self.capabilities.touchstrip;
         let dial_count = self.capabilities.dials;
-        for dial in 0..self.profile.dials.len() {
-            let (title, value, status) = self.resolved(state).dial_feedback(dial);
+        let feedback: Vec<_> = {
+            let deck = self.resolved(state);
+            (0..self.profile.dials.len())
+                .map(|dial| deck.dial_feedback(dial))
+                .collect()
+        };
+        for (dial, (title, value, status)) in feedback.into_iter().enumerate() {
             let hash = hash_of(&(&title, &value, status));
             if self.sent_dials.get(dial).copied().flatten() == Some(hash) {
                 continue;
@@ -339,6 +426,19 @@ impl Session {
     pub fn tile_at(&self, index: usize, state: &DeckState) -> Tile {
         self.resolved(state).tile(index)
     }
+}
+
+/// Deck feedback for something that did not happen, when we know which key asked for it.
+///
+/// A dial press has no key to flash, and an alert nobody can see is worse than none at all —
+/// the caller logs those instead.
+fn alert(key: Option<usize>, message: &str) -> Vec<DaemonMessage> {
+    key.map_or(vec![], |index| {
+        vec![DaemonMessage::Alert {
+            index,
+            message: message.to_string(),
+        }]
+    })
 }
 
 fn hash_of<T: Hash>(value: &T) -> u64 {
@@ -404,6 +504,65 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Send one message at a moment the test does not care about.
+    fn send(session: &mut Session, message: FrontendMessage, state: &DeckState) -> Outcome {
+        session.handle(message, state, Instant::now())
+    }
+
+    /// Press key `index` and let go `held` later, returning whatever the gesture produced.
+    ///
+    /// A key acts either on the press or on the release and never both, so folding the two
+    /// outcomes into one loses nothing and lets each test below read like the gesture it is about.
+    fn press_for(
+        session: &mut Session,
+        index: usize,
+        held: Duration,
+        state: &DeckState,
+    ) -> Outcome {
+        let down = Instant::now();
+        let pressed = session.handle(FrontendMessage::KeyDown { index }, state, down);
+        let released = session.handle(FrontendMessage::KeyUp { index }, state, down + held);
+        assert!(
+            pressed.action.is_none() || released.action.is_none(),
+            "one press must not produce two actions"
+        );
+        if released.action.is_some() || !released.messages.is_empty() {
+            released
+        } else {
+            pressed
+        }
+    }
+
+    fn tap(session: &mut Session, index: usize, state: &DeckState) -> Outcome {
+        press_for(session, index, Duration::from_millis(40), state)
+    }
+
+    fn hold(session: &mut Session, index: usize, state: &DeckState) -> Outcome {
+        press_for(session, index, LONG_PRESS, state)
+    }
+
+    /// What the deck's attention key is currently counting.
+    fn attention_count(session: &Session, state: &DeckState) -> usize {
+        let index = session
+            .profile()
+            .keys
+            .iter()
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::NextAttention)
+            .expect("this profile has an attention key");
+        match session.tile_at(index, state) {
+            Tile::Attention { count } => count,
+            other => panic!("expected the attention tile, got {other:?}"),
+        }
+    }
+
+    /// Whether key `index` is drawing an agent that has been dismissed.
+    fn tile_is_acknowledged(session: &Session, index: usize, state: &DeckState) -> bool {
+        match session.tile_at(index, state) {
+            Tile::Agent { acknowledged, .. } => acknowledged,
+            other => panic!("key {index} is not showing an agent: {other:?}"),
+        }
     }
 
     #[test]
@@ -477,13 +636,250 @@ mod tests {
         let state = state(vec![agent("term_x", AgentStatus::Blocked, 1)]);
         session.greet(&state);
 
-        let outcome = session.handle(FrontendMessage::KeyDown { index: 0 }, &state);
+        let outcome = tap(&mut session, 0, &state);
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusAgent {
                 pane_id: "w1:pane-term_x".into(),
                 key: Some(0)
             })
+        );
+    }
+
+    // --- Long press ------------------------------------------------------------------------
+    //
+    // Holding an agent key dismisses it from the attention queue. The tests that matter most
+    // here are the ones about the acknowledgement *ending*: a dismissal that outlived the state
+    // it was about would hide an agent that needs you, and a deck that hides those has no reason
+    // to exist.
+
+    #[test]
+    fn holding_an_agent_key_acknowledges_it_without_ever_asking_for_a_focus() {
+        // The entire point: clearing a finished agent must not drag the terminal window in front
+        // of whatever you were doing.
+        let mut session = session();
+        let state = state(vec![agent("finished", AgentStatus::Done, 1)]);
+        session.greet(&state);
+        assert_eq!(attention_count(&session, &state), 1);
+
+        let outcome = hold(&mut session, 0, &state);
+        assert!(
+            outcome.action.is_none(),
+            "a long press must produce no action for the daemon to perform, got {:?}",
+            outcome.action
+        );
+        assert!(
+            !outcome.messages.is_empty(),
+            "the deck has to repaint, or the gesture looks like it did nothing"
+        );
+        assert_eq!(attention_count(&session, &state), 0);
+        assert!(tile_is_acknowledged(&session, 0, &state));
+    }
+
+    #[test]
+    fn an_acknowledged_agent_keeps_its_key_and_a_short_press_still_takes_you_there() {
+        let mut session = session();
+        let state = state(vec![agent("finished", AgentStatus::Done, 1)]);
+        session.greet(&state);
+        hold(&mut session, 0, &state);
+
+        assert!(matches!(session.tile_at(0, &state), Tile::Agent { .. }));
+        assert_eq!(
+            tap(&mut session, 0, &state).action,
+            Some(PendingAction::FocusAgent {
+                pane_id: "w1:pane-finished".into(),
+                key: Some(0)
+            })
+        );
+    }
+
+    #[test]
+    fn an_agent_that_blocks_again_after_being_acknowledged_comes_straight_back() {
+        // The invariant the whole feature stands on. If an acknowledgement ever survives the
+        // state it dismissed, the deck goes quiet about an agent that is waiting on you — a
+        // false negative, and the worst thing this product can do.
+        let mut session = session();
+        let blocked = state(vec![agent("stuck", AgentStatus::Blocked, 1)]);
+        session.greet(&blocked);
+        hold(&mut session, 0, &blocked);
+        assert_eq!(attention_count(&session, &blocked), 0);
+
+        // You answered it elsewhere and it got on with the work.
+        let working = state(vec![agent("stuck", AgentStatus::Working, 2)]);
+        session.repaint(&working);
+        assert_eq!(attention_count(&session, &working), 0);
+
+        // Now it needs you again. herdr bumps the sequence, so the acknowledgement no longer
+        // describes anything and the agent is back at the top of the queue.
+        let again = state(vec![agent("stuck", AgentStatus::Blocked, 3)]);
+        let messages = session.repaint(&again);
+        assert_eq!(
+            attention_count(&session, &again),
+            1,
+            "a re-blocked agent must count again"
+        );
+        assert!(
+            !tile_is_acknowledged(&session, 0, &again),
+            "and must be drawn as the alarm it is"
+        );
+        assert!(
+            !messages.is_empty(),
+            "the deck has to be repainted to say so"
+        );
+    }
+
+    #[test]
+    fn an_acknowledgement_survives_an_unrelated_agent_changing_state() {
+        // Acknowledgement is per agent. Expiring the lot on any state change anywhere would make
+        // the gesture useless on a busy machine, where something is always moving.
+        let mut session = session();
+        let before = state(vec![
+            agent("dismissed", AgentStatus::Done, 1),
+            agent("other", AgentStatus::Working, 2),
+        ]);
+        session.greet(&before);
+        // `done` outranks `working`, so key 0 is the agent this test dismisses.
+        hold(&mut session, 0, &before);
+        assert_eq!(attention_count(&session, &before), 0);
+
+        let after = state(vec![
+            agent("dismissed", AgentStatus::Done, 1),
+            agent("other", AgentStatus::Blocked, 9),
+        ]);
+        session.repaint(&after);
+        assert_eq!(
+            attention_count(&session, &after),
+            1,
+            "only the newly blocked agent should be counted"
+        );
+        // The blocked agent now owns key 0 and the dismissed one has dropped behind it.
+        assert!(tile_is_acknowledged(&session, 1, &after));
+    }
+
+    #[test]
+    fn a_press_of_exactly_the_threshold_is_a_hold_and_a_millisecond_less_is_a_tap() {
+        // The boundary is worth pinning in both directions: a threshold that only fires above it
+        // makes the gesture feel unreliable, and one that fires below it steals ordinary presses.
+        let state = state(vec![agent("finished", AgentStatus::Done, 1)]);
+
+        let mut just_short = session();
+        just_short.greet(&state);
+        let outcome = press_for(
+            &mut just_short,
+            0,
+            LONG_PRESS - Duration::from_millis(1),
+            &state,
+        );
+        assert!(
+            outcome.action.is_some(),
+            "a hair under the threshold is still a press, and a press focuses"
+        );
+        assert_eq!(attention_count(&just_short, &state), 1);
+
+        let mut exactly = session();
+        exactly.greet(&state);
+        let outcome = press_for(&mut exactly, 0, LONG_PRESS, &state);
+        assert!(outcome.action.is_none());
+        assert_eq!(attention_count(&exactly, &state), 0);
+    }
+
+    #[test]
+    fn a_key_with_no_second_action_still_acts_the_instant_it_goes_down() {
+        // Nothing about the mode toggle is ambiguous, so nothing about it should wait. A key that
+        // did nothing until you let go would read as broken hardware.
+        let mut session = session();
+        let mut s = state(vec![agent("a", AgentStatus::Idle, 1)]);
+        s.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w1".into(),
+            label: Some("api".into()),
+            ..Default::default()
+        }];
+        session.greet(&s);
+        let toggle = session
+            .profile()
+            .keys
+            .iter()
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .unwrap();
+
+        let outcome = session.handle(
+            FrontendMessage::KeyDown { index: toggle },
+            &s,
+            Instant::now(),
+        );
+        assert!(!outcome.messages.is_empty(), "it must act on the press");
+        assert!(matches!(session.tile_at(0, &s), Tile::Workspace { .. }));
+    }
+
+    #[test]
+    fn holding_a_key_with_no_second_action_does_not_act_a_second_time_on_release() {
+        let mut session = session();
+        let mut s = state(vec![agent("a", AgentStatus::Idle, 1)]);
+        s.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w1".into(),
+            label: Some("api".into()),
+            ..Default::default()
+        }];
+        session.greet(&s);
+        let toggle = session
+            .profile()
+            .keys
+            .iter()
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .unwrap();
+
+        let now = Instant::now();
+        session.handle(FrontendMessage::KeyDown { index: toggle }, &s, now);
+        let released = session.handle(
+            FrontendMessage::KeyUp { index: toggle },
+            &s,
+            now + LONG_PRESS * 4,
+        );
+        assert!(released.messages.is_empty() && released.action.is_none());
+        assert!(
+            matches!(session.tile_at(0, &s), Tile::Workspace { .. }),
+            "the mode must have toggled exactly once"
+        );
+    }
+
+    #[test]
+    fn a_release_with_no_press_behind_it_is_ignored() {
+        // A frontend that connects while a key is already held, or one that repeats a key_up,
+        // must not act on a press this session never saw.
+        let mut session = session();
+        let s = state(vec![agent("finished", AgentStatus::Done, 1)]);
+        session.greet(&s);
+
+        let outcome = send(&mut session, FrontendMessage::KeyUp { index: 0 }, &s);
+        assert!(outcome.action.is_none());
+        assert!(outcome.messages.is_empty());
+        assert_eq!(attention_count(&session, &s), 1);
+    }
+
+    #[test]
+    fn an_agent_herdr_gave_no_state_sequence_for_is_refused_out_loud_rather_than_muted_forever() {
+        // Without a sequence nothing could ever expire the acknowledgement, so the only safe
+        // answer is to decline it — and to say so, rather than leave the user believing an agent
+        // was dismissed when it was not.
+        let mut session = session();
+        let mut sequenceless = agent("mystery", AgentStatus::Blocked, 0);
+        sequenceless.state_change_seq = None;
+        let s = state(vec![sequenceless]);
+        session.greet(&s);
+
+        let outcome = hold(&mut session, 0, &s);
+        assert!(outcome.action.is_none());
+        match outcome.messages.as_slice() {
+            [DaemonMessage::Alert { index, message }] => {
+                assert_eq!(*index, 0);
+                assert!(message.contains("state sequence"), "got {message}");
+            }
+            other => panic!("expected one alert on the pressed key, got {other:?}"),
+        }
+        assert_eq!(
+            attention_count(&session, &s),
+            1,
+            "the agent must still be asking for you"
         );
     }
 
@@ -495,7 +891,7 @@ mod tests {
 
         // The agent disappears between paint and press.
         let now = state(vec![]);
-        let outcome = session.handle(FrontendMessage::KeyDown { index: 0 }, &now);
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: 0 }, &now);
         assert!(outcome.action.is_none());
         // With no agent, the slot is empty and simply does nothing.
         assert!(outcome.messages.is_empty());
@@ -518,7 +914,7 @@ mod tests {
             .iter()
             .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
             .unwrap();
-        let outcome = session.handle(FrontendMessage::KeyDown { index: toggle }, &s);
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: toggle }, &s);
         assert!(!outcome.messages.is_empty(), "mode change must repaint");
         assert!(matches!(session.tile_at(0, &s), Tile::Workspace { .. }));
     }
@@ -532,7 +928,11 @@ mod tests {
         ]);
         session.greet(&s);
 
-        let outcome = session.handle(FrontendMessage::DialRotate { dial: 0, ticks: 1 }, &s);
+        let outcome = send(
+            &mut session,
+            FrontendMessage::DialRotate { dial: 0, ticks: 1 },
+            &s,
+        );
         let feedback: Vec<_> = outcome
             .messages
             .iter()
@@ -555,9 +955,13 @@ mod tests {
             agent("second", AgentStatus::Blocked, 5),
         ]);
         session.greet(&s);
-        session.handle(FrontendMessage::DialRotate { dial: 0, ticks: 1 }, &s);
+        send(
+            &mut session,
+            FrontendMessage::DialRotate { dial: 0, ticks: 1 },
+            &s,
+        );
 
-        let outcome = session.handle(FrontendMessage::DialDown { dial: 0 }, &s);
+        let outcome = send(&mut session, FrontendMessage::DialDown { dial: 0 }, &s);
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusAgent {
@@ -586,9 +990,13 @@ mod tests {
             },
         ];
         session.greet(&s);
-        session.handle(FrontendMessage::DialRotate { dial: 2, ticks: 1 }, &s);
+        send(
+            &mut session,
+            FrontendMessage::DialRotate { dial: 2, ticks: 1 },
+            &s,
+        );
 
-        let outcome = session.handle(FrontendMessage::DialDown { dial: 2 }, &s);
+        let outcome = send(&mut session, FrontendMessage::DialDown { dial: 2 }, &s);
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusTab {
@@ -603,7 +1011,11 @@ mod tests {
         let mut session = session();
         let s = state(vec![agent("only", AgentStatus::Blocked, 1)]);
         session.greet(&s);
-        let outcome = session.handle(FrontendMessage::TouchTap { dial: Some(0) }, &s);
+        let outcome = send(
+            &mut session,
+            FrontendMessage::TouchTap { dial: Some(0) },
+            &s,
+        );
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusAgent {
@@ -622,11 +1034,15 @@ mod tests {
             agent("c", AgentStatus::Blocked, 1),
         ]);
         session.greet(&many);
-        session.handle(FrontendMessage::DialRotate { dial: 0, ticks: 2 }, &many);
+        send(
+            &mut session,
+            FrontendMessage::DialRotate { dial: 0, ticks: 2 },
+            &many,
+        );
 
         let fewer = state(vec![agent("a", AgentStatus::Blocked, 3)]);
         session.repaint(&fewer);
-        let outcome = session.handle(FrontendMessage::DialDown { dial: 0 }, &fewer);
+        let outcome = send(&mut session, FrontendMessage::DialDown { dial: 0 }, &fewer);
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusAgent {
@@ -645,7 +1061,7 @@ mod tests {
         session.greet(&s);
         assert!(session.repaint(&s).is_empty());
 
-        let outcome = session.handle(FrontendMessage::Refresh, &s);
+        let outcome = send(&mut session, FrontendMessage::Refresh, &s);
         assert_eq!(key_indices(&outcome.messages).len(), 8);
     }
 
@@ -653,7 +1069,7 @@ mod tests {
     fn ping_is_answered_with_pong() {
         let mut session = session();
         let s = state(vec![]);
-        let outcome = session.handle(FrontendMessage::Ping, &s);
+        let outcome = send(&mut session, FrontendMessage::Ping, &s);
         assert_eq!(outcome.messages, vec![DaemonMessage::Pong]);
     }
 
@@ -668,7 +1084,11 @@ mod tests {
                 Tile::Offline { .. }
             ));
         }
-        let outcome = session.handle(FrontendMessage::KeyDown { index: 0 }, &offline);
+        let outcome = send(
+            &mut session,
+            FrontendMessage::KeyDown { index: 0 },
+            &offline,
+        );
         assert!(outcome.action.is_none());
     }
 
@@ -741,7 +1161,7 @@ mod tests {
         };
         let mut session = Session::new(&pedal, &Config::default(), renderer());
         let s = state(vec![agent("stuck", AgentStatus::Blocked, 1)]);
-        let outcome = session.handle(FrontendMessage::KeyDown { index: 0 }, &s);
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: 0 }, &s);
         assert_eq!(
             outcome.action,
             Some(PendingAction::FocusAgent {

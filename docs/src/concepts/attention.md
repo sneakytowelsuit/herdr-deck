@@ -22,9 +22,40 @@ deck: a full red key, a `!` glyph, and first place in the ordering.
 
 `done` is not a separate lifecycle state — it is `idle` *plus* "unseen". Focusing the pane marks
 it seen and it becomes `idle`. So pressing a key on a `done` agent both takes you there and
-clears it from the attention queue, which is exactly the behaviour you want.
+clears it from the attention queue.
 
 Reading state through the herdr CLI does **not** mark it seen; only focusing does.
+
+That coupling is exactly right for `blocked`: an agent that needs a decision needs *you*, at the
+keyboard, now. It is friction for `done`. Clearing three finished agents by pressing their keys
+would yank your terminal window forward three times, for three agents you have already decided
+you do not need to look at yet.
+
+## Long press to acknowledge
+
+**Hold an agent's key for half a second and it leaves the attention queue without being focused.**
+herdr is not called and no window moves. The agent's key still shows it — you dismissed the
+alarm, not the agent — but it stops counting towards the attention key, drops below everything
+still asking for you, and its tile goes calm with a `×` in place of its status glyph.
+
+A short press is unchanged: it focuses, exactly as it always did. Only keys that show an agent
+have a second action; holding a page key or the mode toggle does what pressing it does.
+
+### An acknowledgement expires the moment the agent moves
+
+This is the part that matters. An acknowledgement is recorded against the agent **and the exact
+state it was in** — herdr's `state_change_seq`. The instant that sequence changes, the
+acknowledgement stops describing anything and the agent is back in the queue on its own.
+
+So an agent you dismissed while `done`, which later blocks waiting for an approval, reappears
+immediately and loudly. Dismissing something is never a way to stop hearing from it again.
+
+If herdr reports an agent with no `state_change_seq` at all, the deck **refuses** to acknowledge
+it and flashes an alert on that key, because nothing would ever expire the acknowledgement.
+
+Acknowledgement lives with the connected frontend, not with the daemon. Two decks attached to one
+herdr each keep their own: dismissing an alert on the deck in front of you does not silence the
+one in the next room, and reconnecting a deck starts it from a clean queue.
 
 ## The others
 

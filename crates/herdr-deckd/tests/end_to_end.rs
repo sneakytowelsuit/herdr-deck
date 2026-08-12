@@ -164,6 +164,23 @@ impl Frontend {
         self.writer.flush().await.expect("flushing to the daemon");
     }
 
+    /// Press and release a key quickly enough that the daemon reads it as an ordinary press.
+    async fn tap(&mut self, index: usize) {
+        self.send(json!({"type": "key_down", "index": index})).await;
+        self.send(json!({"type": "key_up", "index": index})).await;
+    }
+
+    /// Press a key, hold it past the long-press threshold, and let go.
+    ///
+    /// The one wait in this file that is not waiting for a result. The *duration* is the input
+    /// here — a gesture is defined by how long it lasted — so there is nothing to observe
+    /// instead. It is generous over the daemon's 500ms so a loaded box does not read it as a tap.
+    async fn hold(&mut self, index: usize) {
+        self.send(json!({"type": "key_down", "index": index})).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        self.send(json!({"type": "key_up", "index": index})).await;
+    }
+
     /// The next line, or `None` if the daemon closed the connection.
     async fn next_line(&mut self) -> Option<String> {
         timeout(PATIENCE, self.lines.next_line())
@@ -454,7 +471,7 @@ async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_term
     frontend.read(1 + PLUS_KEYS + PLUS_DIALS).await;
 
     // Key 0 shows the top of the attention order, which is the blocked agent.
-    frontend.send(json!({"type": "key_down", "index": 0})).await;
+    frontend.tap(0).await;
 
     // Window raising is disabled in the test config, so this is a partial success — and the
     // deck says so rather than pretending everything happened.
@@ -473,6 +490,44 @@ async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_term
         mock.agent_focus_targets().await,
         vec!["w1:p9"],
         "focus takes the pane id; the terminal id the key is bound to would not resolve"
+    );
+}
+
+#[tokio::test]
+async fn holding_an_agents_key_clears_it_from_the_attention_queue_without_touching_herdr() {
+    // The whole reason the gesture exists: clearing a finished agent must not focus it, and so
+    // must not drag its terminal window in front of whatever you were doing. A `done` agent that
+    // herdr had been asked to focus would also be marked seen, so "herdr was never called" is the
+    // property to pin — not merely "no window moved".
+    let mock = mock_herdr(two_agents(AgentStatus::Done)).await;
+    let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(PLUS_DIALS as u8)).await;
+    let greeting = frontend.read(1 + PLUS_KEYS + PLUS_DIALS).await;
+    let before = key_images(&greeting);
+
+    // Key 1 is the `done` agent, behind the blocked one.
+    frontend.hold(1).await;
+
+    let repaint = frontend.drain_to_pong().await;
+    let after = key_images(&repaint);
+    assert!(
+        after
+            .iter()
+            .any(|(index, png)| *index == 1 && Some(png) != before.get(1).map(|(_, p)| p)),
+        "the dismissed agent's tile must go calm, got {repaint:?}"
+    );
+    assert!(
+        !repaint
+            .iter()
+            .any(|m| matches!(m, DaemonMessage::Ok { .. } | DaemonMessage::Alert { .. })),
+        "a long press asks for no action, so there is no action to report on, got {repaint:?}"
+    );
+    assert!(
+        mock.agent_focus_targets().await.is_empty(),
+        "herdr must not be called at all"
     );
 }
 
