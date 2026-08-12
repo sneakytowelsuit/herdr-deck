@@ -18,9 +18,9 @@ is replaced, the agent goes with it.
 By default, keys show **agents**, because an agent is the thing that can need you. Pressing the
 mode toggle switches the deck to **workspaces**, which is the level you navigate at.
 
-herdr-deck does not model tabs or panes as key targets — dial 3 cycles tabs, and that has been
-enough. Sessions are not modelled either: the daemon talks to one herdr session, chosen with
-`--session` or `herdr_session` in config.
+herdr-deck does not model tabs or panes as key targets — dial 3 scrubs tabs and pressing it
+focuses the tab you landed on, and that has been enough. Sessions are not modelled either: the
+daemon talks to one herdr session, chosen with `--session` or `herdr_session` in config.
 
 ## Why keys bind to `terminal_id`
 

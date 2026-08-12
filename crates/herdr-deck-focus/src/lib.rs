@@ -287,6 +287,21 @@ impl<R: CommandRunner> FocusEngine<R> {
         }
     }
 
+    pub async fn focus_tab(&self, tab_id: &str) -> FocusReport {
+        match self.client.tab_focus(tab_id).await {
+            Ok(()) => FocusReport {
+                herdr_focused: true,
+                raise: self.raise_window().await,
+                error: None,
+            },
+            Err(e) => FocusReport {
+                herdr_focused: false,
+                raise: RaiseOutcome::Disabled,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
     /// Try each of the backend's commands until one works.
     pub async fn raise_window(&self) -> RaiseOutcome {
         if !self.config.raise_window {
@@ -337,6 +352,7 @@ impl<R: CommandRunner> FocusEngine<R> {
 mod tests {
     use super::*;
     use herdr_deck_herdr::mock::MockHerdr;
+    use herdr_deck_herdr::wire::SessionSnapshot;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -653,5 +669,21 @@ mod tests {
         assert!(report.fully_succeeded());
         let params = mock.observed_params("workspace.focus").await.unwrap();
         assert_eq!(params["workspace_id"], "w2");
+    }
+
+    #[tokio::test]
+    async fn focusing_a_tab_follows_the_same_two_step_path() {
+        // A tab focus that skipped the raise would switch herdr underneath a window the user
+        // still cannot see, which is exactly the half-done outcome we report loudly elsewhere.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        let report = engine.focus_tab("w1:t2").await;
+        assert!(report.herdr_focused);
+        assert!(report.fully_succeeded());
+        assert_eq!(mock.tab_focus_ids().await, vec!["w1:t2".to_string()]);
+        assert_eq!(runner.ran().len(), 1, "the window must still be raised");
     }
 }

@@ -186,6 +186,7 @@ impl MockHerdr {
         self.reply("session.snapshot", value).await;
         self.reply("agent.focus", json!({ "type": "ok" })).await;
         self.reply("workspace.focus", json!({ "type": "ok" })).await;
+        self.reply("tab.focus", json!({ "type": "ok" })).await;
         self.reply("client.window_title.set", json!({ "type": "ok" }))
             .await;
     }
@@ -199,6 +200,11 @@ impl MockHerdr {
     pub async fn workspace_focus_ids(&self) -> Vec<String> {
         self.observed_string_params("workspace.focus", "workspace_id")
             .await
+    }
+
+    /// The tab id of each `tab.focus` call, in order.
+    pub async fn tab_focus_ids(&self) -> Vec<String> {
+        self.observed_string_params("tab.focus", "tab_id").await
     }
 
     /// How many times state was read.

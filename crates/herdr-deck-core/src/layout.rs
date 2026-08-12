@@ -116,6 +116,11 @@ pub enum SlotAction {
     FocusWorkspace {
         workspace_id: String,
     },
+    /// Focus one tab. Distinct from [`SlotAction::FocusWorkspace`] because a workspace holds
+    /// many tabs, and landing on the workspace's current one is not where the user pointed.
+    FocusTab {
+        tab_id: String,
+    },
     ToggleMode,
     ChangePage {
         delta: i32,
@@ -489,8 +494,8 @@ impl<'a> ResolvedDeck<'a> {
                 .state
                 .tabs
                 .get(cursor)
-                .map(|t| SlotAction::FocusWorkspace {
-                    workspace_id: t.workspace_id.clone(),
+                .map(|t| SlotAction::FocusTab {
+                    tab_id: t.tab_id.clone(),
                 })
                 .unwrap_or(SlotAction::None),
         }
@@ -564,7 +569,7 @@ fn workspace_tile(ws: &herdr_deck_herdr::wire::WorkspaceInfo) -> Tile {
 mod tests {
     use super::*;
     use crate::capabilities::DeckModel;
-    use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, WorkspaceInfo};
+    use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
 
     fn agent(id: &str, status: AgentStatus, seq: u64) -> AgentInfo {
         AgentInfo {
@@ -805,6 +810,38 @@ mod tests {
             deck.dial_press_action(3),
             SlotAction::FocusAgent {
                 terminal_id: "finished".into()
+            }
+        );
+    }
+
+    #[test]
+    fn pressing_the_tab_dial_focuses_that_tab_and_not_the_workspace_holding_it() {
+        // Focusing the workspace lands on whichever tab it happens to have active, which is
+        // rarely the one the user just scrubbed to — the whole point of the dial.
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let mut state = state_with(vec![]);
+        state.tabs = vec![
+            TabInfo {
+                tab_id: "w1:t1".into(),
+                workspace_id: "w1".into(),
+                ..Default::default()
+            },
+            TabInfo {
+                tab_id: "w1:t2".into(),
+                workspace_id: "w1".into(),
+                ..Default::default()
+            },
+        ];
+        let selection = Selection {
+            tabs: 1,
+            ..Default::default()
+        };
+        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection);
+        assert_eq!(
+            deck.dial_press_action(2),
+            SlotAction::FocusTab {
+                tab_id: "w1:t2".into()
             }
         );
     }

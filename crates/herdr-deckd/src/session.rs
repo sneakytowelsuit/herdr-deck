@@ -25,9 +25,16 @@ use base64::Engine as _;
 pub enum PendingAction {
     /// Focus an agent. `pane_id` is already resolved from the stable `terminal_id`, because
     /// herdr's `agent.focus` does not accept terminal ids.
-    FocusAgent { pane_id: String, key: Option<usize> },
+    FocusAgent {
+        pane_id: String,
+        key: Option<usize>,
+    },
     FocusWorkspace {
         workspace_id: String,
+        key: Option<usize>,
+    },
+    FocusTab {
+        tab_id: String,
         key: Option<usize>,
     },
 }
@@ -195,6 +202,14 @@ impl Session {
                 action: Some(PendingAction::FocusWorkspace { workspace_id, key }),
             },
 
+            // Tab ids are already what herdr's focus API wants, so unlike an agent there is
+            // nothing to resolve here; a tab that closed under us surfaces as an alert from the
+            // failed call rather than being guessed at.
+            SlotAction::FocusTab { tab_id } => Outcome {
+                messages: vec![],
+                action: Some(PendingAction::FocusTab { tab_id, key }),
+            },
+
             SlotAction::ToggleMode => {
                 self.mode = self.mode.toggled();
                 self.page = 0;
@@ -337,7 +352,7 @@ mod tests {
     use super::*;
     use herdr_deck_core::capabilities::DeckModel;
     use herdr_deck_core::theme::Theme;
-    use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, WorkspaceInfo};
+    use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
 
     fn renderer() -> Arc<TileRenderer> {
         Arc::new(TileRenderer::new(Theme::Dark))
@@ -547,6 +562,37 @@ mod tests {
             outcome.action,
             Some(PendingAction::FocusAgent {
                 pane_id: "w1:pane-second".into(),
+                key: None
+            })
+        );
+    }
+
+    #[test]
+    fn pressing_the_tab_dial_asks_for_a_tab_focus_rather_than_its_workspace() {
+        // The tab dial exists to reach a tab that is *not* the workspace's current one, so
+        // handing the daemon a workspace focus here would quietly undo the whole gesture.
+        let mut session = session();
+        let mut s = state(vec![agent("term_x", AgentStatus::Blocked, 1)]);
+        s.tabs = vec![
+            TabInfo {
+                tab_id: "w1:t1".into(),
+                workspace_id: "w1".into(),
+                ..Default::default()
+            },
+            TabInfo {
+                tab_id: "w1:t2".into(),
+                workspace_id: "w1".into(),
+                ..Default::default()
+            },
+        ];
+        session.greet(&s);
+        session.handle(FrontendMessage::DialRotate { dial: 2, ticks: 1 }, &s);
+
+        let outcome = session.handle(FrontendMessage::DialDown { dial: 2 }, &s);
+        assert_eq!(
+            outcome.action,
+            Some(PendingAction::FocusTab {
+                tab_id: "w1:t2".into(),
                 key: None
             })
         );

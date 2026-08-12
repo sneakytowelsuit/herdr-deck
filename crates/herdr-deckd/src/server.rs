@@ -212,6 +212,7 @@ async fn perform(context: &ServerContext, action: PendingAction) -> Vec<DaemonMe
         PendingAction::FocusWorkspace { workspace_id, key } => {
             (context.focus.focus_workspace(&workspace_id).await, key)
         }
+        PendingAction::FocusTab { tab_id, key } => (context.focus.focus_tab(&tab_id).await, key),
     };
 
     if !report.fully_succeeded() {

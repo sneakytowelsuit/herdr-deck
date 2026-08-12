@@ -34,6 +34,7 @@ The only methods that hold a connection open are `events.subscribe` and `pane.gr
 | `events.subscribe` | The doorbell that says when to re-read it. |
 | `agent.focus` | Switch to an agent. Also marks the tab seen. |
 | `workspace.focus` | Switch workspace. |
+| `tab.focus` | Switch to one tab, for the tab dial. |
 | `client.window_title.set` | Stamp a marker so the exact terminal window can be found. |
 | `ping` | Liveness. |
 | `notification.show` | Optional toast; its `reason` doubles as "is a TUI attached". |
