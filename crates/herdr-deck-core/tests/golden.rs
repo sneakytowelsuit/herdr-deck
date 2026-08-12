@@ -27,6 +27,7 @@
 //! genuine regression by baking it in as the new expectation.
 
 use herdr_deck_core::render::{Tile, TileRenderer};
+use herdr_deck_core::state::WaitBucket;
 use herdr_deck_core::theme::Theme;
 use herdr_deck_herdr::wire::AgentStatus;
 use std::path::PathBuf;
@@ -98,6 +99,7 @@ fn an_idle_agent_tile_pins_the_dim_calm_palette() {
         status: AgentStatus::Idle,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_idle", &tile, 120);
 }
@@ -111,6 +113,7 @@ fn a_done_agent_tile_pins_the_amber_completion_palette() {
         status: AgentStatus::Done,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_done", &tile, 120);
 }
@@ -126,6 +129,7 @@ fn an_unknown_status_agent_tile_pins_the_fallback_palette() {
         status: AgentStatus::Unknown,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_unknown", &tile, 120);
 }
@@ -142,6 +146,7 @@ fn an_acknowledged_agent_tile_pins_the_calm_palette_and_its_dismissed_glyph() {
         status: AgentStatus::Blocked,
         focused: false,
         acknowledged: true,
+        waiting: None,
     };
     assert_key_matches_golden("agent_acknowledged", &tile, 120);
 }
@@ -160,6 +165,7 @@ fn a_blocked_focused_agent_tile_pins_the_alert_palette_footer_and_focus_ring() {
         status: AgentStatus::Blocked,
         focused: true,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_blocked_focused_120", &tile, 120);
 }
@@ -175,6 +181,7 @@ fn a_working_unfocused_agent_tile_at_the_smallest_key_size_has_no_ring() {
         status: AgentStatus::Working,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_working_unfocused_72", &tile, 72);
 }
@@ -191,6 +198,7 @@ fn a_real_project_name_in_the_footer_stays_legible_on_the_smallest_key() {
         status: AgentStatus::Blocked,
         focused: true,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_project_footer_72", &tile, 72);
 }
@@ -268,6 +276,82 @@ fn a_touchstrip_segment_pins_its_title_and_value_layout() {
     assert_matches_golden("touchstrip_segment", &png);
 }
 
+// --- Wait escalation ------------------------------------------------------------------------
+//
+// The escalation has to survive on a tile that is already carrying a label, a sublabel, a
+// workspace footer and a status glyph, so every fixture below uses exactly that tile and varies
+// only the bucket. Rendered at both ends of the size range: 120px is where it should look
+// deliberate, 72px is where a marker one size too big turns the tile into soup. Look at all six
+// after regenerating — this is the change most likely to be a mistake, and the fixtures are the
+// only place that is visible.
+
+/// The busiest agent tile there is, waiting for `bucket`.
+fn waiting_tile(bucket: WaitBucket) -> Tile {
+    Tile::Agent {
+        label: "refactor-auth".into(),
+        sublabel: Some("claude".into()),
+        workspace: Some("payments-api".into()),
+        status: AgentStatus::Blocked,
+        focused: false,
+        acknowledged: false,
+        waiting: Some(bucket),
+    }
+}
+
+#[test]
+fn a_freshly_blocked_agent_pins_the_quietest_rung_of_the_escalation() {
+    assert_key_matches_golden(
+        "agent_wait_fresh_120",
+        &waiting_tile(WaitBucket::Fresh),
+        120,
+    );
+}
+
+#[test]
+fn an_agent_blocked_for_a_few_minutes_pins_the_middle_rung() {
+    assert_key_matches_golden(
+        "agent_wait_waiting_120",
+        &waiting_tile(WaitBucket::Waiting),
+        120,
+    );
+}
+
+#[test]
+fn an_agent_blocked_for_over_five_minutes_pins_the_loudest_rung() {
+    // Thickest bar, boldest marker. It still must not out-shout the label: the point is to know
+    // *which* agent to go to, and the duration only ranks them.
+    assert_key_matches_golden(
+        "agent_wait_overdue_120",
+        &waiting_tile(WaitBucket::Overdue),
+        120,
+    );
+}
+
+#[test]
+fn the_quietest_rung_stays_legible_on_the_smallest_key() {
+    assert_key_matches_golden("agent_wait_fresh_72", &waiting_tile(WaitBucket::Fresh), 72);
+}
+
+#[test]
+fn the_middle_rung_stays_legible_on_the_smallest_key() {
+    assert_key_matches_golden(
+        "agent_wait_waiting_72",
+        &waiting_tile(WaitBucket::Waiting),
+        72,
+    );
+}
+
+#[test]
+fn the_loudest_rung_stays_legible_on_the_smallest_key() {
+    // 72px with all four text rows and both escalation channels present is the worst case the
+    // tile will ever be asked to draw. If anything is going to collide, it collides here.
+    assert_key_matches_golden(
+        "agent_wait_overdue_72",
+        &waiting_tile(WaitBucket::Overdue),
+        72,
+    );
+}
+
 // --- The awkward wrapping cases wrap_text exists for ----------------------------------------
 
 #[test]
@@ -281,6 +365,7 @@ fn a_long_kebab_case_agent_name_pins_its_hyphen_aware_wrap() {
         status: AgentStatus::Working,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_long_kebab_case_name", &tile, 96);
 }
@@ -296,6 +381,7 @@ fn an_agent_name_with_no_separators_pins_its_hard_split_wrap() {
         status: AgentStatus::Working,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_name_with_no_separators", &tile, 96);
 }
@@ -311,6 +397,7 @@ fn an_agent_name_with_xml_metacharacters_pins_correctly_escaped_output() {
         status: AgentStatus::Working,
         focused: false,
         acknowledged: false,
+        waiting: None,
     };
     assert_key_matches_golden("agent_xml_metacharacters", &tile, 120);
 }

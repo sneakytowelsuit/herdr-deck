@@ -12,10 +12,10 @@
 //! deck.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use herdr_deck_core::config::Config;
-use herdr_deck_core::state::DeckState;
+use herdr_deck_core::state::{DeckState, WaitClock};
 use herdr_deck_herdr::{EventStream, HerdrClient, HerdrError};
 use tokio::sync::watch;
 
@@ -52,8 +52,13 @@ impl Watcher {
 
     async fn run(self, tx: watch::Sender<Arc<DeckState>>) {
         let mut backoff = RETRY_MIN;
+        // Outside the connection loop on purpose: herdr restarting, or a socket blip, is not the
+        // agents calming down. An agent that was blocked before the blip and is still blocked
+        // after it — same `state_change_seq` — has been waiting the whole time, and resetting
+        // its clock here would quietly turn a ten-minute wait back into a fresh one.
+        let mut clock = WaitClock::default();
         loop {
-            match self.connected_loop(&tx).await {
+            match self.connected_loop(&tx, &mut clock).await {
                 Ok(()) => {
                     // The subscription ended cleanly — herdr restarted or shut down. Retry
                     // promptly rather than backing off; this is the common case after a herdr
@@ -71,11 +76,15 @@ impl Watcher {
     }
 
     /// One connected lifetime: bootstrap, then follow events until the stream ends.
-    async fn connected_loop(&self, tx: &watch::Sender<Arc<DeckState>>) -> Result<(), HerdrError> {
+    async fn connected_loop(
+        &self,
+        tx: &watch::Sender<Arc<DeckState>>,
+        clock: &mut WaitClock,
+    ) -> Result<(), HerdrError> {
         // Subscribe *before* the first snapshot so no change can slip through the gap between
         // reading state and starting to listen.
         let mut events = EventStream::subscribe(&self.client).await?;
-        self.reconcile(tx).await?;
+        self.reconcile(tx, clock).await?;
 
         loop {
             let next = tokio::time::timeout(self.reconcile_interval, events.next()).await;
@@ -87,21 +96,29 @@ impl Watcher {
                         tokio::time::timeout(Duration::from_millis(1), events.next()).await
                     {
                     }
-                    self.reconcile(tx).await?;
+                    self.reconcile(tx, clock).await?;
                 }
                 // herdr closed the subscription.
                 Ok(Ok(None)) => return Ok(()),
                 Ok(Err(e)) => return Err(e),
                 // Nothing happened for a while; reconcile anyway as the safety net.
-                Err(_) => self.reconcile(tx).await?,
+                Err(_) => self.reconcile(tx, clock).await?,
             }
         }
     }
 
-    async fn reconcile(&self, tx: &watch::Sender<Arc<DeckState>>) -> Result<(), HerdrError> {
+    async fn reconcile(
+        &self,
+        tx: &watch::Sender<Arc<DeckState>>,
+        clock: &mut WaitClock,
+    ) -> Result<(), HerdrError> {
         let snapshot = self.client.session_snapshot().await?;
         warn_on_protocol_mismatch(snapshot.protocol);
-        let _ = tx.send(Arc::new(DeckState::from_snapshot(snapshot)));
+        let mut state = DeckState::from_snapshot(snapshot);
+        // Stamped here rather than in `from_snapshot` because this is the only layer that has
+        // both the fresh state and a clock older than it.
+        clock.stamp(&mut state, Instant::now());
+        let _ = tx.send(Arc::new(state));
         Ok(())
     }
 }
@@ -252,6 +269,40 @@ mod tests {
         let latest = rx.borrow_and_update().clone();
         assert_eq!(latest.agents[0].agent_status, AgentStatus::Idle);
         assert_eq!(state.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn the_published_state_carries_how_long_a_blocked_agent_has_been_waiting() {
+        // Nothing else stamps a wait. If this wiring is ever dropped the buckets are simply
+        // absent everywhere, every tile silently loses its marker, and no other test notices —
+        // they all stamp their own clock by hand.
+        use herdr_deck_core::state::WaitBucket;
+        use herdr_deck_herdr::wire::{AgentInfo, SessionSnapshot};
+
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot {
+            protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+            agents: vec![AgentInfo {
+                terminal_id: "term_a".into(),
+                agent_status: AgentStatus::Blocked,
+                workspace_id: "w1".into(),
+                pane_id: "w1:p1".into(),
+                state_change_seq: Some(7),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        let config = Config::default();
+        let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &config);
+        let mut rx = watcher.spawn();
+
+        let state = wait_for(&mut rx, |s| !s.is_offline()).await;
+        assert_eq!(
+            state.wait_bucket(&state.agents[0]),
+            Some(WaitBucket::Fresh),
+            "an agent that just blocked has been waiting no time at all, but it is being timed"
+        );
     }
 
     #[tokio::test]

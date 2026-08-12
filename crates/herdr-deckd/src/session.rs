@@ -628,6 +628,105 @@ mod tests {
         );
     }
 
+    // --- Wait escalation, and the repaint budget it is allowed ---------------------------------
+    //
+    // Bucketing a wait rather than counting seconds exists entirely for these two tests. A live
+    // counter would change every tile's hash on every tick, the diff above would match nothing,
+    // and the reconcile timer would repaint the whole deck twice a second forever — which is the
+    // exact failure the hashing was added to prevent.
+
+    /// A state whose blocked agent has been waiting `waited`, from one long-lived clock.
+    ///
+    /// Mirrors the watcher: one clock, a fresh `DeckState` per reconcile.
+    struct Reconciler {
+        clock: herdr_deck_core::state::WaitClock,
+        start: Instant,
+    }
+
+    impl Reconciler {
+        fn new() -> Self {
+            Self {
+                clock: herdr_deck_core::state::WaitClock::default(),
+                start: Instant::now(),
+            }
+        }
+
+        fn at(&mut self, waited: Duration, agents: Vec<AgentInfo>) -> DeckState {
+            let mut state = state(agents);
+            self.clock.stamp(&mut state, self.start + waited);
+            state
+        }
+    }
+
+    #[test]
+    fn a_reconcile_that_only_advances_the_clock_within_a_bucket_still_sends_nothing() {
+        // The steady state: an agent has been blocked for a while, nothing about it changes, and
+        // the deck must stay silent between bucket crossings.
+        let mut session = session();
+        let mut reconciler = Reconciler::new();
+        let blocked = vec![agent("stuck", AgentStatus::Blocked, 1)];
+
+        session.greet(&reconciler.at(Duration::ZERO, blocked.clone()));
+        for tick in 1..20 {
+            let state = reconciler.at(Duration::from_secs(tick * 2), blocked.clone());
+            let messages = session.repaint(&state);
+            assert!(
+                messages.is_empty(),
+                "reconcile at {}s repainted {:?}",
+                tick * 2,
+                key_indices(&messages)
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_a_wait_bucket_repaints_the_waiting_agent_and_nothing_else() {
+        // The cost side of the same bargain: an escalation is worth one repaint of one key, and
+        // must not drag the rest of the deck along with it.
+        let mut session = session();
+        let mut reconciler = Reconciler::new();
+        let agents = vec![
+            agent("stuck", AgentStatus::Blocked, 1),
+            agent("busy", AgentStatus::Working, 2),
+        ];
+        session.greet(&reconciler.at(Duration::ZERO, agents.clone()));
+
+        let crossed = reconciler.at(Duration::from_secs(61), agents.clone());
+        assert_eq!(
+            key_indices(&session.repaint(&crossed)),
+            vec![0],
+            "only the key showing the waiting agent should be redrawn"
+        );
+        assert!(
+            session
+                .repaint(&reconciler.at(Duration::from_secs(63), agents.clone()))
+                .is_empty(),
+            "and it settles again immediately"
+        );
+
+        let overdue = reconciler.at(Duration::from_secs(301), agents);
+        assert_eq!(key_indices(&session.repaint(&overdue)), vec![0]);
+    }
+
+    #[test]
+    fn an_agent_waiting_the_whole_time_costs_exactly_two_extra_repaints() {
+        // Stated as a budget because that is how the feature was justified: two buckets to cross,
+        // so two repaints, however long the incident runs.
+        let mut session = session();
+        let mut reconciler = Reconciler::new();
+        let blocked = vec![agent("stuck", AgentStatus::Blocked, 1)];
+        session.greet(&reconciler.at(Duration::ZERO, blocked.clone()));
+
+        // Ten minutes of reconciles, two seconds apart.
+        let repaints: usize = (1..300)
+            .map(|tick| {
+                let state = reconciler.at(Duration::from_secs(tick * 2), blocked.clone());
+                key_indices(&session.repaint(&state)).len()
+            })
+            .sum();
+        assert_eq!(repaints, 2, "one crossing into 1m+, one into 5m+, no more");
+    }
+
     #[test]
     fn pressing_a_key_resolves_the_stable_terminal_id_to_a_pane_id() {
         // herdr's agent.focus takes a pane id; the deck binds to terminal ids. Getting this

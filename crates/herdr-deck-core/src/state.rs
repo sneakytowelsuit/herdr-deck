@@ -5,6 +5,7 @@
 //! deck when nothing is pinned.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
 
@@ -20,6 +21,12 @@ pub struct DeckState {
     pub protocol: Option<u32>,
     /// Set when herdr is unreachable, so the deck can say so instead of going blank.
     pub offline_reason: Option<String>,
+    /// How long each waiting agent has been waiting, stamped on by a [`WaitClock`].
+    ///
+    /// Empty unless something stamped it, and deliberately not derived from the snapshot: herdr
+    /// has no idea. Only the clock may write here, which is why the field is private — a
+    /// duration nobody timed would be a lie about the one number this feature exists to report.
+    waits: HashMap<String, WaitBucket>,
 }
 
 impl DeckState {
@@ -36,6 +43,7 @@ impl DeckState {
             focused_pane_id: snapshot.focused_pane_id,
             protocol: snapshot.protocol,
             offline_reason: None,
+            waits: HashMap::new(),
         };
         state.agents.sort_by(attention_order);
         state
@@ -102,6 +110,15 @@ impl DeckState {
 
     pub fn agent_by_terminal_id(&self, terminal_id: &str) -> Option<&AgentInfo> {
         self.agents.iter().find(|a| a.terminal_id == terminal_id)
+    }
+
+    /// How long this agent has been asking for you, if anything has been timing it.
+    ///
+    /// `None` covers three honest cases: nothing stamped this state, the agent is not in an
+    /// attention state so there is nothing to escalate, or herdr gave no `state_change_seq` and
+    /// the clock had no key to hang a start time on.
+    pub fn wait_bucket(&self, agent: &AgentInfo) -> Option<WaitBucket> {
+        self.waits.get(&agent.terminal_id).copied()
     }
 
     pub fn workspace_by_id(&self, workspace_id: &str) -> Option<&WorkspaceInfo> {
@@ -219,6 +236,138 @@ impl Acknowledged {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// How long an agent has been waiting, at the only granularity worth painting.
+///
+/// # Why buckets and not a seconds counter
+///
+/// The daemon hashes each tile and resends only the keys whose hash moved; that diff is the
+/// only reason the reconcile timer does not repaint the whole deck every two seconds forever.
+/// A live counter would change the hash on every tick and defeat it completely. Three buckets
+/// change at most twice per incident — two extra repaints per agent, and that is the entire
+/// cost of knowing how long something has been red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WaitBucket {
+    /// Under a minute. You may not have looked away yet.
+    Fresh,
+    /// One to five minutes.
+    Waiting,
+    /// Over five minutes: this is the agent costing you time.
+    Overdue,
+}
+
+/// When [`WaitBucket::Fresh`] becomes [`WaitBucket::Waiting`], and that becomes
+/// [`WaitBucket::Overdue`].
+///
+/// A minute is roughly how long it takes to notice something on your own; five is well past the
+/// point where an agent has been waiting longer than the work it was asked to do.
+const WAITING_AFTER: Duration = Duration::from_secs(60);
+const OVERDUE_AFTER: Duration = Duration::from_secs(5 * 60);
+
+impl WaitBucket {
+    pub fn for_duration(waited: Duration) -> Self {
+        if waited >= OVERDUE_AFTER {
+            WaitBucket::Overdue
+        } else if waited >= WAITING_AFTER {
+            WaitBucket::Waiting
+        } else {
+            WaitBucket::Fresh
+        }
+    }
+
+    /// The marker a tile draws. Three characters, because that is what fits opposite the status
+    /// glyph on a 72px key without stealing room from the label.
+    pub fn marker(self) -> &'static str {
+        match self {
+            WaitBucket::Fresh => "<1m",
+            WaitBucket::Waiting => "1m+",
+            WaitBucket::Overdue => "5m+",
+        }
+    }
+
+    /// How far up the escalation this is, 0 to 2, for the renderer to scale its treatment by.
+    pub fn level(self) -> u8 {
+        match self {
+            WaitBucket::Fresh => 0,
+            WaitBucket::Waiting => 1,
+            WaitBucket::Overdue => 2,
+        }
+    }
+}
+
+/// When each waiting agent started waiting.
+///
+/// # Why the deck has to own a clock at all
+///
+/// herdr records no timestamps: `state_change_seq` is a monotonic counter, not a time. So a key
+/// that has been red for eight minutes is, as far as herdr is concerned, indistinguishable from
+/// one that turned red a moment ago. The only way to tell them apart is to have been watching,
+/// and this is the thing that was watching.
+///
+/// # Why it cannot live in [`DeckState`]
+///
+/// That struct is rebuilt wholesale from every snapshot — see [`DeckState::from_snapshot`] and
+/// the reason it replaces rather than merges. A start time stored there would be discarded and
+/// re-taken every reconcile, and would therefore always read zero. This table sits beside the
+/// watcher instead and outlives every state it stamps.
+///
+/// # Why it is keyed on the state, not the agent
+///
+/// The same reason [`Acknowledged`] is: an entry is `terminal_id -> (state_change_seq, when)`.
+/// herdr bumps that sequence on each state change, so an agent that unblocks and blocks again
+/// is asking a *new* question, and the clock for it starts when that question was asked rather
+/// than carrying over a wait the user already dealt with.
+#[derive(Debug, Default)]
+pub struct WaitClock {
+    started: HashMap<String, (u64, Instant)>,
+}
+
+impl WaitClock {
+    /// Note every agent now waiting, and stamp what it has waited so far onto `state`.
+    ///
+    /// Call this on each fresh snapshot, before publishing it. An offline state is deliberately
+    /// *not* stamped: herdr briefly going away is not the agents calming down, and wiping the
+    /// table there would reset every wait on a socket blip.
+    pub fn stamp(&mut self, state: &mut DeckState, now: Instant) {
+        let mut buckets = HashMap::new();
+        for agent in &state.agents {
+            if !agent.agent_status.needs_attention() {
+                continue;
+            }
+            // No sequence, no clock. Keying on the terminal id alone would let a wait survive
+            // the state it was measuring, so an agent that blocked, was dealt with, and blocked
+            // again would be reported as having waited the whole time — overstating the one
+            // number this exists to report. Saying nothing is the honest answer.
+            let Some(seq) = agent.state_change_seq else {
+                continue;
+            };
+            let since = match self.started.get(&agent.terminal_id) {
+                Some((known, since)) if *known == seq => *since,
+                _ => {
+                    self.started.insert(agent.terminal_id.clone(), (seq, now));
+                    now
+                }
+            };
+            buckets.insert(
+                agent.terminal_id.clone(),
+                WaitBucket::for_duration(now.saturating_duration_since(since)),
+            );
+        }
+        // Anything not bucketed just now stopped asking, moved to a new state, or vanished; its
+        // start time can never be read again, so drop it rather than let a long-running daemon
+        // hoard one entry per agent it ever saw block.
+        self.started.retain(|id, _| buckets.contains_key(id));
+        state.waits = buckets;
+    }
+
+    pub fn len(&self) -> usize {
+        self.started.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.started.is_empty()
     }
 }
 
@@ -507,6 +656,192 @@ mod tests {
             DeckState::from_snapshot(snapshot(vec![agent("worker", AgentStatus::Blocked, 8)]));
         acked.forget_stale(&after);
         assert!(acked.is_empty());
+    }
+
+    // --- How long an agent has been waiting ----------------------------------------------------
+    //
+    // herdr has no clock, so every one of these is about the deck's own. The two that matter most
+    // are the one where the clock outlives the state it stamped — without that the whole feature
+    // silently reports zero forever — and the one where a state change restarts it, without which
+    // the deck would tell you an agent had been waiting ten minutes for a question it asked ten
+    // seconds ago.
+
+    /// The bucket the clock gives our single agent, `waited` after it first saw it.
+    fn bucket_after(agents: Vec<AgentInfo>, waited: Duration) -> Option<WaitBucket> {
+        let start = Instant::now();
+        let mut clock = WaitClock::default();
+        let mut first = DeckState::from_snapshot(snapshot(agents.clone()));
+        clock.stamp(&mut first, start);
+        // A *separate* state, exactly as the watcher builds one from every fresh snapshot. If
+        // the clock lived in `DeckState` this second stamp would restart it and every assertion
+        // below would read `Fresh`.
+        let mut later = DeckState::from_snapshot(snapshot(agents));
+        clock.stamp(&mut later, start + waited);
+        later.wait_bucket(later.agents.first()?)
+    }
+
+    #[test]
+    fn a_wait_is_fresh_until_the_moment_it_has_lasted_a_whole_minute() {
+        let blocked = vec![agent("stuck", AgentStatus::Blocked, 1)];
+        assert_eq!(
+            bucket_after(blocked.clone(), Duration::from_secs(59)),
+            Some(WaitBucket::Fresh)
+        );
+        assert_eq!(
+            bucket_after(blocked, Duration::from_secs(60)),
+            Some(WaitBucket::Waiting),
+            "the boundary belongs to the louder bucket: rounding down would let an agent sit \
+             one tick under a minute forever and never escalate"
+        );
+    }
+
+    #[test]
+    fn a_wait_becomes_the_longest_bucket_the_moment_it_has_lasted_five_minutes() {
+        let blocked = vec![agent("stuck", AgentStatus::Blocked, 1)];
+        assert_eq!(
+            bucket_after(blocked.clone(), Duration::from_secs(299)),
+            Some(WaitBucket::Waiting)
+        );
+        assert_eq!(
+            bucket_after(blocked, Duration::from_secs(300)),
+            Some(WaitBucket::Overdue)
+        );
+    }
+
+    #[test]
+    fn a_wait_survives_the_snapshot_it_was_measured_from_being_thrown_away() {
+        // The reason the clock is a side table at all. `DeckState` is rebuilt wholesale every
+        // reconcile — twice a second at worst — so a start time kept inside one would be
+        // discarded and re-taken before it ever measured anything, and every agent would read
+        // as freshly blocked forever.
+        let start = Instant::now();
+        let mut clock = WaitClock::default();
+        let blocked = vec![agent("stuck", AgentStatus::Blocked, 1)];
+
+        // Ten reconciles over six minutes, each throwing the previous state away.
+        let mut latest = DeckState::default();
+        for tick in 0..10 {
+            latest = DeckState::from_snapshot(snapshot(blocked.clone()));
+            clock.stamp(&mut latest, start + Duration::from_secs(tick * 40));
+        }
+        assert_eq!(
+            latest.wait_bucket(&latest.agents[0]),
+            Some(WaitBucket::Overdue)
+        );
+    }
+
+    #[test]
+    fn the_clock_starts_again_when_herdr_says_the_agent_entered_a_new_state() {
+        // An agent that blocked, was dealt with, and blocked again is asking a *new* question.
+        // Carrying the old wait over would report six minutes of waiting for something asked a
+        // moment ago — and the number would be at its loudest exactly when it is most wrong.
+        let start = Instant::now();
+        let mut clock = WaitClock::default();
+
+        let mut long_blocked =
+            DeckState::from_snapshot(snapshot(vec![agent("stuck", AgentStatus::Blocked, 1)]));
+        clock.stamp(&mut long_blocked, start);
+        let mut still_blocked =
+            DeckState::from_snapshot(snapshot(vec![agent("stuck", AgentStatus::Blocked, 1)]));
+        clock.stamp(&mut still_blocked, start + Duration::from_secs(360));
+        assert_eq!(
+            still_blocked.wait_bucket(&still_blocked.agents[0]),
+            Some(WaitBucket::Overdue)
+        );
+
+        // herdr bumps the sequence: same agent, new question.
+        let mut asked_again =
+            DeckState::from_snapshot(snapshot(vec![agent("stuck", AgentStatus::Blocked, 2)]));
+        clock.stamp(&mut asked_again, start + Duration::from_secs(361));
+        assert_eq!(
+            asked_again.wait_bucket(&asked_again.agents[0]),
+            Some(WaitBucket::Fresh)
+        );
+    }
+
+    #[test]
+    fn an_agent_that_is_only_working_has_no_wait_because_it_is_not_waiting_for_anyone() {
+        for calm in [
+            AgentStatus::Working,
+            AgentStatus::Idle,
+            AgentStatus::Unknown,
+        ] {
+            assert_eq!(
+                bucket_after(vec![agent("busy", calm, 1)], Duration::from_secs(600)),
+                None,
+                "{calm} is not an attention state and has nothing to escalate"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_herdr_gave_no_state_sequence_for_gets_no_bucket_rather_than_an_invented_one() {
+        // With no sequence there is no way to tell "still waiting on the same question" from
+        // "waiting again on a new one", so any duration we reported could be arbitrarily too
+        // large. Saying nothing is the only honest answer available.
+        let mut sequenceless = agent("mystery", AgentStatus::Blocked, 0);
+        sequenceless.state_change_seq = None;
+        assert_eq!(
+            bucket_after(vec![sequenceless], Duration::from_secs(600)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wait_that_ended_is_forgotten_rather_than_accumulating_for_the_life_of_the_daemon() {
+        let start = Instant::now();
+        let mut clock = WaitClock::default();
+        let mut blocked =
+            DeckState::from_snapshot(snapshot(vec![agent("stuck", AgentStatus::Blocked, 1)]));
+        clock.stamp(&mut blocked, start);
+        assert_eq!(clock.len(), 1);
+
+        let mut answered =
+            DeckState::from_snapshot(snapshot(vec![agent("stuck", AgentStatus::Working, 2)]));
+        clock.stamp(&mut answered, start + Duration::from_secs(1));
+        assert!(
+            clock.is_empty(),
+            "an agent that stopped asking stops being timed"
+        );
+    }
+
+    #[test]
+    fn one_agents_wait_is_independent_of_every_other_agents() {
+        let start = Instant::now();
+        let mut clock = WaitClock::default();
+        let mut first =
+            DeckState::from_snapshot(snapshot(vec![agent("early", AgentStatus::Blocked, 1)]));
+        clock.stamp(&mut first, start);
+
+        // A second agent blocks six minutes later. The first is overdue; the second has only
+        // just asked, and must not inherit the queue's age.
+        let mut both = DeckState::from_snapshot(snapshot(vec![
+            agent("early", AgentStatus::Blocked, 1),
+            agent("late", AgentStatus::Blocked, 2),
+        ]));
+        clock.stamp(&mut both, start + Duration::from_secs(360));
+        let bucket = |id: &str| both.wait_bucket(both.agent_by_terminal_id(id).unwrap());
+        assert_eq!(bucket("early"), Some(WaitBucket::Overdue));
+        assert_eq!(bucket("late"), Some(WaitBucket::Fresh));
+    }
+
+    #[test]
+    fn every_bucket_has_its_own_marker_so_the_three_rungs_are_never_confusable() {
+        let markers = [
+            WaitBucket::Fresh.marker(),
+            WaitBucket::Waiting.marker(),
+            WaitBucket::Overdue.marker(),
+        ];
+        let mut unique = markers.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), markers.len());
+        for marker in markers {
+            assert!(
+                marker.chars().count() <= 3,
+                "{marker:?} will not fit beside a status glyph on a 72px key"
+            );
+        }
     }
 
     #[test]

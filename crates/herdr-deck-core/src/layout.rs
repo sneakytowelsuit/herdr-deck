@@ -628,15 +628,23 @@ impl<'a> ResolvedDeck<'a> {
 /// Needs the whole state, not just the agent: the footer names the agent's *project*, and only
 /// the state knows what herdr calls the workspace the agent happens to be in.
 fn agent_tile(state: &DeckState, agent: &AgentInfo, acked: &Acknowledged) -> Tile {
+    // Only an *attention* state can be dismissed. Marking a working agent acknowledged would
+    // repaint a perfectly ordinary tile for no reason a user could explain.
+    let acknowledged = agent.agent_status.needs_attention() && acked.contains(agent);
     Tile::Agent {
         label: agent.label().to_string(),
         sublabel: agent.state_label().map(str::to_string),
         workspace: state.project_label(agent).map(str::to_string),
         status: agent.agent_status,
         focused: agent.focused,
-        // Only an *attention* state can be dismissed. Marking a working agent acknowledged
-        // would repaint a perfectly ordinary tile for no reason a user could explain.
-        acknowledged: agent.agent_status.needs_attention() && acked.contains(agent),
+        acknowledged,
+        // A dismissed agent has stopped asking, so it has nothing left to escalate: keeping its
+        // marker would go on shouting the exact number the user just said they had seen.
+        waiting: if acknowledged {
+            None
+        } else {
+            state.wait_bucket(agent)
+        },
     }
 }
 
@@ -991,6 +999,91 @@ mod tests {
         );
         let (_, value, _) = deck.dial_feedback(3);
         assert_eq!(value, "stuck");
+    }
+
+    // --- How long an agent has been asking ---------------------------------------------------
+    //
+    // The clock itself is pinned in `state.rs`; these are about the bucket reaching the tile,
+    // which is the only place a user can ever see it.
+
+    /// A deck whose single blocked agent has been waiting `waited`.
+    fn state_waiting_for(waited: std::time::Duration) -> DeckState {
+        let start = std::time::Instant::now();
+        let mut clock = crate::state::WaitClock::default();
+        let agents = vec![agent("stuck", AgentStatus::Blocked, 1)];
+        let mut first = state_with(agents.clone());
+        clock.stamp(&mut first, start);
+        let mut later = state_with(agents);
+        clock.stamp(&mut later, start + waited);
+        later
+    }
+
+    fn tile_wait(tile: &Tile) -> Option<crate::state::WaitBucket> {
+        match tile {
+            Tile::Agent { waiting, .. } => *waiting,
+            other => panic!("expected an agent tile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_agent_tile_says_how_long_it_has_been_asking_for_you() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_waiting_for(std::time::Duration::from_secs(360));
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+        assert_eq!(
+            tile_wait(&deck.tile(0)),
+            Some(crate::state::WaitBucket::Overdue)
+        );
+    }
+
+    #[test]
+    fn a_dismissed_agent_stops_reporting_how_long_it_has_waited() {
+        // Dismissing is the user saying they have seen it. Going on to display a number that
+        // only grows would be arguing with them about the one thing they just settled.
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_waiting_for(std::time::Duration::from_secs(360));
+        let mut acked = Acknowledged::default();
+        acked.acknowledge(state.agent_by_terminal_id("stuck").unwrap());
+        let deck = plus_deck(&profile, &state, &acked);
+
+        let tile = deck.tile(0);
+        assert_eq!(tile_wait(&tile), None);
+        assert!(
+            matches!(
+                tile,
+                Tile::Agent {
+                    acknowledged: true,
+                    status: AgentStatus::Blocked,
+                    ..
+                }
+            ),
+            "and it must still carry the status herdr reports, got {tile:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_tile_never_claims_a_wait_because_it_is_a_rollup_of_many_agents() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let mut state = state_waiting_for(std::time::Duration::from_secs(360));
+        state.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w1".into(),
+            agent_status: AgentStatus::Blocked,
+            ..Default::default()
+        }];
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Workspaces,
+            0,
+            Selection::default(),
+            &acked,
+        );
+        assert!(matches!(deck.tile(0), Tile::Workspace { .. }));
     }
 
     #[test]

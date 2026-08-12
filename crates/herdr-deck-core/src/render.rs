@@ -13,6 +13,7 @@
 
 use herdr_deck_herdr::wire::AgentStatus;
 
+use crate::state::WaitBucket;
 use crate::theme::{StatusStyle, Theme};
 
 const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
@@ -43,6 +44,11 @@ pub enum Tile {
         /// drawn calm. `status` still says what herdr reports, because that is what an
         /// acknowledgement is *about* and the deck must not start inventing states.
         acknowledged: bool,
+        /// How long this agent has been asking for you, when something has been timing it.
+        ///
+        /// A bucket and not a duration on purpose: this is part of the tile's hash, and a value
+        /// that moved every second would defeat the diffing that keeps the deck quiet.
+        waiting: Option<WaitBucket>,
     },
     /// A workspace, for the navigation page.
     Workspace {
@@ -58,6 +64,20 @@ pub enum Tile {
     Empty,
     /// herdr is unreachable.
     Offline { message: String },
+}
+
+/// Everything the shared agent/workspace layout draws.
+///
+/// Gathered into one piece because the two tiles that share that layout were already handing it
+/// six positional arguments, and a seventh would have made the call sites unreadable in exactly
+/// the place where mixing two of them up is silent.
+struct AgentFace<'a> {
+    label: &'a str,
+    sublabel: Option<&'a str>,
+    workspace: Option<&'a str>,
+    style: StatusStyle,
+    focused: bool,
+    waiting: Option<WaitBucket>,
 }
 
 /// Renders tiles to PNG.
@@ -144,6 +164,7 @@ impl TileRenderer {
                 status,
                 focused,
                 acknowledged,
+                waiting,
             } => {
                 let style = if *acknowledged {
                     self.theme.acknowledged()
@@ -152,11 +173,14 @@ impl TileRenderer {
                 };
                 self.agent_svg(
                     s,
-                    label,
-                    sublabel.as_deref(),
-                    workspace.as_deref(),
-                    style,
-                    *focused,
+                    AgentFace {
+                        label,
+                        sublabel: sublabel.as_deref(),
+                        workspace: workspace.as_deref(),
+                        style,
+                        focused: *focused,
+                        waiting: *waiting,
+                    },
                 )
             }
             Tile::Workspace {
@@ -165,7 +189,19 @@ impl TileRenderer {
                 focused,
             } => {
                 let style = self.theme.status(*status);
-                self.agent_svg(s, label, None, None, style, *focused)
+                self.agent_svg(
+                    s,
+                    AgentFace {
+                        label,
+                        sublabel: None,
+                        workspace: None,
+                        style,
+                        focused: *focused,
+                        // A workspace is a rollup of many agents, so there is no single wait to
+                        // report and inventing one would be worse than silence.
+                        waiting: None,
+                    },
+                )
             }
             Tile::Attention { count } => self.attention_svg(s, *count),
             Tile::Mode { label, active } => self.mode_svg(s, label, *active),
@@ -180,15 +216,15 @@ impl TileRenderer {
         }
     }
 
-    fn agent_svg(
-        &self,
-        s: f32,
-        label: &str,
-        sublabel: Option<&str>,
-        workspace: Option<&str>,
-        style: StatusStyle,
-        focused: bool,
-    ) -> String {
+    fn agent_svg(&self, s: f32, face: AgentFace<'_>) -> String {
+        let AgentFace {
+            label,
+            sublabel,
+            workspace,
+            style,
+            focused,
+            waiting,
+        } = face;
         let pad = s * 0.08;
         let label_px = s * 0.17;
         let small_px = s * 0.115;
@@ -240,6 +276,45 @@ impl TileRenderer {
             ));
         }
 
+        // The escalation. Two quiet channels rather than one loud one: a marker saying how long,
+        // and a top bar that thickens with the wait so a tile reads as more urgent from across
+        // the desk without being read at all. Neither channel is colour — the tile's colour
+        // already means the status, and giving it a second meaning would make both less
+        // trustworthy.
+        //
+        // The marker sits in the band between the bar and the top of the label, mirroring the
+        // status glyph across the tile. That band is only about a tenth of the key high, which
+        // is what sets every constant below: this is the largest text that clears the thickest
+        // bar above it and a two-line label beneath it, and the buckets are three characters
+        // wide precisely because that is what fits there on a 72px key. Move any of it and look
+        // at the golden fixtures — the collision it causes is a two-pixel one.
+        let marker_px = s * 0.10;
+        let marker = waiting.map_or(String::new(), |bucket| {
+            format!(
+                r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{fs:.2}" font-weight="{weight}" fill="{c}" text-anchor="start" opacity="{opacity}">{text}</text>"##,
+                x = pad * 0.75,
+                y = s * 0.175,
+                font = FONT_FAMILY,
+                fs = marker_px,
+                weight = if bucket == WaitBucket::Overdue {
+                    "bold"
+                } else {
+                    "normal"
+                },
+                c = style.accent,
+                // The quietest rung sits at the workspace footer's opacity, which is this tile's
+                // "incidental information" tier and the faintest thing still legible on a 72px
+                // key. Anything dimmer stops being readable and starts being visual noise.
+                opacity = match bucket.level() {
+                    0 => "0.72",
+                    1 => "0.86",
+                    _ => "1",
+                },
+                text = escape(bucket.marker()),
+            )
+        });
+        let bar = s * 0.045 * (1.0 + waiting.map_or(0.0, |b| b.level() as f32) / 3.0);
+
         // A focus ring, so you can see which agent herdr is currently on.
         let focus_ring = if focused {
             format!(
@@ -257,18 +332,20 @@ impl TileRenderer {
 <rect width="{s}" height="{s}" fill="{bg}"/>
 <rect x="0" y="0" width="{s}" height="{bar:.2}" fill="{accent}"/>
 <text x="{gx:.2}" y="{gy:.2}" font-family="{font}" font-size="{gfs:.2}" font-weight="bold" fill="{accent}" text-anchor="end">{glyph}</text>
+{marker}
 {body}
 {focus_ring}
 </svg>"##,
             s = s,
             bg = style.background,
-            bar = s * 0.045,
+            bar = bar,
             accent = style.accent,
             gx = s - s * 0.07,
             gy = s * 0.235,
             font = FONT_FAMILY,
             gfs = glyph_px,
             glyph = escape(style.glyph),
+            marker = marker,
             body = body,
             focus_ring = focus_ring,
         )
@@ -584,6 +661,7 @@ mod tests {
                 status: AgentStatus::Blocked,
                 focused: true,
                 acknowledged: false,
+                waiting: None,
             },
             Tile::Workspace {
                 label: "api".into(),
@@ -618,6 +696,7 @@ mod tests {
             status: AgentStatus::Working,
             focused: false,
             acknowledged: false,
+            waiting: None,
         };
         for size in [72, 80, 96, 120] {
             let png = r.render_key(&tile, size).expect("renders");
@@ -650,6 +729,7 @@ mod tests {
             status: AgentStatus::Blocked,
             focused: false,
             acknowledged: false,
+            waiting: None,
         };
         let a = r.render_key(&tile, 120).unwrap();
         let b = r.render_key(&tile, 120).unwrap();
@@ -669,10 +749,84 @@ mod tests {
             status,
             focused: false,
             acknowledged: false,
+            waiting: None,
         };
         let blocked = r.render_key(&make(AgentStatus::Blocked), 120).unwrap();
         let idle = r.render_key(&make(AgentStatus::Idle), 120).unwrap();
         assert_ne!(blocked, idle);
+    }
+
+    #[test]
+    fn each_wait_bucket_draws_a_visibly_different_tile() {
+        // Status is never colour alone (see `theme.rs`), and neither is a wait: each rung has to
+        // differ in something a photocopier would keep. Byte inequality is a weak check, so the
+        // golden fixtures carry the real judgement — this just stops a bucket being accepted
+        // and then silently dropped on the floor.
+        let r = renderer();
+        let make = |waiting| Tile::Agent {
+            label: "refactor-auth".into(),
+            sublabel: Some("claude".into()),
+            workspace: Some("api".into()),
+            status: AgentStatus::Blocked,
+            focused: false,
+            acknowledged: false,
+            waiting,
+        };
+        let rendered: Vec<_> = [
+            None,
+            Some(WaitBucket::Fresh),
+            Some(WaitBucket::Waiting),
+            Some(WaitBucket::Overdue),
+        ]
+        .into_iter()
+        .map(|bucket| r.render_key(&make(bucket), 120).unwrap())
+        .collect();
+        for (i, a) in rendered.iter().enumerate() {
+            for b in rendered.iter().skip(i + 1) {
+                assert_ne!(a, b, "two wait treatments render identically");
+            }
+        }
+    }
+
+    #[test]
+    fn the_status_bar_thickens_with_every_rung_of_the_wait() {
+        // The half of the escalation that works without being read. It has to be monotonic:
+        // a treatment that grew and then shrank would say the agent had calmed down.
+        let r = renderer();
+        let bar_height = |waiting| {
+            let svg = r.key_svg(
+                &Tile::Agent {
+                    label: "refactor-auth".into(),
+                    sublabel: None,
+                    workspace: None,
+                    status: AgentStatus::Blocked,
+                    focused: false,
+                    acknowledged: false,
+                    waiting,
+                },
+                120,
+            );
+            // The second rect is the accent bar; the first is the tile background.
+            let rect = svg.match_indices("<rect").nth(1).expect("tile has a bar").0;
+            let height = svg[rect..].split(r#"height=""#).nth(1).unwrap();
+            height[..height.find('"').unwrap()].parse::<f32>().unwrap()
+        };
+        let none = bar_height(None);
+        let fresh = bar_height(Some(WaitBucket::Fresh));
+        let waiting = bar_height(Some(WaitBucket::Waiting));
+        let overdue = bar_height(Some(WaitBucket::Overdue));
+        assert_eq!(
+            none, fresh,
+            "a wait nobody has been timing must look exactly like one that just started"
+        );
+        assert!(
+            fresh < waiting && waiting < overdue,
+            "bar heights must escalate, got {fresh} / {waiting} / {overdue}"
+        );
+        assert!(
+            overdue < 120.0 * 0.1,
+            "the bar has grown into a band and is eating the tile"
+        );
     }
 
     #[test]
@@ -686,6 +840,7 @@ mod tests {
             status: AgentStatus::Working,
             focused: false,
             acknowledged: false,
+            waiting: None,
         };
         let png = r
             .render_key(&tile, 120)

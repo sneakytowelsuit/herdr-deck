@@ -38,6 +38,11 @@ Status is never carried by colour alone — every state has its own glyph too.
 
 A focused agent gets a bright ring around its key, so you can see where herdr currently is.
 
+An agent that is `blocked` or `done` also shows how long it has been asking, in the corner
+opposite its glyph — `<1m`, `1m+` or `5m+` — with a status bar that thickens as the wait grows.
+Three buckets rather than a running clock, for good reasons; see
+[attention](../concepts/attention.md#how-long-it-has-been-asking).
+
 ## Pressing and holding
 
 Every agent key has two actions. A press focuses the agent, taking you there and raising the

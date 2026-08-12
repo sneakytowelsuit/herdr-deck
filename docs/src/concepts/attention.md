@@ -57,6 +57,45 @@ Acknowledgement lives with the connected frontend, not with the daemon. Two deck
 herdr each keep their own: dismissing an alert on the deck in front of you does not silence the
 one in the next room, and reconnecting a deck starts it from a clean queue.
 
+## How long it has been asking
+
+A key that has been red for eight minutes looks exactly like one that turned red a moment ago,
+and they are not the same problem. So an agent in an attention state also carries a small
+duration marker in the corner opposite its status glyph, and its status bar thickens as the wait
+grows:
+
+| Marker | Meaning              | Bar      |
+| ------ | -------------------- | -------- |
+| `<1m`  | under a minute       | normal   |
+| `1m+`  | one to five minutes  | thicker  |
+| `5m+`  | over five minutes    | thickest |
+
+Buckets, not a live counter, and deliberately so. The daemon only repaints keys whose contents
+changed; a ticking clock would change every waiting key every second and repaint the deck
+forever. Three buckets cost at most two repaints per agent per incident.
+
+Only `blocked` and `done` are timed — a `working` agent is not waiting for anyone — and a
+[dismissed](#long-press-to-acknowledge) agent drops its marker, because you have already said you
+saw it.
+
+### The clock is the deck's own
+
+herdr records no timestamps at all. `state_change_seq` is a monotonic counter, not a time, so
+nothing herdr reports can answer "how long". The daemon therefore notes when it first saw each
+agent enter its current attention state, keyed on the agent **and** that sequence — the same
+trick acknowledgement uses, and for the same reason. An agent that unblocks and blocks again is
+asking a new question, and its clock starts again with it.
+
+Two consequences worth knowing:
+
+- The clock starts when **the daemon** first saw the state, not when the agent entered it. Start
+  herdr-deck next to an agent that has already been blocked for an hour and it will read `<1m`
+  until it crosses the next boundary. There is no way to do better; nothing recorded the truth.
+- herdr briefly going away does not reset it. An agent still blocked on the same sequence when
+  herdr comes back has been waiting the whole time.
+
+If herdr reports an agent with no `state_change_seq`, it gets no marker rather than a guess.
+
 ## The others
 
 - **`working`** — running. Interesting, but not actionable.

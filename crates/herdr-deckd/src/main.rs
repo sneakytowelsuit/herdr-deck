@@ -255,7 +255,33 @@ fn parse_model(name: &str) -> anyhow::Result<DeckModel> {
 }
 
 /// A state that exercises every status, so a dry run shows the whole palette.
+///
+/// The two waiting agents are given deliberately different ages, because a dry run that showed
+/// only one rung of the wait escalation would be no use for checking it — and checking a theme
+/// change without owning every model is the entire point of `--dry-run`.
 fn sample_state() -> DeckState {
+    use herdr_deck_core::state::WaitClock;
+    use herdr_deck_herdr::wire::AgentStatus;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut clock = WaitClock::default();
+
+    // The blocked agent starts asking first, alone...
+    let mut blocked_only = sample_snapshot();
+    blocked_only
+        .agents
+        .retain(|a| a.agent_status == AgentStatus::Blocked);
+    clock.stamp(&mut DeckState::from_snapshot(blocked_only), start);
+
+    // ...and six minutes later the rest of the session appears around it, so the blocked agent
+    // is long overdue and the freshly finished one has only just raised its hand.
+    let mut state = DeckState::from_snapshot(sample_snapshot());
+    clock.stamp(&mut state, start + Duration::from_secs(360));
+    state
+}
+
+fn sample_snapshot() -> herdr_deck_herdr::wire::SessionSnapshot {
     use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, WorkspaceInfo};
 
     let agent = |name: &str, kind: &str, workspace: &str, status, seq| AgentInfo {
@@ -270,7 +296,7 @@ fn sample_state() -> DeckState {
         ..Default::default()
     };
 
-    DeckState::from_snapshot(SessionSnapshot {
+    SessionSnapshot {
         protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
         agents: vec![
             agent("refactor-auth", "claude", "api", AgentStatus::Blocked, 90),
@@ -295,7 +321,7 @@ fn sample_state() -> DeckState {
             },
         ],
         ..Default::default()
-    })
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +356,30 @@ mod tests {
         assert_eq!(
             state.top_attention().unwrap().agent_status,
             AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn the_sample_state_shows_both_ends_of_the_wait_escalation() {
+        // One rung would let a dry run pass while the escalation was broken at the other end,
+        // which defeats the point of being able to check a theme change without hardware.
+        use herdr_deck_core::state::WaitBucket;
+        use herdr_deck_herdr::wire::AgentStatus;
+        let state = sample_state();
+        let bucket = |status| {
+            let agent = state
+                .agents
+                .iter()
+                .find(|a| a.agent_status == status)
+                .expect("the sample covers every status");
+            state.wait_bucket(agent)
+        };
+        assert_eq!(bucket(AgentStatus::Blocked), Some(WaitBucket::Overdue));
+        assert_eq!(bucket(AgentStatus::Done), Some(WaitBucket::Fresh));
+        assert_eq!(
+            bucket(AgentStatus::Working),
+            None,
+            "nothing calm should carry a wait"
         );
     }
 
