@@ -96,3 +96,37 @@ If it has moved, the changes belong in `crates/herdr-deck-herdr`, and
 cd plugin
 npx @elgato/cli validate com.sneakytowelsuit.herdr-deck.sdPlugin
 ```
+
+## Validating the herdr manifest
+
+`herdr-plugin.toml` is the one file here that no tool in this repository reads — herdr does.
+It shipped broken once for exactly that reason: every action used `name` where herdr requires
+`title`, so `herdr plugin install` failed with `missing field title` before doing anything.
+Reviewing it did not catch that. Two checks now do.
+
+The fast one needs nothing installed. It parses the manifest against structs mirroring herdr's
+own, with `deny_unknown_fields`:
+
+```sh
+cargo test -p herdr-deck-cli --test plugin_manifest
+```
+
+The honest one runs a real herdr and believes whatever it says:
+
+```sh
+scripts/verify-herdr-plugin.sh              # uses `herdr` from PATH
+HERDR=/path/to/herdr scripts/verify-herdr-plugin.sh
+```
+
+It links the checkout, checks every action registered with a title and a context, and then feeds
+herdr a deliberately broken copy to prove the check can still fail. No herdr session needs to be
+running — the plugin commands fall back to an on-disk registry — and it points herdr at a
+throwaway `XDG_CONFIG_HOME`, so your own installed plugins are untouched.
+
+The difference matters: the unit test can only be as correct as our reading of herdr's source,
+and it will keep passing if herdr changes its schema. The script will not.
+
+CI runs the script on every pull request against the herdr named by `min_herdr_version`, on Linux
+and macOS. Tagged releases additionally run the whole `herdr plugin install` path — the git clone,
+the `[[build]]` command, and a check that the binaries the actions name exist and start — and a
+release cannot publish until that passes.

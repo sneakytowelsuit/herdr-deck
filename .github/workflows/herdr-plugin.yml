@@ -1,0 +1,122 @@
+name: herdr plugin
+
+# Check `herdr-plugin.toml` against a real herdr binary.
+#
+# The manifest is read by herdr, not by anything in this repository, so it had no checker and
+# shipped broken — `herdr plugin install` failed with "missing field `title`" before doing
+# anything. Reviewing a file no tool reads did not catch it, twice. This does.
+#
+# Two depths:
+#
+#   link    — downloads herdr, links the checkout, asserts the actions register. Seconds. Runs on
+#             every pull request, and tests the working tree.
+#   install — the real `herdr plugin install owner/repo`, including the git clone and the cargo
+#             build it runs, then checks the binaries the actions point at actually exist and run.
+#             Minutes, and it can only test a commit that is already pushed. Gates releases.
+
+on:
+  workflow_call:
+    inputs:
+      install:
+        description: Also run the full `herdr plugin install` path against a pushed ref.
+        type: boolean
+        default: false
+      ref:
+        description: Git ref for `herdr plugin install` to fetch. Must exist on the remote.
+        type: string
+        default: ""
+  workflow_dispatch:
+
+jobs:
+  link:
+    name: Link (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # The manifest declares platforms = ["linux", "macos"], so check it on both.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install herdr
+        run: ${{ github.workspace }}/scripts/install-herdr.sh
+
+      - name: Check the manifest against herdr
+        run: scripts/verify-herdr-plugin.sh
+
+  install:
+    name: Install (${{ matrix.os }})
+    if: inputs.install
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # herdr runs our [[build]] command in its own checkout under a scrubbed environment, so
+      # nothing here is shared with the workspace — including the target directory. This build is
+      # cold by design: it is the build a user gets, and that is the point of the check.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install herdr
+        run: ${{ github.workspace }}/scripts/install-herdr.sh
+
+      - name: herdr plugin install
+        env:
+          # Keep herdr's registry inside the job rather than the runner's real config directory.
+          XDG_CONFIG_HOME: ${{ runner.temp }}/herdr-config
+          XDG_STATE_HOME: ${{ runner.temp }}/herdr-state
+          INSTALL_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+
+          # --yes is required: herdr refuses a remote install when stdin is not a terminal.
+          if [ -n "$INSTALL_REF" ]; then
+            herdr plugin install "$GITHUB_REPOSITORY" --ref "$INSTALL_REF" --yes
+          else
+            herdr plugin install "$GITHUB_REPOSITORY" --yes
+          fi
+
+      - name: The actions point at binaries that exist and run
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/herdr-config
+          XDG_STATE_HOME: ${{ runner.temp }}/herdr-state
+        run: |
+          set -euo pipefail
+          herdr plugin list --json > list.json
+
+          # Ask herdr where it put the plugin rather than assuming its directory layout.
+          root="$(python3 -c "
+          import json
+          plugins = json.load(open('list.json'))['result']['plugins']
+          print(next(p for p in plugins if p['plugin_id'] == 'sneakytowelsuit.herdr-deck')['plugin_root'])
+          ")"
+          echo "installed at $root"
+
+          # Every action runs one of these. A manifest can install cleanly and still name a
+          # binary the build never produces — that fails at the moment someone presses the key,
+          # long after install reported success.
+          python3 -c "
+          import json, os, sys
+          plugins = json.load(open('list.json'))['result']['plugins']
+          plugin = next(p for p in plugins if p['plugin_id'] == 'sneakytowelsuit.herdr-deck')
+          missing = sorted({
+              a['command'][0] for a in plugin['actions']
+              if not os.access(os.path.join('$root', a['command'][0]), os.X_OK)
+          })
+          if missing:
+              sys.exit(f'actions point at binaries that are missing or not executable: {missing}')
+          print('all action binaries present:', sorted({a['command'][0] for a in plugin['actions']}))
+          "
+
+          # And prove the thing actually starts, rather than merely existing.
+          "$root/target/release/herdr-deck" --version
+          "$root/target/release/herdr-deckd" --version

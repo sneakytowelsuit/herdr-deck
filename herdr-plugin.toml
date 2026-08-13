@@ -23,42 +23,49 @@ command = ["cargo", "build", "--release", "-p", "herdr-deckd", "-p", "herdr-deck
 # Install the service unit and start the daemon under the platform's service manager.
 [[actions]]
 id = "install"
-name = "Install service"
+title = "Install service"
+contexts = ["global"]
 description = "Write the launchd/systemd unit and start the herdr-deck daemon."
 command = ["target/release/herdr-deck", "service", "install"]
 
 [[actions]]
 id = "start"
-name = "Start"
+title = "Start"
+contexts = ["global"]
 description = "Start the herdr-deck daemon."
 command = ["target/release/herdr-deck", "service", "start"]
 
 [[actions]]
 id = "stop"
-name = "Stop"
+title = "Stop"
+contexts = ["global"]
 description = "Stop the herdr-deck daemon."
 command = ["target/release/herdr-deck", "service", "stop"]
 
 [[actions]]
 id = "restart"
-name = "Restart"
+title = "Restart"
+contexts = ["global"]
 description = "Restart the herdr-deck daemon, e.g. after editing config.toml."
 command = ["target/release/herdr-deck", "service", "restart"]
 
 [[actions]]
 id = "status"
-name = "Status"
+title = "Status"
+contexts = ["global"]
 description = "Show whether the herdr-deck daemon is running."
 command = ["target/release/herdr-deck", "service", "status"]
 
 [[actions]]
 id = "doctor"
-name = "Doctor"
+title = "Doctor"
+contexts = ["global"]
 description = "Diagnose herdr-deck: herdr socket, daemon, window-raise backend, deck permissions."
 command = ["target/release/herdr-deck", "doctor"]
 
 [[actions]]
 id = "uninstall"
-name = "Uninstall service"
+title = "Uninstall service"
+contexts = ["global"]
 description = "Stop the daemon and remove its service unit."
 command = ["target/release/herdr-deck", "service", "uninstall"]

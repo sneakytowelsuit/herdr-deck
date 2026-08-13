@@ -88,6 +88,12 @@ jobs:
       - name: Validate the plugin
         run: npx --yes @elgato/cli@latest validate com.sneakytowelsuit.herdr-deck.sdPlugin
 
+  # `herdr-plugin.toml` is read by herdr, not by anything here, so the rest of this file cannot
+  # see it break. This links the checkout into a real herdr and checks the actions register.
+  herdr-plugin:
+    name: herdr plugin
+    uses: ./.github/workflows/herdr-plugin.yml
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
