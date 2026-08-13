@@ -92,8 +92,20 @@ jobs:
           name: streamdeck-plugin
           path: plugin/*.streamDeckPlugin
 
+  # Install the plugin the way a user would — clone the tag from GitHub, run the build commands in
+  # the manifest, check the binaries the actions name actually exist and run. A release that
+  # cannot be installed is worse than a delayed one, so this blocks publishing.
+  herdr-plugin:
+    name: herdr plugin
+    uses: ./.github/workflows/herdr-plugin.yml
+    with:
+      install: true
+      # The tag being released; on a dry run, whatever tag was typed. Empty means "the remote's
+      # default HEAD", which is the right fallback for a manual smoke test.
+      ref: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+
   release:
-    needs: [binaries, plugin]
+    needs: [binaries, plugin, herdr-plugin]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
