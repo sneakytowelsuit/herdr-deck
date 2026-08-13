@@ -1,0 +1,69 @@
+name: Docs
+
+# Publishes the mdBook to GitHub Pages.
+#
+# One-time setup: Settings → Pages → Source → "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install mdBook
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The deck preview in the docs is generated, not committed stale: regenerating it here
+      # means the screenshots can never drift from what the code actually renders.
+      - name: Regenerate the deck preview
+        run: |
+          cargo run --release -p herdr-deckd -- --dry-run /tmp/tiles --dry-run-model plus
+          python3 scripts/compose-preview.py /tmp/tiles docs/src/images/deck-preview.png
+
+      - run: python3 scripts/check-docs-links.py
+
+      - run: mdbook build docs
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

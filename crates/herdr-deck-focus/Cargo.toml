@@ -1,0 +1,22 @@
+[package]
+name = "herdr-deck-focus"
+description = "Focus engine for herdr-deck: herdr focus plus OS window raising"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+herdr-deck-herdr.workspace = true
+herdr-deck-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+herdr-deck-herdr = { workspace = true, features = ["mock"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

@@ -1,0 +1,64 @@
+# herdr plugin manifest.
+#
+# Registering with herdr is purely for ergonomics: it means `herdr plugin install
+# sneakytowelsuit/herdr-deck` builds herdr-deck, and `prefix`-bound actions can start, stop and
+# diagnose the daemon without leaving the TUI.
+#
+# Note what this manifest deliberately does NOT do: it does not run the daemon as a startup
+# hook. herdr's startup hooks are one-shot initialisation commands expected to exit, not
+# supervised processes — so the `start` action hands the daemon to launchd/systemd instead. That
+# also keeps the deck alive across a herdr restart, which is what you want from a status display.
+
+id = "sneakytowelsuit.herdr-deck"
+name = "herdr-deck"
+version = "0.1.0"
+description = "Show agent status on an Elgato Stream Deck and focus a session when it needs input."
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+
+# Build both binaries from source. herdr runs this once at install time.
+[[build]]
+command = ["cargo", "build", "--release", "-p", "herdr-deckd", "-p", "herdr-deck-cli"]
+
+# Install the service unit and start the daemon under the platform's service manager.
+[[actions]]
+id = "install"
+name = "Install service"
+description = "Write the launchd/systemd unit and start the herdr-deck daemon."
+command = ["target/release/herdr-deck", "service", "install"]
+
+[[actions]]
+id = "start"
+name = "Start"
+description = "Start the herdr-deck daemon."
+command = ["target/release/herdr-deck", "service", "start"]
+
+[[actions]]
+id = "stop"
+name = "Stop"
+description = "Stop the herdr-deck daemon."
+command = ["target/release/herdr-deck", "service", "stop"]
+
+[[actions]]
+id = "restart"
+name = "Restart"
+description = "Restart the herdr-deck daemon, e.g. after editing config.toml."
+command = ["target/release/herdr-deck", "service", "restart"]
+
+[[actions]]
+id = "status"
+name = "Status"
+description = "Show whether the herdr-deck daemon is running."
+command = ["target/release/herdr-deck", "service", "status"]
+
+[[actions]]
+id = "doctor"
+name = "Doctor"
+description = "Diagnose herdr-deck: herdr socket, daemon, window-raise backend, deck permissions."
+command = ["target/release/herdr-deck", "doctor"]
+
+[[actions]]
+id = "uninstall"
+name = "Uninstall service"
+description = "Stop the daemon and remove its service unit."
+command = ["target/release/herdr-deck", "service", "uninstall"]

@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist-test",
+    "noEmit": false
+  },
+  "include": ["src/protocol.ts", "src/device.ts", "src/*.test.ts"]
+}

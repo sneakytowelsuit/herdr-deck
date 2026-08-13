@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/herdr-deck-herdr",
+    "crates/herdr-deck-core",
+    "crates/herdr-deck-focus",
+    "crates/herdr-deck-hid",
+    "crates/herdr-deckd",
+    "crates/herdr-deck-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/sneakytowelsuit/herdr-deck"
+homepage = "https://sneakytowelsuit.github.io/herdr-deck/"
+authors = ["SneakyTowelSuit"]
+
+[workspace.dependencies]
+herdr-deck-herdr = { path = "crates/herdr-deck-herdr", version = "0.1.0" }
+herdr-deck-core = { path = "crates/herdr-deck-core", version = "0.1.0" }
+herdr-deck-focus = { path = "crates/herdr-deck-focus", version = "0.1.0" }
+herdr-deck-hid = { path = "crates/herdr-deck-hid", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+    "signal",
+] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+base64 = "0.22"
+resvg = "0.44"
+tiny-skia = "0.11"
+usvg = "0.44"
+image = { version = "0.25", default-features = false, features = ["png"] }
+elgato-streamdeck = { version = "0.13", features = ["async"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

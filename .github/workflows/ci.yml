@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # hidapi builds against libudev on Linux. Without this the HID frontend cannot compile,
+      # and the Linux half of the project would go untested.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --all-targets --all-features
+
+      - run: cargo test --all-features
+
+  tiles:
+    name: Render tiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      # Proves the renderer works end to end for every model, with no herdr and no hardware.
+      # The artefact is also the fastest way to eyeball a theme change in review.
+      - name: Render every model's layout
+        run: |
+          for model in plus original mini xl neo pedal; do
+            cargo run --release -p herdr-deckd -- --dry-run "tiles/$model" --dry-run-model "$model"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rendered-tiles
+          path: tiles/
+
+  plugin:
+    name: Stream Deck plugin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run build
+
+      # Elgato's own validator catches manifest problems that only surface at install time.
+      - name: Validate the plugin
+        run: npx --yes @elgato/cli@latest validate com.sneakytowelsuit.herdr-deck.sdPlugin
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: mdbook build docs
+
+      # A summary entry pointing at a file that does not exist builds fine but 404s for readers.
+      - name: Check every page is reachable and every link resolves
+        run: python3 scripts/check-docs-links.py

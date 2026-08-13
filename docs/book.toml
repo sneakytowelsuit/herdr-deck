@@ -1,0 +1,20 @@
+[book]
+title = "herdr-deck"
+description = "Stream Deck control for herdr: agent status on hardware, and one press to focus a session that needs you."
+authors = ["SneakyTowelSuit"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/sneakytowelsuit/herdr-deck"
+edit-url-template = "https://github.com/sneakytowelsuit/herdr-deck/edit/main/docs/{path}"
+site-url = "/herdr-deck/"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

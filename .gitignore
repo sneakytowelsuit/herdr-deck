@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / Stream Deck plugin
+node_modules/
+plugin/**/bin/
+plugin/*.streamDeckPlugin
+dist/
+
+# mdBook
+docs/book/
+
+# Local artifacts
+*.log
+.DS_Store
+/tmp-render/
+plugin/dist-test/
+
+# Transient git worktrees created by parallel agent workflows. These are full checkouts of
+# this same repository; committing them would nest the repo inside itself.
+.claude/worktrees/
