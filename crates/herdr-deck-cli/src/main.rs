@@ -179,6 +179,12 @@ fn describe_key(binding: &KeyBinding) -> String {
         KeyBinding::Dynamic { rank } => format!("agent #{rank} in attention order"),
         KeyBinding::PinnedAgent { terminal_id } => format!("pinned agent {terminal_id}"),
         KeyBinding::PinnedWorkspace { workspace_id } => format!("pinned workspace {workspace_id}"),
+        // Naming the gesture matters more than naming the command: a key that only works when
+        // held is the one thing about a layout you cannot discover by looking at the deck.
+        KeyBinding::Command { command } if command.is_destructive() => {
+            format!("{} {} — hold to confirm", command.label(), command.target())
+        }
+        KeyBinding::Command { command } => format!("{} {}", command.label(), command.target()),
         KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
         KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
         KeyBinding::PagePrev => "previous page".to_string(),

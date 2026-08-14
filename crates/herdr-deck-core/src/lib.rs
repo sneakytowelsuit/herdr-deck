@@ -7,6 +7,7 @@
 //! identical output.
 
 pub mod capabilities;
+pub mod command;
 pub mod config;
 pub mod layout;
 pub mod protocol;
@@ -15,6 +16,7 @@ pub mod state;
 pub mod theme;
 
 pub use capabilities::{DeckCapabilities, DeckModel, TouchStrip};
+pub use command::DeckCommand;
 pub use config::Config;
 pub use layout::{
     DialBinding, KeyBinding, Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction,

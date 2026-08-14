@@ -189,6 +189,34 @@ impl MockHerdr {
         self.reply("tab.focus", json!({ "type": "ok" })).await;
         self.reply("client.window_title.set", json!({ "type": "ok" }))
             .await;
+        self.with_attached_client().await;
+    }
+
+    /// Answer as a herdr with a terminal attached to it.
+    ///
+    /// Named for the fact rather than the method because that is the only thing callers above
+    /// this crate are allowed to care about: whether there is a client whose window could be
+    /// raised. herdr answers that question through its toast delivery, which is this crate's
+    /// business and nobody else's.
+    pub async fn with_attached_client(&self) {
+        self.reply(
+            "notification.show",
+            json!({"type": "notification_show", "shown": true, "reason": "shown"}),
+        )
+        .await;
+    }
+
+    /// Answer as a headless herdr: running, holding state, with no terminal attached.
+    pub async fn without_attached_client(&self) {
+        self.reply(
+            "notification.show",
+            json!({
+                "type": "notification_show",
+                "shown": false,
+                "reason": "no_foreground_client"
+            }),
+        )
+        .await;
     }
 
     /// The target of each `agent.focus` call, in the order they arrived.

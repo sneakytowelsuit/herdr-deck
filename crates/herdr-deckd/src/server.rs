@@ -12,11 +12,12 @@ use herdr_deck_core::protocol::{DaemonMessage, FrontendMessage, FRONTEND_PROTOCO
 use herdr_deck_core::render::TileRenderer;
 use herdr_deck_core::state::DeckState;
 use herdr_deck_core::Config;
-use herdr_deck_focus::FocusEngine;
+use herdr_deck_focus::{FocusEngine, FocusReport};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
+use crate::audit::AuditLog;
 use crate::session::{PendingAction, Session};
 
 /// Everything a connection needs.
@@ -25,6 +26,7 @@ pub struct ServerContext {
     pub renderer: Arc<TileRenderer>,
     pub focus: Arc<FocusEngine>,
     pub state: watch::Receiver<Arc<DeckState>>,
+    pub audit: Arc<AuditLog>,
 }
 
 /// Where the frontend socket lives.
@@ -205,32 +207,42 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> a
     Ok(())
 }
 
-/// Carry out a focus request and turn the result into deck feedback.
+/// Carry out one command and turn the result into deck feedback.
+///
+/// The only place a command leaves this daemon, which is why it is also the only place that
+/// records one. An audit line written anywhere else would eventually describe something that was
+/// never actually issued.
 async fn perform(context: &ServerContext, action: PendingAction) -> Vec<DaemonMessage> {
-    let (report, key) = match action {
-        PendingAction::FocusAgent { pane_id, key } => {
-            (context.focus.focus_agent(&pane_id).await, key)
-        }
-        PendingAction::FocusWorkspace { workspace_id, key } => {
-            (context.focus.focus_workspace(&workspace_id).await, key)
-        }
-        PendingAction::FocusTab { tab_id, key } => (context.focus.focus_tab(&tab_id).await, key),
-    };
+    let PendingAction { command, key } = action;
+    let report = context.focus.perform(&command).await;
+    let verdict = report.verdict();
+    context.audit.record(&command, verdict);
 
     if !report.fully_succeeded() {
-        // A partial success — herdr focused but the window did not come forward — is worth
-        // saying out loud, because otherwise the user presses a key and nothing visibly happens.
-        tracing::info!(outcome = %report.describe(), "focus did not fully succeed");
+        // Anything short of "herdr focused it and the window came forward" is worth saying out
+        // loud, because otherwise the user presses a key and nothing visibly happens.
+        tracing::info!(outcome = %report.describe(), verdict = verdict.as_str(), "focus did not fully succeed");
     }
 
-    let Some(index) = key else { return vec![] };
-    if report.fully_succeeded() {
-        vec![DaemonMessage::Ok { index }]
-    } else {
-        vec![DaemonMessage::Alert {
+    match key {
+        Some(index) => vec![key_feedback(index, &report)],
+        None => vec![],
+    }
+}
+
+/// What the key that asked for a command should show.
+///
+/// A verdict is not an error merely because something was left undone. With no client attached
+/// there was no window to raise, so nothing was left undone at all — and a key that alerted about
+/// that would teach the user to ignore the alerts that mean something.
+fn key_feedback(index: usize, report: &FocusReport) -> DaemonMessage {
+    if report.verdict().is_error() {
+        DaemonMessage::Alert {
             index,
             message: report.describe(),
-        }]
+        }
+    } else {
+        DaemonMessage::Ok { index }
     }
 }
 
@@ -253,6 +265,74 @@ async fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use herdr_deck_focus::RaiseOutcome;
+
+    fn report(raise: RaiseOutcome, error: Option<&str>) -> FocusReport {
+        FocusReport {
+            herdr_focused: error.is_none(),
+            raise,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_focus_with_nothing_attached_to_raise_reads_as_success_on_the_key() {
+        // herdr focused it and it persists to the next attach. There was no window, so nothing
+        // failed — and a deck that cries wolf here is a deck whose alerts stop being read.
+        assert_eq!(
+            key_feedback(2, &report(RaiseOutcome::NoClient, None)),
+            DaemonMessage::Ok { index: 2 }
+        );
+    }
+
+    #[test]
+    fn a_window_that_should_have_come_forward_and_did_not_still_alerts() {
+        for raise in [
+            RaiseOutcome::NotFound,
+            RaiseOutcome::Disabled,
+            RaiseOutcome::ToolMissing {
+                program: "wmctrl".into(),
+            },
+            RaiseOutcome::Unsupported {
+                reason: "GNOME on Wayland".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    key_feedback(0, &report(raise.clone(), None)),
+                    DaemonMessage::Alert { .. }
+                ),
+                "{raise:?} left the user looking at the wrong window and must say so"
+            );
+        }
+    }
+
+    #[test]
+    fn a_focus_herdr_refused_alerts_and_says_what_herdr_said() {
+        match key_feedback(1, &report(RaiseOutcome::Disabled, Some("pane not found"))) {
+            DaemonMessage::Alert { index, message } => {
+                assert_eq!(index, 1);
+                assert!(message.contains("pane not found"), "got {message}");
+            }
+            other => panic!("expected an alert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_focus_that_fully_worked_reads_as_success() {
+        assert_eq!(
+            key_feedback(
+                3,
+                &report(
+                    RaiseOutcome::Raised {
+                        via: "hyprctl".into()
+                    },
+                    None
+                )
+            ),
+            DaemonMessage::Ok { index: 3 }
+        );
+    }
 
     #[tokio::test]
     async fn binding_twice_is_refused_rather_than_stealing_the_socket() {
