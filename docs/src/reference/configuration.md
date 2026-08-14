@@ -67,6 +67,10 @@ keys = [
   # Always this workspace.
   { kind = "pinned_workspace", workspace_id = "w1" },
 
+  # One herdr command, spelled out. The escape hatch for anything the derived
+  # layout does not offer.
+  { kind = "command", command = { verb = "focus_tab", tab_id = "w1:t2" } },
+
   # Fixed controls.
   { kind = "next_attention" },
   { kind = "mode_toggle" },
@@ -90,8 +94,16 @@ dials = [
 
 Scrub targets: `agents`, `workspaces`, `tabs`, `attention`.
 
+Command verbs: `focus_pane` (`pane_id`), `focus_workspace` (`workspace_id`), `focus_tab`
+(`tab_id`).
+
 A hand-written layout shorter than the hardware is padded with empty keys, so you cannot
 accidentally leave keys unaddressable.
+
+> A command that could destroy work is never issued by a tap. It moves to a hold, and the key
+> says `hold:` on its face. Nothing herdr-deck can do today is destructive, so nothing on the
+> deck currently behaves that way — but the guard applies to the command, not to the key, so a
+> hand-written layout cannot opt out of it.
 
 > Pinning is a trade. A pinned key always points at the same agent, even when a different one is
 > screaming for attention. The dynamic default is usually the better choice — consider pinning

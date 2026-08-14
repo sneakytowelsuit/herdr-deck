@@ -34,9 +34,28 @@ On macOS the marker is skipped entirely, because macOS offers no supported way t
 specific window of another application. Setting it would rewrite your terminal title for no
 benefit.
 
+## One call, not three
+
+`agent.focus` walks the whole path itself: it switches workspace, switches tab, focuses the pane,
+follows zoom, marks the tab seen and dismisses whatever dialog herdr was showing. herdr-deck
+therefore sends exactly one call and never a workspace or tab focus around it — doing so would
+make three round trips of a journey herdr does atomically, and fight its own logic on the way.
+
+## When there is nothing to raise
+
+herdr owns the focus, not its clients. With no terminal attached at all, step 1 still happens,
+still persists, and the next terminal to attach opens on that pane. There was never a window to
+bring forward, so nothing was left undone: the key reports success and the log records the
+outcome as `settled`.
+
+This is not the same as a window that should have come forward and did not, which is a genuine
+failure and is reported as one. herdr-deck tells the two apart by asking herdr whether anything
+is attached, and only when the raise matched no window — the one case where the answer changes
+what to report.
+
 ## When step 2 fails
 
-herdr-deck never pretends. If the window did not come forward:
+herdr-deck never pretends. If the window did not come forward and could have:
 
 - the key flashes an alert,
 - the daemon logs the specific reason,

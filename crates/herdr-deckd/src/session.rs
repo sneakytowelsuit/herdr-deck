@@ -1410,6 +1410,34 @@ mod tests {
     }
 
     #[test]
+    fn a_key_bound_straight_to_a_command_issues_it_and_needs_no_list_behind_it() {
+        // The path every command that is not a focus will arrive by: no agent, no cursor, no
+        // page — the key holds the command and the daemon hands it on unchanged.
+        let mut config = Config::default();
+        config.layout = Some(herdr_deck_core::config::LayoutOverride {
+            keys: vec![herdr_deck_core::layout::KeyBinding::Command {
+                command: DeckCommand::FocusTab {
+                    tab_id: "w1:t2".into(),
+                },
+            }],
+            dials: vec![],
+        });
+        let mut session = Session::new(&plus_device(), &config, renderer());
+        let s = state(vec![]);
+        session.greet(&s);
+
+        assert_eq!(
+            tap(&mut session, 0, &s).action,
+            Some(PendingAction {
+                command: DeckCommand::FocusTab {
+                    tab_id: "w1:t2".into()
+                },
+                key: Some(0)
+            })
+        );
+    }
+
+    #[test]
     fn pressing_a_pedal_still_focuses_the_top_attention_agent() {
         let pedal = DeviceReport {
             model: Some(DeckModel::Pedal),
