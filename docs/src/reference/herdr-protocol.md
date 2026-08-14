@@ -240,12 +240,37 @@ from away-from-desk surfaces. They solve "answer it from wherever I am". herdr-d
 Write access to herdr itself — workspaces, tabs, panes, layouts — is a separate question and is
 squarely in scope; it is herdr-centric control, not agent interaction.
 
+## The snapshot is wrapped
+
+`session.snapshot` answers `{"type": "session_snapshot", "snapshot": {...}}`. The snapshot's own
+fields — `protocol`, `agents`, `workspaces` — are a level down.
+
+This is worth stating plainly because reading the result *as* the snapshot does not fail. Every
+field of the type has a default, so it yields a valid, empty session: a deck with no agents on it
+and a `doctor` reporting that herdr never sent a protocol version. That shipped. The decode is now
+strict about the wrapper so the same mistake is an error instead of an empty screen.
+
 ## Subscribing
 
-`pane.agent_status_changed` exists in **two** forms: a per-pane filtered subscription that
-requires a `pane_id`, and an unfiltered broadcast. herdr-deck uses the broadcast form —
-`{"type": "pane.agent_status_changed"}` with no filter — so it sees every pane without
-enumerating them first. Adding a `pane_id` would silently limit you to one pane.
+Most events can be subscribed to as a bare `{"type": "..."}`, which is what herdr-deck wants: every
+pane, without enumerating them first.
+
+**`pane.agent_status_changed` is not one of them.** It was previously documented here as having an
+unfiltered broadcast form alongside the per-pane one. It does not. In herdr 0.8.0 it exists *only*
+filtered, and a subscription without a `pane_id` is rejected — as are `pane.scroll_changed` and
+`pane.output_matched`.
+
+herdr validates the batch as a whole, so one bad entry fails the entire `events.subscribe` with
+`invalid_request`. When that happened the watcher fell to its offline path and every key on the
+deck read `herdr error: invalid_request`.
+
+herdr-deck therefore does not subscribe to it. That costs latency, not correctness:
+`session.snapshot` is the source of truth and the reconcile timer re-reads it regardless, so a
+status change is seen within one interval rather than instantly. Subscribing per pane, and
+re-subscribing as panes come and go, would buy the latency back.
+
+Both of these were found by running a real herdr, not by reading. `scripts/verify-herdr-contract.sh`
+now does that on every pull request.
 
 ## Identifiers
 
