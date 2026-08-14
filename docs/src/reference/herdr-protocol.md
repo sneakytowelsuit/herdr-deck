@@ -41,7 +41,15 @@ The only methods that hold a connection open are `events.subscribe` and `pane.gr
 | `pane.focus_direction` | Move one pane left/right/up/down. |
 | `pane.zoom` | Fill a tab with its focused pane, or put it back. |
 | `pane.split` | New shell beside or below the focused one. |
-| `pane.close` | Close a pane. The only destructive call the deck makes. |
+| `pane.close` | Close a pane. |
+| `worktree.list` | The checkouts of the repository you are in, for the worktree page. |
+| `worktree.open` | Open a checkout as a workspace and go there. |
+| `worktree.create` | Make a new worktree. herdr invents the branch name. |
+| `worktree.remove` | Give a checkout back to git. Never forced. |
+| `workspace.create` | New workspace, from a named preset. |
+| `tab.create` | New tab in the workspace you are in, from a named preset. |
+| `tab.close` | Close a tab. |
+| `layout.apply` | Build a new tab from a named arrangement of panes. Never with a `tab_id`. |
 
 ## Pane commands
 
@@ -71,6 +79,73 @@ as its own message on the key and leaves the dialog alone. It could dismiss it �
 `agent.focus` settles herdr's mode and would take the modal with it — but answering a question the
 user has not read yet is exactly what this project does not do, and it would drag them to another
 pane on the way.
+
+## Structure: layouts, worktrees, workspaces and tabs
+
+Two of these methods are traps rather than features, and the deck's shape here is mostly about
+not falling into them.
+
+**`layout.apply` with a `tab_id` is destructive, and nothing in its name says so.** It builds the
+replacement tab first and then *closes* the tab you named, killing every terminal in it — no
+confirmation, no worktree-group guard, no dry run. herdr's own docs put it plainly: it "does not
+preserve live PTYs, scrollback, or running processes." Without a `tab_id` the same call is purely
+additive: a new tab in the workspace you are in. The deck's client offers no way to supply one, so
+a layout preset can only ever add.
+
+**`worktree.remove` is the only call the deck makes that could delete a file.** With `force: true`
+it does two destructive things in order: it kills every terminal in the workspace *before* git
+runs — so a git failure loses your agents for nothing — and then deletes uncommitted and untracked
+files. The deck's client takes no `force` argument and always sends `false`. Unforced, git refuses
+to remove a checkout with changes in it, herdr passes that refusal straight back, and the key
+shows it. That refusal *is* the confirmation dialog, and it is a better one than a deck could
+draw. Committed work is never at risk either way: herdr does not delete the branch.
+
+`worktree.open` is the best-behaved method in the whole API and the deck leans on it: idempotent,
+synchronous, non-destructive, and it reports `already_open` rather than making a second workspace.
+Its parameters come straight out of `worktree.list`, so nothing has to be typed. The deck opens by
+`path` rather than `branch` because a detached checkout has no branch, and a list where some rows
+worked and others did not would be worse than a shorter list.
+
+`worktree.create` and `worktree.remove` are the **only two methods in herdr's API that do not
+answer at once** — they are deferred until git finishes, which on a large repository is seconds.
+The daemon carries them out alongside its event loop rather than inside it, so the key reports
+late and the rest of the deck keeps working. Everything else here answers immediately.
+
+`tab.close` cascades the way `pane.close` does, one level up: the last tab of a workspace takes
+the workspace with it, and herdr answers the same bare `ok` for both. Like `pane.close` it is
+guarded by a hold, never appears in a derived layout, and surfaces `confirmation_required` as a
+message pointing at herdr's own window.
+
+`worktree.list` shells out to `git worktree list --porcelain`, so the deck reads it on a slow timer
+rather than with every reconcile — and immediately whenever the set of workspaces changes, which is
+what opening, creating or removing a worktree always does. Bare and prunable entries are dropped
+before they reach a key: herdr answers `worktree_not_found` for both, and a key that cannot work is
+worse than a key that is not there.
+
+### Why there is no key that closes a workspace
+
+`workspace.close` is absent from the deck's vocabulary, and there is a test asserting it stays
+absent. It is the worst-behaved method in this part of the API:
+
+- **No confirmation of any kind.** `tab.close` and `pane.close` both refuse with
+  `confirmation_required` when closing would take a worktree group with it. `workspace.close` has
+  no such guard — the TUI's own path honours `confirm_close`, and the API bypasses it entirely.
+- **It does not necessarily close one workspace.** When the target is the source-repo member of a
+  worktree group with two or more members, it closes *every* workspace in that group: the repo and
+  all its worktree children, in one call.
+- **It cannot report what it did.** The response is a bare `{"type":"ok"}`, so a key could not tell
+  you afterwards whether it had closed one workspace or five.
+
+A daemon could in principle establish that a target is not worktree-grouped before sending — the
+`worktree.list` response carries `open_workspace_id` for every checkout. It would rest on inferring
+herdr's grouping rule rather than reading it, and it would race: the check and the close are two
+calls, and a worktree opened in between makes the answer stale. A wrong inference costs somebody
+several workspaces of running agents, so this stays out until herdr offers either a guard of its
+own or a response that says what went.
+
+`workspace.rename` and `tab.rename` are out for a duller reason: both require a `label` with no
+clear or reset form, and a deck has no keyboard. See
+[configuration](configuration.md#presets-are-how-text-reaches-herdr).
 
 ## Why herdr-deck doesn't approve prompts
 

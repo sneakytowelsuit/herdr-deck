@@ -165,14 +165,21 @@ unmarked hole. A line carries ids and a closed vocabulary of outcomes, never a l
 title or working directory — a trail that quoted those would be a file to guard like a secret
 rather than one to read like a log.
 
+A `target` is a herdr id (`w1:p2`), a word from a closed set (`left`), or the name of a config
+preset — which is a word chosen for a *key*, and held to a safe spelling when the config loads for
+exactly this reason. Where a command's only identifier is something out of the user's own
+repository, as a worktree's path or branch is, the target is recorded as `null` rather than bent
+into the rule, and the command's own name carries the line.
+
 ## One confirmation idiom
 
 A long press already means "I am sure" on this deck: it is how an agent is dismissed from the
 attention queue without focusing it. Anything that could destroy work therefore fires from a hold
 and never from a tap, the key wears `hold` on its face, and tapping it says so rather than going
-quiet. Closing a pane is the one command this applies to today, and it is never in a layout the
-deck derived for you — you have to bind it. Guarding is a property of the command, not of the key, so it cannot be bypassed by binding
-one by hand — and it applies the day a new command is added rather than the day someone remembers.
+quiet. Three commands qualify today — closing a pane, closing a tab, and giving a worktree back to
+git — and none of them is ever in a layout the deck derived for you. You have to bind them.
+Guarding is a property of the command, not of the key, so it cannot be bypassed by binding one by
+hand — and it applies the day a new command is added rather than the day someone remembers.
 
 A dial has no hold, since the daemon ignores an encoder's release. A destructive command on a
 dial is refused outright, which is the honest answer: there is no gesture there that means "I am

@@ -75,6 +75,14 @@ keys = [
   # see below.
   { kind = "close_pane" },
 
+  # Structure. Each of these is described under `Layouts, worktrees and presets`.
+  { kind = "layout", preset = "dev" },
+  { kind = "new_workspace", preset = "notes" },
+  { kind = "new_tab" },
+  { kind = "new_worktree" },
+  { kind = "close_tab" },
+  { kind = "remove_worktree" },
+
   # Fixed controls.
   { kind = "next_attention" },
   { kind = "mode_toggle" },
@@ -96,7 +104,8 @@ dials = [
 ]
 ```
 
-Scrub targets: `agents`, `workspaces`, `tabs`, `attention`.
+Scrub targets: `agents`, `workspaces`, `tabs`, `attention`, `worktrees`. The first four are what
+dials get by default, in that order; `worktrees` is there to be bound by hand.
 
 Command verbs:
 
@@ -109,6 +118,8 @@ Command verbs:
 | `zoom_pane` | `zoom` = `on` \| `off` | Fill the tab with the focused pane, or put it back. |
 | `split_pane` | `direction` = `right` \| `down` | New shell beside or below, and focus it. |
 | `close_pane` | `pane_id` | **Destructive.** Prefer the `close_pane` *binding* below. |
+| `create_worktree` | — | New git worktree, opened and focused. |
+| `open_worktree` | `path` | Open that checkout as a workspace and go there. |
 
 A hand-written layout shorter than the hardware is padded with empty keys, so you cannot
 accidentally leave keys unaddressable.
@@ -174,6 +185,146 @@ Three things to know before binding it.
 > Pinning is a trade. A pinned key always points at the same agent, even when a different one is
 > screaming for attention. The dynamic default is usually the better choice — consider pinning
 > only a couple of keys and leaving the rest dynamic.
+
+## Layouts, worktrees and presets
+
+Six more bindings drive herdr's own structure — the workspaces, tabs, layouts and git worktrees
+around your agents rather than the agents themselves.
+
+| Binding | What it does |
+|---|---|
+| `{ kind = "layout", preset = "dev" }` | Builds a **new tab** from `[layouts.dev]`. |
+| `{ kind = "new_workspace", preset = "notes" }` | New workspace from `[workspaces.notes]`. `preset` is optional. |
+| `{ kind = "new_tab", preset = "logs" }` | New tab in the workspace you are in, from `[tabs.logs]`. `preset` is optional. |
+| `{ kind = "new_worktree" }` | New git worktree, opened and focused. Takes nothing. |
+| `{ kind = "close_tab" }` | **Destructive.** Closes the focused tab. Hold. |
+| `{ kind = "remove_worktree" }` | **Destructive.** Gives the focused worktree back to git. Hold. |
+
+A key naming a preset that does not exist is a **config error**, not a dead key. The deck says
+which preset it wanted and lists the ones you have.
+
+### Presets are how text reaches herdr
+
+A Stream Deck has no keyboard, so nothing that needs typing can be a key. Presets are the way
+round that: write the working directory, the label or the environment down once, give it a name,
+and bind a key to the name.
+
+```toml
+[workspaces.notes]
+label = "notes"
+cwd = "/home/dev/notes"
+env = { EDITOR = "hx" }
+
+[tabs.logs]
+label = "logs"
+```
+
+Both tables take the same three optional fields, and every one of them is optional — a
+`new_workspace` key with no preset still works, because herdr picks the working directory from the
+pane you are in.
+
+Preset names must be lower-case letters, digits, `-` or `_`. That is not fussiness: a preset name
+goes on a key face and into the [command log](architecture.md), and it is the only thing recorded
+there that a person wrote.
+
+This is also why `workspace.rename` and `tab.rename` have no keys at all. Both need free text with
+no clear form, so the best a key could do is cycle through canned labels — see
+[the protocol notes](herdr-protocol.md#structure-layouts-worktrees-workspaces-and-tabs).
+
+### `[layouts.<name>]` — arrangements of panes
+
+A layout is a tree. A node with `split` divides its space; a node without one is a pane.
+
+```toml
+[layouts.dev]
+# What to call the tab this makes. Optional.
+label = "dev"
+
+# 70% editor on top, a test runner underneath.
+[layouts.dev.root]
+split = "down"      # "down" or "right" — herdr has no split-left or split-up
+ratio = 70          # whole percent, 10 to 90, for the FIRST child
+
+[layouts.dev.root.first]
+# A bare pane: your shell, in the current directory.
+
+[layouts.dev.root.second]
+command = ["cargo", "watch", "-x", "test"]
+cwd = "/home/dev/src/api"
+label = "tests"
+```
+
+Pane nodes take `cwd`, `command` and `label`; split nodes take `split`, `ratio`, `first` and
+`second`. Mixing the two on one node is an error, as is a `split` missing either child, or
+children with no `split` saying which way they divide. herdr accepts at most 24 panes and 16
+levels of nesting, and the deck checks both when the config loads rather than letting the key fail
+when it is pressed.
+
+`ratio` is refused outside 10–90 rather than clamped. herdr silently clamps it, which would leave
+a config saying `95` and a deck quietly doing `90` forever.
+
+**A layout key only ever adds a tab.** `layout.apply` can also be pointed at an existing tab, in
+which case it builds the replacement and then closes the one you named, killing every process in
+it. herdr-deck has no way to express that, and
+[will not grow one](herdr-protocol.md#structure-layouts-worktrees-workspaces-and-tabs).
+
+Layouts are the one preset that earns keys on its own: a deck with room to spare gets **one key
+per named layout**, alphabetically, without being asked. A layout nobody can press is a layout
+nobody meant to write down. Workspace and tab presets are bound by hand.
+
+### Worktrees
+
+If your session is inside a git repository, the mode key grows a third stop — agents, spaces,
+**trees** — listing every worktree of that repository. Pressing one opens it as a workspace and
+takes you there, window and all, exactly as pressing an agent does. A checkout herdr already has
+open is drawn with a filled circle and the word `open`; one it does not have open is drawn hollow.
+Pressing either does the same thing, because `worktree.open` is idempotent.
+
+Sessions with no worktrees never see the third stop, so nobody pays a press for a page they do not
+use. There is also a dial target:
+
+```toml
+dials = [{ kind = "scrub", target = "worktrees" }]
+```
+
+The listing makes herdr shell out to git, so it is refreshed on a slow timer and whenever the set
+of workspaces changes — which is what opening, creating or removing a worktree always does. In
+practice a worktree key reflects reality within a reconcile.
+
+`{ kind = "new_worktree" }` is the only key on this deck that *starts* a piece of work rather than
+navigating to one, and it takes no arguments at all: herdr generates the branch name, bases it on
+`HEAD`, and puts the checkout in its configured worktree directory. It waits on git, so on a large
+repository the key can take a few seconds to report — the rest of the deck keeps working meanwhile.
+
+### Removing a worktree
+
+```toml
+{ kind = "remove_worktree" }
+```
+
+Gives the focused workspace's checkout back to git, and closes the workspace. Four things to know.
+
+- **It only fires on a hold**, like every destructive key here.
+- **It is never forced, and there is no setting that would force it.** Unforced, git refuses to
+  remove a checkout holding uncommitted or untracked work, and that refusal appears on the key.
+  That is the confirmation prompt — a real one, from the tool that actually knows.
+- **Committed work always survives.** herdr never deletes the branch.
+- **It draws dimmed and refuses when the focused workspace is not a linked worktree**, because
+  herdr will not remove a repository's source checkout and the deck already knows which one that
+  is.
+
+### Closing a tab
+
+```toml
+{ kind = "close_tab" }
+```
+
+The same bargain as [`close_pane`](#closing-a-pane), one level up: hold to fire, cascades to the
+whole workspace when it is the last tab, and cannot tell you afterwards which of the two happened.
+
+**There is no key that closes a workspace**, and there will not be one. `workspace.close` has no
+confirmation and does not necessarily close one workspace —
+[the reasoning is written down](herdr-protocol.md#why-there-is-no-key-that-closes-a-workspace).
 
 ## Environment variables
 

@@ -18,6 +18,12 @@ is replaced, the agent goes with it.
 By default, keys show **agents**, because an agent is the thing that can need you. Pressing the
 mode toggle switches the deck to **workspaces**, which is the level you navigate at.
 
+There is a third list that is not in that tree at all: **worktrees**. A git worktree is a checkout
+on disk, and herdr opens one as a workspace — so it sits *outside* the nesting above, and the only
+way to see the ones you have not opened yet is to ask git. The mode key reaches them as a third
+stop, but only for sessions that have any; see
+[the default layout](../getting-started/default-layout.md#worktrees-when-you-have-them).
+
 herdr-deck does not model tabs or panes as key targets — dial 3 scrubs tabs and pressing it
 focuses the tab you landed on, and that has been enough. Sessions are not modelled either: the
 daemon talks to one herdr session, chosen with `--session` or `herdr_session` in config.

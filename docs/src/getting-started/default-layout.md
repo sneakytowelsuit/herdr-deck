@@ -110,6 +110,28 @@ keys only if yours are genuinely two-dimensional.
 **Closing a pane is never given to you.** It exists, it is guarded by a hold, and you have to ask
 for it in your config.
 
+## Worktrees, when you have them
+
+If your session is inside a git repository with worktrees, the mode key grows a third stop:
+agents, spaces, **trees**. Every checkout of that repository gets a key, and pressing one opens it
+as a workspace and takes you there — the same press, and the same window raise, as pressing an
+agent. A checkout herdr already has open is drawn with a filled circle and the word `open`;
+one it does not is drawn hollow. Either way the press does the same thing.
+
+Sessions with no worktrees never see the third stop, so nobody pays an extra press for a page they
+do not use. Nothing about this needs configuring.
+
+## Keys your config can add
+
+The derived layout stays deliberately small, but it does grow in one direction: **a named layout
+gets a key**. Write `[layouts.dev]` in your config and a deck with room to spare gains a key that
+builds that arrangement of panes as a new tab. Nothing else about the layout changes, and a deck
+without room to spare gains nothing — the agents are still why it is on the desk.
+
+Everything else that drives herdr's structure — new workspace, new tab, new worktree, and the two
+destructive ones — is bound by hand. See
+[configuration](../reference/configuration.md#layouts-worktrees-and-presets).
+
 ## The ordering rule
 
 Agents sort by status band first — `blocked`, then `done`, then `working`, then `idle`, then
