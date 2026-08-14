@@ -130,6 +130,9 @@ id* — not a terminal id — so resolve at the moment of use.
 - `report_agent` cannot write `done`. The reportable states are `idle|working|blocked|unknown`;
   `done` is derived by herdr from idle-and-unseen.
 - Focusing marks a tab seen. Reading state through the CLI does not.
+- `agent.focus` chains the **whole** path itself — workspace, then tab, then pane — and follows
+  zoom while it does. Sending `workspace.focus` or `tab.focus` around it to "prepare the way"
+  makes three round trips of a journey herdr does atomically, and fights its own logic.
 - `workspace.metadata_updated` does not trigger plugin event hooks.
 
 ## Version compatibility

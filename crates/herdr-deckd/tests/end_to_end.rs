@@ -28,6 +28,7 @@ use herdr_deck_focus::FocusEngine;
 use herdr_deck_herdr::mock::MockHerdr;
 use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, WorkspaceInfo};
 use herdr_deck_herdr::{HerdrClient, SocketPath};
+use herdr_deckd::audit::AuditLog;
 use herdr_deckd::server::{self, ServerContext};
 use herdr_deckd::watcher::Watcher;
 use serde_json::json;
@@ -71,6 +72,8 @@ struct Daemon {
     socket: PathBuf,
     state: watch::Receiver<Arc<DeckState>>,
     serve: tokio::task::JoinHandle<()>,
+    audit: Arc<AuditLog>,
+    audit_path: PathBuf,
     // Held so the socket's directory outlives the listener.
     _dir: tempfile::TempDir,
 }
@@ -86,11 +89,15 @@ impl Daemon {
         let socket = dir.path().join("herdr-deck.sock");
         let listener = server::bind(&socket).await.expect("bind frontend socket");
 
+        let audit_path = dir.path().join("commands.jsonl");
+        let audit = Arc::new(AuditLog::open(audit_path.clone()));
+
         let context = Arc::new(ServerContext {
             config,
             renderer,
             focus,
             state: state.clone(),
+            audit: Arc::clone(&audit),
         });
         let serve = tokio::spawn(async move {
             let _ = server::serve(listener, context).await;
@@ -100,8 +107,20 @@ impl Daemon {
             socket,
             state,
             serve,
+            audit,
+            audit_path,
             _dir: dir,
         }
+    }
+
+    /// Every command this daemon recorded, once everything queued has reached the file.
+    async fn audit_lines(&self) -> Vec<serde_json::Value> {
+        self.audit.flush().await;
+        std::fs::read_to_string(&self.audit_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every audit line is valid JSON"))
+            .collect()
     }
 
     /// Block until the daemon's view of herdr satisfies `pred`.
@@ -491,6 +510,93 @@ async fn pressing_a_blocked_agents_key_focuses_that_agents_pane_and_not_its_term
         vec!["w1:p9"],
         "focus takes the pane id; the terminal id the key is bound to would not resolve"
     );
+}
+
+#[tokio::test]
+async fn a_command_that_reached_herdr_leaves_a_line_in_the_audit_log() {
+    // The trail has to be written where the command actually leaves the daemon, or it will
+    // eventually describe presses that never became anything.
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
+    let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(PLUS_DIALS as u8)).await;
+    frontend.read(1 + PLUS_KEYS + PLUS_DIALS).await;
+
+    frontend.tap(0).await;
+    frontend.drain_to_pong().await;
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded.len(), 1, "one command, one line: {recorded:?}");
+    assert_eq!(recorded[0]["command"], "focus_pane");
+    assert_eq!(
+        recorded[0]["target"], "w1:p9",
+        "the log names the pane herdr was actually asked about"
+    );
+    // Window raising is off in the test config, so herdr focused and nothing was raised.
+    assert_eq!(recorded[0]["outcome"], "partial");
+    assert!(
+        recorded[0]["at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z')),
+        "got {}",
+        recorded[0]["at"]
+    );
+}
+
+#[tokio::test]
+async fn an_action_that_never_reaches_herdr_leaves_no_trace_in_the_audit_log() {
+    // Acknowledging, paging and switching mode rearrange the deck's own view of herdr and change
+    // nothing in it. Recording those would bury the handful of lines that matter — and would put
+    // a line on disk for something that, from herdr's side, never happened.
+    let mock = mock_herdr(two_agents(AgentStatus::Done)).await;
+    let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(PLUS_DIALS as u8)).await;
+    frontend.read(1 + PLUS_KEYS + PLUS_DIALS).await;
+
+    // Key 1 is the `done` agent: holding it dismisses without focusing.
+    frontend.hold(1).await;
+    // ...and scrubbing a dial only moves a cursor.
+    frontend
+        .send(json!({"type": "dial_rotate", "dial": 0, "ticks": 1}))
+        .await;
+    frontend.drain_to_pong().await;
+
+    assert!(
+        mock.agent_focus_targets().await.is_empty(),
+        "precondition: nothing should have reached herdr"
+    );
+    assert!(
+        daemon.audit_lines().await.is_empty(),
+        "the log is for commands, not for the deck rearranging itself"
+    );
+}
+
+#[tokio::test]
+async fn a_dial_press_is_audited_even_though_there_is_no_key_to_report_it_on() {
+    // A dial carries no key index, so its outcome never reaches the deck's face. That is exactly
+    // the press the log is most worth having: the only other record of it is a window that may or
+    // may not have moved.
+    let mock = mock_herdr(two_agents(AgentStatus::Idle)).await;
+    let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(PLUS_DIALS as u8)).await;
+    frontend.read(1 + PLUS_KEYS + PLUS_DIALS).await;
+
+    // Dial 0 scrubs agents and its press focuses whichever one the cursor is on.
+    frontend.send(json!({"type": "dial_down", "dial": 0})).await;
+    frontend.drain_to_pong().await;
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded.len(), 1, "got {recorded:?}");
+    assert_eq!(recorded[0]["command"], "focus_pane");
+    assert_eq!(recorded[0]["target"], "w1:p9");
 }
 
 #[tokio::test]

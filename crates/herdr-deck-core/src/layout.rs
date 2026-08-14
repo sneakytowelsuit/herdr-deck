@@ -13,6 +13,7 @@
 //! - **No display at all** (Pedal) → keys act, nothing renders.
 
 use crate::capabilities::DeckCapabilities;
+use crate::command::DeckCommand;
 use crate::render::Tile;
 use crate::state::{Acknowledged, DeckState};
 use herdr_deck_herdr::wire::AgentInfo;
@@ -85,6 +86,15 @@ pub enum KeyBinding {
     PinnedWorkspace {
         workspace_id: String,
     },
+    /// One herdr command, spelled out in config.
+    ///
+    /// The escape hatch for everything the derived layout does not offer: a key bound straight to
+    /// a [`DeckCommand`], with no list, no page and no cursor behind it. It is also how a
+    /// destructive command would ever reach a key, which is why the guard lives on the action
+    /// rather than on the bindings that happen to produce one today.
+    Command {
+        command: DeckCommand,
+    },
     /// Jump straight to the top-ranked agent that wants you.
     NextAttention,
     /// Switch between agents and workspaces.
@@ -108,19 +118,24 @@ pub enum DialBinding {
 }
 
 /// The action to perform when a control is pressed.
+///
+/// Two kinds of thing live here, and the split is the point. [`SlotAction::Command`] leaves the
+/// daemon and reaches herdr; everything else is the deck rearranging its own view and never
+/// touches herdr at all. Only the first kind is audited, and only the first kind can be
+/// destructive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotAction {
+    /// Ask herdr for something. One variant, however many commands there come to be.
+    Command(DeckCommand),
     /// Focus an agent: herdr focus **and** raise the terminal window.
+    ///
+    /// Deliberately not a [`DeckCommand`]: the deck binds agents by the stable `terminal_id` and
+    /// herdr focuses *panes*, so this is the one action carrying a target herdr would not accept.
+    /// The daemon resolves it against live state at the moment the key is released, which is what
+    /// lets a vanished agent be reported rather than guessed at — and what stops an unresolved
+    /// target ever reaching the socket.
     FocusAgent {
         terminal_id: String,
-    },
-    FocusWorkspace {
-        workspace_id: String,
-    },
-    /// Focus one tab. Distinct from [`SlotAction::FocusWorkspace`] because a workspace holds
-    /// many tabs, and landing on the workspace's current one is not where the user pointed.
-    FocusTab {
-        tab_id: String,
     },
     /// Dismiss an agent from the attention queue. Pointedly **not** a focus: herdr is never
     /// called and no window moves, which is the entire reason this gesture exists.
@@ -135,8 +150,48 @@ pub enum SlotAction {
         target: ScrubTarget,
         delta: i32,
     },
+    /// The control was pressed, will not act, and says why on its own face.
+    ///
+    /// A key that goes quiet reads as broken hardware. This is the difference between "nothing is
+    /// bound here" and "I heard you, and here is what you have to do instead".
+    Refuse {
+        message: String,
+    },
     /// Nothing bound, or nothing there right now.
     None,
+}
+
+impl SlotAction {
+    /// The command this action would send to herdr, if any.
+    fn command(&self) -> Option<&DeckCommand> {
+        match self {
+            SlotAction::Command(command) => Some(command),
+            _ => None,
+        }
+    }
+
+    fn is_destructive(&self) -> bool {
+        self.command().is_some_and(DeckCommand::is_destructive)
+    }
+}
+
+/// The destructive-action guard, on the way to a control that acts the instant it is pressed.
+///
+/// Anything that can destroy work is taken off the tap and put on the hold — the gesture this
+/// deck already uses for "I mean this" — and the tap says so out loud. There is exactly one
+/// confirmation idiom on this hardware and this is it; a second one would be a second thing for
+/// the user to learn and a second thing to get wrong under the finger.
+///
+/// Applied to the *action*, not to the bindings that produce one. A command added later is
+/// guarded on the day it is added, whether it arrives from a derived layout, a pinned key or a
+/// hand-written config.
+fn guard_tap(action: SlotAction) -> SlotAction {
+    match &action {
+        SlotAction::Command(command) if command.is_destructive() => SlotAction::Refuse {
+            message: format!("hold to {}", command.label()),
+        },
+        _ => action,
+    }
 }
 
 /// Where each scrub cursor currently sits.
@@ -402,6 +457,16 @@ impl<'a> ResolvedDeck<'a> {
                 .workspace_by_id(workspace_id)
                 .map(workspace_tile)
                 .unwrap_or(Tile::Empty),
+            // A destructive key wears its gesture, because the guard is no use to someone who
+            // only discovers it by pressing.
+            KeyBinding::Command { command } => Tile::Mode {
+                label: if command.is_destructive() {
+                    format!("hold: {}", command.label())
+                } else {
+                    command.label().to_string()
+                },
+                active: true,
+            },
             KeyBinding::NextAttention => Tile::Attention {
                 count: self.attention_count(),
             },
@@ -442,6 +507,11 @@ impl<'a> ResolvedDeck<'a> {
 
     /// What pressing key `index` should do.
     pub fn key_action(&self, index: usize) -> SlotAction {
+        guard_tap(self.bound_key_action(index))
+    }
+
+    /// What key `index` is bound to, before the guard has had its say.
+    fn bound_key_action(&self, index: usize) -> SlotAction {
         if self.state.is_offline() {
             return SlotAction::None;
         }
@@ -459,9 +529,12 @@ impl<'a> ResolvedDeck<'a> {
                     SlotAction::None
                 }
             }
-            KeyBinding::PinnedWorkspace { workspace_id } => SlotAction::FocusWorkspace {
-                workspace_id: workspace_id.clone(),
-            },
+            KeyBinding::PinnedWorkspace { workspace_id } => {
+                SlotAction::Command(DeckCommand::FocusWorkspace {
+                    workspace_id: workspace_id.clone(),
+                })
+            }
+            KeyBinding::Command { command } => SlotAction::Command(command.clone()),
             KeyBinding::NextAttention => self
                 .needing_attention()
                 .next()
@@ -492,8 +565,10 @@ impl<'a> ResolvedDeck<'a> {
                 .state
                 .workspaces
                 .get(index)
-                .map(|w| SlotAction::FocusWorkspace {
-                    workspace_id: w.workspace_id.clone(),
+                .map(|w| {
+                    SlotAction::Command(DeckCommand::FocusWorkspace {
+                        workspace_id: w.workspace_id.clone(),
+                    })
                 })
                 .unwrap_or(SlotAction::None),
         }
@@ -501,15 +576,22 @@ impl<'a> ResolvedDeck<'a> {
 
     /// What *holding* key `index` should do.
     ///
-    /// Only keys that name an agent have a second action. Acknowledging is a statement about one
-    /// agent — there is nothing a page key or a mode toggle could mean by it — so every other
-    /// binding deliberately reports nothing rather than growing a gesture nobody asked for.
+    /// Two things claim a hold. A destructive command, which the guard moved here off the tap;
+    /// and acknowledging an agent, which is a statement about one agent — there is nothing a page
+    /// key or a mode toggle could mean by it. Every other binding deliberately reports nothing
+    /// rather than growing a gesture nobody asked for.
     ///
     /// A [`SlotAction::None`] here is also what tells the daemon a key is a plain one, and so may
     /// keep acting the instant it is pressed.
     pub fn key_long_press_action(&self, index: usize) -> SlotAction {
         if self.state.is_offline() {
             return SlotAction::None;
+        }
+        // The hold is where the guard put a destructive command, so it outranks anything else the
+        // key might have offered — and a key showing one is not showing an agent anyway.
+        let bound = self.bound_key_action(index);
+        if bound.is_destructive() {
+            return bound;
         }
         // Only an agent that is actually asking for attention can be dismissed. Storing an
         // acknowledgement for a working agent would do nothing visible now but arm a mute for
@@ -549,7 +631,14 @@ impl<'a> ResolvedDeck<'a> {
     }
 
     /// Pressing a dial focuses whatever its cursor is on.
+    ///
+    /// A dial has no hold — the daemon ignores its release — so the guard here can only refuse.
+    /// That is the honest answer: there is no gesture on an encoder that means "I am sure".
     pub fn dial_press_action(&self, dial: usize) -> SlotAction {
+        guard_tap(self.bound_dial_press_action(dial))
+    }
+
+    fn bound_dial_press_action(&self, dial: usize) -> SlotAction {
         if self.state.is_offline() {
             return SlotAction::None;
         }
@@ -575,16 +664,20 @@ impl<'a> ResolvedDeck<'a> {
                 .state
                 .workspaces
                 .get(cursor)
-                .map(|w| SlotAction::FocusWorkspace {
-                    workspace_id: w.workspace_id.clone(),
+                .map(|w| {
+                    SlotAction::Command(DeckCommand::FocusWorkspace {
+                        workspace_id: w.workspace_id.clone(),
+                    })
                 })
                 .unwrap_or(SlotAction::None),
             ScrubTarget::Tabs => self
                 .state
                 .tabs
                 .get(cursor)
-                .map(|t| SlotAction::FocusTab {
-                    tab_id: t.tab_id.clone(),
+                .map(|t| {
+                    SlotAction::Command(DeckCommand::FocusTab {
+                        tab_id: t.tab_id.clone(),
+                    })
                 })
                 .unwrap_or(SlotAction::None),
         }
@@ -899,6 +992,127 @@ mod tests {
         }
     }
 
+    // --- The destructive-action guard --------------------------------------------------------
+    //
+    // Nothing this deck can currently do destroys anything, so these run against a stub command
+    // that claims to. That is the point of having them now: the guard is proven before the first
+    // command that could lose someone's work is wired to a key, rather than alongside it.
+
+    /// A deck whose only key is bound to a command that claims it destroys work.
+    fn destructive_profile() -> Profile {
+        Profile {
+            keys: vec![KeyBinding::Command {
+                command: DeckCommand::DestructiveStub,
+            }],
+            dials: vec![DialBinding::Scrub {
+                target: ScrubTarget::Workspaces,
+            }],
+        }
+    }
+
+    #[test]
+    fn tapping_a_destructive_key_refuses_out_loud_instead_of_doing_it() {
+        let profile = destructive_profile();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        match deck.key_action(0) {
+            SlotAction::Refuse { message } => assert!(
+                message.contains("hold"),
+                "the refusal has to name the gesture that would work, got {message:?}"
+            ),
+            other => panic!("a tap must not carry the command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn holding_a_destructive_key_is_what_actually_issues_the_command() {
+        // The other half of the same bargain: guarding a command is only defensible if there is
+        // still a way to mean it.
+        let profile = destructive_profile();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::Command(DeckCommand::DestructiveStub)
+        );
+    }
+
+    #[test]
+    fn a_destructive_key_says_so_before_it_is_ever_pressed() {
+        // A guard nobody can see is a key that appears to be broken the first time it is tapped.
+        let profile = destructive_profile();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        match deck.tile(0) {
+            Tile::Mode { label, .. } => assert!(label.contains("hold"), "got {label:?}"),
+            other => panic!("expected a labelled key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_command_key_still_acts_on_the_tap_and_claims_no_hold() {
+        // The guard must cost nothing to everything that is not dangerous, or every key on the
+        // deck slowly becomes a hold.
+        let profile = Profile {
+            keys: vec![KeyBinding::Command {
+                command: DeckCommand::FocusWorkspace {
+                    workspace_id: "w2".into(),
+                },
+            }],
+            dials: vec![],
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_action(0),
+            SlotAction::Command(DeckCommand::FocusWorkspace {
+                workspace_id: "w2".into()
+            })
+        );
+        assert_eq!(deck.key_long_press_action(0), SlotAction::None);
+    }
+
+    #[test]
+    fn a_dial_press_refuses_a_destructive_command_because_an_encoder_has_no_hold() {
+        // The daemon ignores a dial's release, so there is no gesture here that could mean "I am
+        // sure". Performing it anyway would put the one unguarded path in the product on the
+        // control that is easiest to knock.
+        let profile = Profile {
+            keys: vec![],
+            dials: vec![DialBinding::Scrub {
+                target: ScrubTarget::Workspaces,
+            }],
+        };
+        let mut state = state_with(vec![]);
+        state.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w2".into(),
+            ..Default::default()
+        }];
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        // The dial's own binding is harmless, so it still acts...
+        assert_eq!(
+            deck.dial_press_action(0),
+            SlotAction::Command(DeckCommand::FocusWorkspace {
+                workspace_id: "w2".into()
+            })
+        );
+        // ...and the guard is what a destructive one would meet.
+        assert!(matches!(
+            guard_tap(SlotAction::Command(DeckCommand::DestructiveStub)),
+            SlotAction::Refuse { .. }
+        ));
+    }
+
     #[test]
     fn an_acknowledged_agent_stops_counting_towards_the_attention_key() {
         let caps = DeckModel::Plus.capabilities();
@@ -1209,9 +1423,9 @@ mod tests {
         );
         assert_eq!(
             deck.key_action(0),
-            SlotAction::FocusWorkspace {
+            SlotAction::Command(DeckCommand::FocusWorkspace {
                 workspace_id: "w2".into()
-            }
+            })
         );
         assert!(matches!(deck.tile(0), Tile::Workspace { .. }));
     }
@@ -1316,9 +1530,9 @@ mod tests {
         let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
         assert_eq!(
             deck.dial_press_action(2),
-            SlotAction::FocusTab {
+            SlotAction::Command(DeckCommand::FocusTab {
                 tab_id: "w1:t2".into()
-            }
+            })
         );
     }
 

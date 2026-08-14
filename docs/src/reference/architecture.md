@@ -78,6 +78,71 @@ Three details make it hold up:
 Each tile is hashed. A reconcile that produces identical tiles sends nothing at all, so the
 safety-net timer does not repaint the deck twice a second forever.
 
+## One command, carried end to end
+
+Everything the deck asks herdr to *do* is a `DeckCommand`. A control decides which one it means,
+the daemon performs it, the audit log records it — and all three handle the same value rather
+than translating it into a shape of their own on the way past.
+
+```text
+   key or dial            daemon                    socket
+  ┌───────────┐      ┌──────────────┐        ┌──────────────────┐
+  │ SlotAction├─────►│ PendingAction├───────►│ focus engine     │
+  │ ::Command │      │ { command,   │        │ one match, one   │
+  └───────────┘      │   key }      │        │ call per command │
+                     └──────┬───────┘        └──────────────────┘
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │  audit log   │
+                     └──────────────┘
+```
+
+Adding a command means a variant and an arm where commands are performed. It deliberately does
+**not** mean a new match arm in every layer it passes through, which is what a control surface
+with fifteen commands would otherwise cost.
+
+Two things are kept out of that vocabulary on purpose:
+
+- **herdr's method names.** A command names an intent; `herdr-deck-herdr` decides what that
+  becomes on the wire.
+- **Agent focus before it is resolved.** The deck binds agents by their stable `terminal_id` and
+  herdr focuses *panes*, so agent focus stays a `SlotAction` until the daemon resolves it against
+  live state at the moment the key is released. An unresolved target therefore cannot reach the
+  socket, and an agent that vanished between paint and press is reported rather than guessed at.
+
+## Reads are polled, writes are commands
+
+The watcher re-reads `session.snapshot` on a timer whether or not anyone touches the deck, so a
+read is never something a user did. A command always is. That split is why the audit log records
+every command and no read: dismissing an agent from the attention queue, changing page or turning
+a dial rearranges the deck's own view of herdr and leaves no line, because from herdr's side
+nothing happened.
+
+## The audit log
+
+One JSONL line per command actually issued, in `commands.jsonl` under the daemon's state
+directory — timestamp, command, target id, outcome. It rotates once at a quarter of a megabyte,
+so it is bounded at twice that and never needs thinking about.
+
+It is written on a task of its own behind a bounded channel: a slow or full disk costs audit
+lines, never key latency, and a dropped line says so in the daemon's log rather than leaving an
+unmarked hole. A line carries ids and a closed vocabulary of outcomes, never a label, window
+title or working directory — a trail that quoted those would be a file to guard like a secret
+rather than one to read like a log.
+
+## One confirmation idiom
+
+A long press already means "I am sure" on this deck: it is how an agent is dismissed from the
+attention queue without focusing it. Anything that could destroy work therefore fires from a hold
+and never from a tap, the key wears `hold:` on its face, and tapping it says so rather than going
+quiet. Guarding is a property of the command, not of the key, so it cannot be bypassed by binding
+one by hand — and it applies the day a new command is added rather than the day someone remembers.
+
+A dial has no hold, since the daemon ignores an encoder's release. A destructive command on a
+dial is refused outright, which is the honest answer: there is no gesture there that means "I am
+sure".
+
 ## The crates
 
 | Crate | Responsibility |

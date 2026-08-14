@@ -23,6 +23,7 @@ use std::time::Duration;
 pub use backend::{Backend, CommandSpec, WindowTarget};
 pub use detect::{detect, detect_or_override, FocusEnv, TargetOs};
 
+use herdr_deck_core::command::DeckCommand;
 use herdr_deck_core::config::FocusConfig;
 use herdr_deck_herdr::HerdrClient;
 
@@ -31,6 +32,12 @@ use herdr_deck_herdr::HerdrClient;
 /// A wedged `hyprctl` must never stall the deck's event loop.
 const RAISE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// What the deck says when it asks herdr whether anyone is attached.
+///
+/// A canned string, because a deck has no keyboard and because this ends up in front of the user
+/// when a client *is* attached — in which case it is a true and useful thing to have said.
+const NO_CLIENT_PROBE: &str = "herdr-deck: could not raise the window";
+
 /// What happened when we tried to raise a window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaiseOutcome {
@@ -38,6 +45,12 @@ pub enum RaiseOutcome {
     Raised { via: String },
     /// Every command ran but none matched a window.
     NotFound,
+    /// There is no window because nothing is attached to herdr.
+    ///
+    /// Not a failure. herdr owns the focus, not its clients: it moved, it persists, and the next
+    /// terminal to attach opens on that pane. Reporting this as an error would teach people to
+    /// ignore the deck's alerts, which is the one thing this hardware cannot afford.
+    NoClient,
     /// This environment has no usable mechanism.
     Unsupported { reason: String },
     /// The backend's tools are missing.
@@ -58,11 +71,52 @@ impl RaiseOutcome {
             RaiseOutcome::NotFound => {
                 "herdr focused, but no matching terminal window was found".to_string()
             }
+            RaiseOutcome::NoClient => {
+                "herdr focused it; nothing is attached, so it waits for the next one".to_string()
+            }
             RaiseOutcome::Unsupported { reason } => reason.clone(),
             RaiseOutcome::ToolMissing { program } => {
                 format!("herdr focused, but `{program}` is not installed to raise the window")
             }
             RaiseOutcome::Disabled => "herdr focused (window raising is disabled)".to_string(),
+        }
+    }
+}
+
+/// How much of what the user asked for actually happened.
+///
+/// Three outcomes rather than two, because "not everything happened" and "something went wrong"
+/// are different things and a key that conflates them is a key whose alerts stop meaning
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusVerdict {
+    /// herdr focused it and the window came forward.
+    Complete,
+    /// herdr focused it, and there was nothing further that could be done.
+    ///
+    /// Nothing is attached to raise, so herdr's focus is the whole of the journey available: it
+    /// persists, and the next client to attach opens there. Everything that *could* happen did,
+    /// which is why this must not read as a failure.
+    Settled,
+    /// herdr focused it, but the window did not come forward and could have.
+    Partial,
+    /// herdr did not focus it, so nothing happened at all.
+    Failed,
+}
+
+impl FocusVerdict {
+    /// Should the key flash an alert?
+    pub fn is_error(self) -> bool {
+        matches!(self, FocusVerdict::Partial | FocusVerdict::Failed)
+    }
+
+    /// A stable word for the audit log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FocusVerdict::Complete => "complete",
+            FocusVerdict::Settled => "settled",
+            FocusVerdict::Partial => "partial",
+            FocusVerdict::Failed => "failed",
         }
     }
 }
@@ -78,13 +132,26 @@ pub struct FocusReport {
 }
 
 impl FocusReport {
+    /// How much of the two-step focus happened.
+    pub fn verdict(&self) -> FocusVerdict {
+        if !self.herdr_focused || self.error.is_some() {
+            return FocusVerdict::Failed;
+        }
+        match self.raise {
+            RaiseOutcome::Raised { .. } => FocusVerdict::Complete,
+            RaiseOutcome::NoClient => FocusVerdict::Settled,
+            _ => FocusVerdict::Partial,
+        }
+    }
+
     /// Did everything the user asked for actually happen?
     ///
     /// Deliberately strict: focusing herdr without raising the window is a *partial* success,
     /// and the deck flashes an alert for it so the user is never left wondering why nothing
-    /// appeared to happen.
+    /// appeared to happen. Use [`FocusReport::verdict`] to tell that apart from the case where
+    /// there was no window to raise in the first place.
     pub fn fully_succeeded(&self) -> bool {
-        self.herdr_focused && self.raise.succeeded()
+        self.verdict() == FocusVerdict::Complete
     }
 
     pub fn describe(&self) -> String {
@@ -252,33 +319,51 @@ impl<R: CommandRunner> FocusEngine<R> {
         }
     }
 
+    /// Perform one command.
+    ///
+    /// The single place a [`DeckCommand`] becomes something that happens. Adding a command means
+    /// an arm here and a call in `herdr-deck-herdr`; nothing between the key and this function
+    /// has to learn what the new command is.
+    pub async fn perform(&self, command: &DeckCommand) -> FocusReport {
+        match command {
+            DeckCommand::FocusPane { pane_id } => self.focus_agent(pane_id).await,
+            DeckCommand::FocusWorkspace { workspace_id } => {
+                self.focus_workspace(workspace_id).await
+            }
+            DeckCommand::FocusTab { tab_id } => self.focus_tab(tab_id).await,
+        }
+    }
+
     /// Focus an agent: switch herdr's active pane, then raise the terminal window.
     ///
     /// `target` is an agent name or a **pane id** — herdr's `agent.focus` does not accept a
     /// `terminal_id`, so callers holding a stable terminal id must resolve it against current
     /// state first.
+    ///
+    /// One call, and only one: herdr walks workspace → tab → pane itself and follows zoom while
+    /// it does, so there is deliberately no workspace or tab focus around this.
     pub async fn focus_agent(&self, target: &str) -> FocusReport {
-        match self.client.agent_focus(target).await {
-            Ok(()) => FocusReport {
-                herdr_focused: true,
-                raise: self.raise_window().await,
-                error: None,
-            },
-            Err(e) => FocusReport {
-                herdr_focused: false,
-                raise: RaiseOutcome::Disabled,
-                error: Some(e.to_string()),
-            },
-        }
+        self.report(self.client.agent_focus(target).await).await
     }
 
     pub async fn focus_workspace(&self, workspace_id: &str) -> FocusReport {
-        match self.client.workspace_focus(workspace_id).await {
+        self.report(self.client.workspace_focus(workspace_id).await)
+            .await
+    }
+
+    pub async fn focus_tab(&self, tab_id: &str) -> FocusReport {
+        self.report(self.client.tab_focus(tab_id).await).await
+    }
+
+    /// Turn "herdr said yes or no" into the two-step report, raising the window when it said yes.
+    async fn report(&self, focused: herdr_deck_herdr::Result<()>) -> FocusReport {
+        match focused {
             Ok(()) => FocusReport {
                 herdr_focused: true,
-                raise: self.raise_window().await,
+                raise: self.raise_or_explain().await,
                 error: None,
             },
+            // Raising a window for a focus that did not happen would show the user the wrong pane.
             Err(e) => FocusReport {
                 herdr_focused: false,
                 raise: RaiseOutcome::Disabled,
@@ -287,18 +372,25 @@ impl<R: CommandRunner> FocusEngine<R> {
         }
     }
 
-    pub async fn focus_tab(&self, tab_id: &str) -> FocusReport {
-        match self.client.tab_focus(tab_id).await {
-            Ok(()) => FocusReport {
-                herdr_focused: true,
-                raise: self.raise_window().await,
-                error: None,
-            },
-            Err(e) => FocusReport {
-                herdr_focused: false,
-                raise: RaiseOutcome::Disabled,
-                error: Some(e.to_string()),
-            },
+    /// Raise the window, and work out whether "no window" means there was never one to find.
+    ///
+    /// Only asked when the raise matched nothing, because that is the only outcome the answer
+    /// changes — and because the question costs a round trip and, when a client *is* attached,
+    /// a toast the user did not ask for. A headless herdr answers `no_foreground_client`, which
+    /// turns a reported failure into the honest "focused, and it will be there when you attach".
+    /// Anything else, including the probe itself failing, leaves the original verdict alone.
+    async fn raise_or_explain(&self) -> RaiseOutcome {
+        let outcome = self.raise_window().await;
+        if outcome != RaiseOutcome::NotFound {
+            return outcome;
+        }
+        match self.client.notification_show(NO_CLIENT_PROBE, None).await {
+            Ok(reason) if reason == "no_foreground_client" => RaiseOutcome::NoClient,
+            Ok(_) => outcome,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not ask herdr whether a client is attached");
+                outcome
+            }
         }
     }
 
@@ -669,6 +761,114 @@ mod tests {
         assert!(report.fully_succeeded());
         let params = mock.observed_params("workspace.focus").await.unwrap();
         assert_eq!(params["workspace_id"], "w2");
+    }
+
+    // --- Focusing a herdr nobody is looking at ------------------------------------------------
+    //
+    // herdr owns the focus, not its clients: a headless server still moves it, still persists it,
+    // and the next terminal to attach opens on that pane. So the raise finding no window is only
+    // a failure when there was a window to find.
+
+    #[tokio::test]
+    async fn focusing_with_nothing_attached_to_herdr_is_a_settled_outcome_and_not_a_failure() {
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.without_attached_client().await;
+        // Every raise command runs and matches nothing, because there is no window to match.
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Failed)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        let report = engine.focus_agent("w1:p1").await;
+        assert!(report.herdr_focused);
+        assert_eq!(report.raise, RaiseOutcome::NoClient);
+        assert_eq!(
+            report.verdict(),
+            FocusVerdict::Settled,
+            "there was nothing more that could have been done, so nothing was left undone"
+        );
+        assert!(
+            !report.verdict().is_error(),
+            "a key that alerted here would be crying wolf, and people stop reading alerts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_that_is_merely_hidden_is_still_reported_as_a_partial_focus() {
+        // The distinction the whole outcome rests on: a client *is* attached, so there was a
+        // window that should have come forward and did not. That is a real failure to report.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Failed)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner).await;
+
+        let report = engine.focus_agent("w1:p1").await;
+        assert_eq!(report.raise, RaiseOutcome::NotFound);
+        assert_eq!(report.verdict(), FocusVerdict::Partial);
+        assert!(report.verdict().is_error());
+    }
+
+    #[tokio::test]
+    async fn herdr_is_only_asked_who_is_attached_when_the_window_could_not_be_found() {
+        // The question costs a round trip and, when a client is attached, a toast. Asking it on
+        // every successful focus would put one in front of the user for nothing.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner).await;
+
+        assert!(engine.focus_agent("w1:p1").await.fully_succeeded());
+        assert_eq!(mock.call_count("notification.show").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_focus_reaches_herdr_as_exactly_one_call_and_never_chains_a_workspace_or_tab_around_it(
+    ) {
+        // herdr walks workspace → tab → pane itself from `agent.focus`, marks the tab seen and
+        // follows zoom. Helpfully "preparing the way" with a workspace focus first would make
+        // three round trips of a journey herdr does atomically, and fight its own logic.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner).await;
+
+        engine
+            .perform(&DeckCommand::FocusPane {
+                pane_id: "w1:p1".into(),
+            })
+            .await;
+
+        assert_eq!(mock.agent_focus_targets().await, vec!["w1:p1".to_string()]);
+        assert!(mock.workspace_focus_ids().await.is_empty());
+        assert!(mock.tab_focus_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_command_the_deck_knows_reaches_herdr() {
+        // One arm per command, in one place. This is the test that fails when a command is added
+        // to the vocabulary and never wired to anything.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner).await;
+
+        for command in [
+            DeckCommand::FocusPane {
+                pane_id: "w1:p1".into(),
+            },
+            DeckCommand::FocusWorkspace {
+                workspace_id: "w2".into(),
+            },
+            DeckCommand::FocusTab {
+                tab_id: "w1:t2".into(),
+            },
+        ] {
+            let report = engine.perform(&command).await;
+            assert!(
+                report.herdr_focused,
+                "{} did not reach herdr: {report:?}",
+                command.name()
+            );
+        }
     }
 
     #[tokio::test]

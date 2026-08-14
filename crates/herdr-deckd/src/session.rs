@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use herdr_deck_core::capabilities::DeckCapabilities;
+use herdr_deck_core::command::DeckCommand;
 use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
 use herdr_deck_core::protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 use herdr_deck_core::render::{Tile, TileRenderer};
@@ -30,22 +31,17 @@ use base64::Engine as _;
 const LONG_PRESS: Duration = Duration::from_millis(500);
 
 /// Something the connection loop must do asynchronously.
+///
+/// One command and the control that asked for it — not one variant per command. Everything a key
+/// can ask herdr for arrives here in the same shape, which is what keeps adding a command to a
+/// vocabulary rather than to four match statements.
+///
+/// `key` is the key to report back on; a dial press has no face to flash, so it carries `None`
+/// and the outcome goes to the log instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingAction {
-    /// Focus an agent. `pane_id` is already resolved from the stable `terminal_id`, because
-    /// herdr's `agent.focus` does not accept terminal ids.
-    FocusAgent {
-        pane_id: String,
-        key: Option<usize>,
-    },
-    FocusWorkspace {
-        workspace_id: String,
-        key: Option<usize>,
-    },
-    FocusTab {
-        tab_id: String,
-        key: Option<usize>,
-    },
+pub struct PendingAction {
+    pub command: DeckCommand,
+    pub key: Option<usize>,
 }
 
 /// What a frontend message produced.
@@ -270,6 +266,12 @@ impl Session {
         match action {
             SlotAction::None => Outcome::default(),
 
+            // Already in herdr's own terms, so there is nothing to resolve: hand it on.
+            SlotAction::Command(command) => Outcome {
+                messages: vec![],
+                action: Some(PendingAction { command, key }),
+            },
+
             SlotAction::FocusAgent { terminal_id } => {
                 // Resolve the stable terminal id to the pane id herdr's focus API wants. If the
                 // agent vanished between paint and press, do nothing rather than focus whatever
@@ -277,13 +279,24 @@ impl Session {
                 match state.agent_by_terminal_id(&terminal_id) {
                     Some(agent) => Outcome {
                         messages: vec![],
-                        action: Some(PendingAction::FocusAgent {
-                            pane_id: agent.pane_id.clone(),
+                        action: Some(PendingAction {
+                            command: DeckCommand::FocusPane {
+                                pane_id: agent.pane_id.clone(),
+                            },
                             key,
                         }),
                     },
                     None => Outcome::just(alert(key, "that agent is gone")),
                 }
+            }
+
+            // The guard, or anything else that decided not to act, saying why. A dial has no face
+            // to say it on, so that goes to the log rather than nowhere.
+            SlotAction::Refuse { message } => {
+                if key.is_none() {
+                    tracing::info!(%message, "a control declined to act");
+                }
+                Outcome::just(alert(key, &message))
             }
 
             // The point of this action is what it does *not* do: no herdr call, no window raised,
@@ -301,19 +314,6 @@ impl Session {
                     None => Outcome::just(alert(key, "that agent is gone")),
                 }
             }
-
-            SlotAction::FocusWorkspace { workspace_id } => Outcome {
-                messages: vec![],
-                action: Some(PendingAction::FocusWorkspace { workspace_id, key }),
-            },
-
-            // Tab ids are already what herdr's focus API wants, so unlike an agent there is
-            // nothing to resolve here; a tab that closed under us surfaces as an alert from the
-            // failed call rather than being guessed at.
-            SlotAction::FocusTab { tab_id } => Outcome {
-                messages: vec![],
-                action: Some(PendingAction::FocusTab { tab_id, key }),
-            },
 
             SlotAction::ToggleMode => {
                 self.mode = self.mode.toggled();
@@ -519,6 +519,16 @@ mod tests {
         Session::new(&plus_device(), &Config::default(), renderer())
     }
 
+    /// The command a key press should have produced to take the user to `pane_id`.
+    fn focus_pane(pane_id: &str, key: Option<usize>) -> PendingAction {
+        PendingAction {
+            command: DeckCommand::FocusPane {
+                pane_id: pane_id.to_string(),
+            },
+            key,
+        }
+    }
+
     fn key_indices(messages: &[DaemonMessage]) -> Vec<usize> {
         messages
             .iter()
@@ -591,13 +601,7 @@ mod tests {
             &during,
             down + Duration::from_millis(50),
         );
-        assert_eq!(
-            released.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-alice".into(),
-                key: Some(0)
-            })
-        );
+        assert_eq!(released.action, Some(focus_pane("w1:pane-alice", Some(0))));
     }
 
     #[test]
@@ -916,13 +920,7 @@ mod tests {
         session.greet(&state);
 
         let outcome = tap(&mut session, 0, &state);
-        assert_eq!(
-            outcome.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-term_x".into(),
-                key: Some(0)
-            })
-        );
+        assert_eq!(outcome.action, Some(focus_pane("w1:pane-term_x", Some(0))));
     }
 
     // --- Long press ------------------------------------------------------------------------
@@ -965,10 +963,7 @@ mod tests {
         assert!(matches!(session.tile_at(0, &state), Tile::Agent { .. }));
         assert_eq!(
             tap(&mut session, 0, &state).action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-finished".into(),
-                key: Some(0)
-            })
+            Some(focus_pane("w1:pane-finished", Some(0)))
         );
     }
 
@@ -1241,13 +1236,7 @@ mod tests {
         );
 
         let outcome = send(&mut session, FrontendMessage::DialDown { dial: 0 }, &s);
-        assert_eq!(
-            outcome.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-second".into(),
-                key: None
-            })
-        );
+        assert_eq!(outcome.action, Some(focus_pane("w1:pane-second", None)));
     }
 
     #[test]
@@ -1278,8 +1267,10 @@ mod tests {
         let outcome = send(&mut session, FrontendMessage::DialDown { dial: 2 }, &s);
         assert_eq!(
             outcome.action,
-            Some(PendingAction::FocusTab {
-                tab_id: "w1:t2".into(),
+            Some(PendingAction {
+                command: DeckCommand::FocusTab {
+                    tab_id: "w1:t2".into()
+                },
                 key: None
             })
         );
@@ -1295,13 +1286,7 @@ mod tests {
             FrontendMessage::TouchTap { dial: Some(0) },
             &s,
         );
-        assert_eq!(
-            outcome.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-only".into(),
-                key: None
-            })
-        );
+        assert_eq!(outcome.action, Some(focus_pane("w1:pane-only", None)));
     }
 
     #[test]
@@ -1324,10 +1309,7 @@ mod tests {
         let outcome = send(&mut session, FrontendMessage::DialDown { dial: 0 }, &fewer);
         assert_eq!(
             outcome.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-a".into(),
-                key: None
-            }),
+            Some(focus_pane("w1:pane-a", None)),
             "a stale cursor must not select nothing"
         );
     }
@@ -1428,6 +1410,34 @@ mod tests {
     }
 
     #[test]
+    fn a_key_bound_straight_to_a_command_issues_it_and_needs_no_list_behind_it() {
+        // The path every command that is not a focus will arrive by: no agent, no cursor, no
+        // page — the key holds the command and the daemon hands it on unchanged.
+        let mut config = Config::default();
+        config.layout = Some(herdr_deck_core::config::LayoutOverride {
+            keys: vec![herdr_deck_core::layout::KeyBinding::Command {
+                command: DeckCommand::FocusTab {
+                    tab_id: "w1:t2".into(),
+                },
+            }],
+            dials: vec![],
+        });
+        let mut session = Session::new(&plus_device(), &config, renderer());
+        let s = state(vec![]);
+        session.greet(&s);
+
+        assert_eq!(
+            tap(&mut session, 0, &s).action,
+            Some(PendingAction {
+                command: DeckCommand::FocusTab {
+                    tab_id: "w1:t2".into()
+                },
+                key: Some(0)
+            })
+        );
+    }
+
+    #[test]
     fn pressing_a_pedal_still_focuses_the_top_attention_agent() {
         let pedal = DeviceReport {
             model: Some(DeckModel::Pedal),
@@ -1441,12 +1451,6 @@ mod tests {
         let mut session = Session::new(&pedal, &Config::default(), renderer());
         let s = state(vec![agent("stuck", AgentStatus::Blocked, 1)]);
         let outcome = send(&mut session, FrontendMessage::KeyDown { index: 0 }, &s);
-        assert_eq!(
-            outcome.action,
-            Some(PendingAction::FocusAgent {
-                pane_id: "w1:pane-stuck".into(),
-                key: Some(0)
-            })
-        );
+        assert_eq!(outcome.action, Some(focus_pane("w1:pane-stuck", Some(0))));
     }
 }

@@ -7,6 +7,7 @@
 //! The daemon is a library with a thin binary on top purely so the seam where these pieces meet
 //! — a real socket, a real watcher, a real session — can be driven from an integration test.
 
+pub mod audit;
 pub mod server;
 pub mod session;
 pub mod watcher;

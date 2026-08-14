@@ -14,6 +14,7 @@ use herdr_deck_core::Config;
 use herdr_deck_focus::FocusEngine;
 use herdr_deck_herdr::HerdrClient;
 
+use herdr_deckd::audit::AuditLog;
 use herdr_deckd::server::{self, ServerContext};
 use herdr_deckd::watcher::Watcher;
 
@@ -129,11 +130,25 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // A record of what the deck asked herdr to do. Not having somewhere to write it is a working
+    // deck with no trail, never a reason to refuse to start.
+    let audit = match AuditLog::default_path() {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "recording issued commands");
+            AuditLog::open(path)
+        }
+        None => {
+            tracing::warn!("no state directory: commands will not be recorded");
+            AuditLog::disabled()
+        }
+    };
+
     let context = Arc::new(ServerContext {
         config,
         renderer,
         focus: Arc::new(focus),
         state,
+        audit: Arc::new(audit),
     });
 
     // Remove the socket on the way out so the next start does not have to reclaim it.
