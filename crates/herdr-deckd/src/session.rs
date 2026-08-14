@@ -100,28 +100,7 @@ impl Session {
     /// Build a session from a frontend's `hello`.
     pub fn new(device: &DeviceReport, config: &Config, renderer: Arc<TileRenderer>) -> Self {
         let capabilities = device.to_capabilities();
-        let profile = match &config.layout {
-            // A hand-written layout is used verbatim, but never allowed to be shorter than the
-            // hardware — unbound trailing keys are explicitly empty rather than out of range.
-            Some(override_layout) if !override_layout.keys.is_empty() => {
-                let mut keys = override_layout.keys.clone();
-                keys.resize(
-                    capabilities.key_count(),
-                    herdr_deck_core::layout::KeyBinding::Empty,
-                );
-                let mut dials = override_layout.dials.clone();
-                dials.resize(
-                    capabilities.dials as usize,
-                    herdr_deck_core::layout::DialBinding::Unused,
-                );
-                Profile {
-                    keys,
-                    dials,
-                    presets: config.presets(),
-                }
-            }
-            _ => Profile::derive(&capabilities, config),
-        };
+        let profile = Profile::for_config(&capabilities, config);
         let key_count = profile.keys.len();
         let dial_count = profile.dials.len();
         Self {

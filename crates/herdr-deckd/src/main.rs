@@ -212,7 +212,9 @@ async fn shutdown_signal() {
 fn dry_run(config: &Config, dir: &std::path::Path, model_name: &str) -> anyhow::Result<()> {
     let model = parse_model(model_name)?;
     let capabilities: DeckCapabilities = model.capabilities();
-    let profile = Profile::for_capabilities(&capabilities);
+    // The layout this config would actually produce, so a dry run renders this machine's deck
+    // rather than the one it would have had with an empty config file.
+    let profile = Profile::for_config(&capabilities, config);
     let renderer = TileRenderer::new(config.theme);
     let state = sample_state();
 

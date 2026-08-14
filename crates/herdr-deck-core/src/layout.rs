@@ -334,7 +334,33 @@ impl Profile {
         Self::derive(caps, &Config::default())
     }
 
-    /// Build the default layout for this hardware and this config's presets.
+    /// The layout this hardware would actually get from this config.
+    ///
+    /// A hand-written layout replaces the derived one entirely, but is never allowed to be shorter
+    /// than the hardware — unbound trailing keys are explicitly empty rather than out of range.
+    ///
+    /// Lives here rather than in the daemon so that everything answering "what will my deck look
+    /// like" gives the same answer: the running session, `herdr-deck layout`, and a dry run all go
+    /// through this.
+    pub fn for_config(caps: &DeckCapabilities, config: &Config) -> Self {
+        match &config.layout {
+            Some(written) if !written.keys.is_empty() => {
+                let mut keys = written.keys.clone();
+                keys.resize(caps.key_count(), KeyBinding::Empty);
+                let mut dials = written.dials.clone();
+                dials.resize(caps.dials as usize, DialBinding::Unused);
+                Self {
+                    keys,
+                    dials,
+                    presets: config.presets(),
+                }
+            }
+            _ => Self::derive(caps, config),
+        }
+    }
+
+    /// Build the default layout for this hardware and this config's presets, ignoring any
+    /// hand-written one.
     ///
     /// The presets are an input to the *layout* and not only to the keys: a deck with room to
     /// spare grows one key per named layout, because a layout nobody can reach is one nobody

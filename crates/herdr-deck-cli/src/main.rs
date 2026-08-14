@@ -156,9 +156,9 @@ async fn status(config: &Config, session: Option<&str>, json: bool) -> anyhow::R
 fn layout(config: &Config, model: &str) -> anyhow::Result<()> {
     let model = parse_model(model)?;
     let capabilities = model.capabilities();
-    // Built from the config as well as the hardware, because named layouts earn keys of their own
-    // — printing a deck that ignored them would be printing a deck nobody has.
-    let profile = Profile::derive(&capabilities, config);
+    // The layout this deck would actually get, hand-written or derived. Printing the derived one
+    // regardless would be printing a deck nobody has the moment somebody writes a `[layout]`.
+    let profile = Profile::for_config(&capabilities, config);
 
     println!("{}\n", capabilities.describe());
     for (index, binding) in profile.keys.iter().enumerate() {
@@ -376,6 +376,28 @@ mod tests {
             layout(&Config::default(), model)
                 .unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
         }
+    }
+
+    #[test]
+    fn a_hand_written_layout_is_what_gets_printed_rather_than_the_one_it_replaced() {
+        // `herdr-deck layout` is the answer to "what will my deck do", asked before plugging it
+        // in. Printing the derived layout to somebody who has replaced it would answer a question
+        // they did not ask.
+        let config = Config::from_toml(
+            r#"
+            [layout]
+            keys = [{ kind = "new_worktree" }]
+            "#,
+        )
+        .unwrap();
+        let profile = Profile::for_config(&DeckModel::Plus.capabilities(), &config);
+        assert_eq!(profile.keys[0], KeyBinding::NewWorktree);
+        assert_eq!(
+            profile.keys.len(),
+            8,
+            "a short layout is padded, never left with keys that address nothing"
+        );
+        assert_eq!(profile.keys[1], KeyBinding::Empty);
     }
 
     #[test]
