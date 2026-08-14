@@ -67,9 +67,26 @@ pub enum Tile {
         focused: bool,
     },
     /// "N agents want you" — dark when nothing does.
-    Attention { count: usize },
-    /// A mode/page toggle.
-    Mode { label: String, active: bool },
+    ///
+    /// `away` says the deck is showing something other than the top of the agents page, which is
+    /// the only time this key's second job — bringing you back — is worth spelling out. On the
+    /// agents page with nothing waiting, "all clear" is the whole truth and an offer to go
+    /// somewhere you already are would be noise.
+    Attention { count: usize, away: bool },
+    /// Which page the deck is showing, and which one the next press goes to.
+    ///
+    /// `next` is `None` when there is nowhere else to go — a session with one workspace, no
+    /// worktrees and every command page already on keys of its own. The key then draws dim and
+    /// says only where you are, rather than promising a journey it cannot make.
+    Page {
+        current: String,
+        next: Option<String>,
+        /// Which screen of a page too long for the keys, when there is more than one.
+        screen: Option<(usize, usize)>,
+    },
+    /// A key with a word on it and nothing else: paging, scrubbing, and the commands whose target
+    /// no shape could name.
+    Label { label: String, active: bool },
     /// A key bound to one herdr command: a shape, and a word under it.
     Command {
         /// What the key does, said as a shape. This is the part meant to be read.
@@ -278,8 +295,13 @@ impl TileRenderer {
                     waiting: None,
                 },
             ),
-            Tile::Attention { count } => self.attention_svg(s, *count),
-            Tile::Mode { label, active } => self.mode_svg(s, label, *active),
+            Tile::Attention { count, away } => self.attention_svg(s, *count, *away),
+            Tile::Page {
+                current,
+                next,
+                screen,
+            } => self.page_svg(s, current, next.as_deref(), *screen),
+            Tile::Label { label, active } => self.label_svg(s, label, *active),
             Tile::Command {
                 glyph,
                 label,
@@ -432,7 +454,7 @@ impl TileRenderer {
         )
     }
 
-    fn attention_svg(&self, s: f32, count: usize) -> String {
+    fn attention_svg(&self, s: f32, count: usize, away: bool) -> String {
         let (bg, fg, accent) = if count == 0 {
             (
                 self.theme.neutral_background(),
@@ -443,7 +465,14 @@ impl TileRenderer {
             let style = self.theme.status(AgentStatus::Blocked);
             (style.background, style.foreground, style.accent)
         };
-        let caption = if count == 0 { "all clear" } else { "need you" };
+        // Three captions for one key, because it has one meaning with two halves and which half
+        // matters depends on where you are. Something waiting always wins: that is the sentence
+        // this deck exists to say.
+        let caption = match (count, away) {
+            (0, false) => "all clear",
+            (0, true) => "◀ agents",
+            _ => "need you",
+        };
         format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
 <rect width="{s}" height="{s}" fill="{bg}"/>
@@ -465,7 +494,67 @@ impl TileRenderer {
         )
     }
 
-    fn mode_svg(&self, s: f32, label: &str, active: bool) -> String {
+    /// Where you are, in bold; where the next press goes, underneath and quieter.
+    ///
+    /// Two sizes rather than two keys. The name of the current page is the larger because it is
+    /// the one glanced at — "which page am I on" is asked constantly and answered in a fraction of
+    /// a second, while "where does this go" is asked once a week. The screen counter sits in the
+    /// same corner and the same size as an agent tile's wait marker and a command tile's hold
+    /// marker: one place the eye goes for "there is more to this key than its face".
+    fn page_svg(
+        &self,
+        s: f32,
+        current: &str,
+        next: Option<&str>,
+        screen: Option<(usize, usize)>,
+    ) -> String {
+        let inner = s * 0.86;
+        let current_px = s * 0.19;
+        let next_px = s * 0.115;
+        let marker = match screen {
+            Some((at, of)) => format!(
+                r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{fs:.2}" fill="{c}" text-anchor="start" opacity="0.85">{at}/{of}</text>"##,
+                x = s * 0.06,
+                y = s * 0.175,
+                font = FONT_FAMILY,
+                fs = s * 0.10,
+                c = self.theme.dim_foreground(),
+            ),
+            None => String::new(),
+        };
+        let onward = match next {
+            Some(next) => format!(
+                r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{fs:.2}" fill="{c}" text-anchor="middle">▶ {text}</text>"##,
+                x = s / 2.0,
+                y = s * 0.76,
+                font = FONT_FAMILY,
+                fs = next_px,
+                c = self.theme.dim_foreground(),
+                text = escape(&truncate_to_width(next, inner * 0.8, next_px)),
+            ),
+            None => String::new(),
+        };
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
+<rect width="{s}" height="{s}" fill="{bg}"/>
+{marker}
+<text x="{cx:.2}" y="{cy:.2}" font-family="{font}" font-size="{fs:.2}" font-weight="bold" fill="{fg}" text-anchor="middle">{current}</text>
+{onward}
+</svg>"##,
+            s = s,
+            bg = self.theme.neutral_background(),
+            marker = marker,
+            cx = s / 2.0,
+            cy = s * 0.55,
+            font = FONT_FAMILY,
+            fs = current_px,
+            fg = self.theme.neutral_foreground(),
+            current = escape(&truncate_to_width(current, inner, current_px)),
+            onward = onward,
+        )
+    }
+
+    fn label_svg(&self, s: f32, label: &str, active: bool) -> String {
         let fg = if active {
             self.theme.neutral_foreground()
         } else {
@@ -1011,9 +1100,15 @@ mod tests {
                 status: AgentStatus::Working,
                 focused: false,
             },
-            Tile::Attention { count: 3 },
-            Tile::Attention { count: 0 },
-            Tile::Mode {
+            Tile::Attention {
+                count: 3,
+                away: false,
+            },
+            Tile::Attention {
+                count: 0,
+                away: false,
+            },
+            Tile::Label {
                 label: "agents".into(),
                 active: true,
             },

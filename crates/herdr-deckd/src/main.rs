@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use herdr_deck_core::capabilities::{DeckCapabilities, DeckModel};
-use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, Selection};
+use herdr_deck_core::layout::{Page, Profile, ResolvedDeck, Selection};
 use herdr_deck_core::render::TileRenderer;
 use herdr_deck_core::state::{Acknowledged, DeckState};
 use herdr_deck_core::Config;
@@ -225,7 +225,7 @@ fn dry_run(config: &Config, dir: &std::path::Path, model_name: &str) -> anyhow::
     let deck = ResolvedDeck::new(
         &profile,
         &state,
-        Mode::Agents,
+        Page::Agents,
         0,
         Selection::default(),
         &nothing_acknowledged,

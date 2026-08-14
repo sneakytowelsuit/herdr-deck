@@ -899,7 +899,10 @@ fn structure_config() -> Config {
             KeyBinding::NewWorktree,
             KeyBinding::CloseTab,
             KeyBinding::RemoveWorktree,
-            KeyBinding::Dynamic { rank: 0 },
+            KeyBinding::Dynamic {
+                rank: 0,
+                page: None,
+            },
         ],
         dials: vec![],
     });
@@ -1142,10 +1145,10 @@ async fn a_deck_with_worktrees_can_reach_them_from_the_mode_key_and_open_one() {
     frontend.read(1 + PLUS_KEYS).await;
 
     // Agents -> spaces -> trees. This frontend reports no dials, so it gets paging keys and the
-    // mode toggle lands at key 5.
-    frontend.tap(5).await;
+    // page key lands last, at key 7.
+    frontend.tap(7).await;
     frontend.drain_to_pong().await;
-    frontend.tap(5).await;
+    frontend.tap(7).await;
     frontend.drain_to_pong().await;
 
     frontend.tap(0).await;

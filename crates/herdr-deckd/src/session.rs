@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use herdr_deck_core::capabilities::DeckCapabilities;
 use herdr_deck_core::command::DeckCommand;
-use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
+use herdr_deck_core::layout::{Page, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
 use herdr_deck_core::protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 use herdr_deck_core::render::{Tile, TileRenderer};
 use herdr_deck_core::state::{Acknowledged, DeckState};
@@ -76,8 +76,8 @@ pub struct Session {
     capabilities: DeckCapabilities,
     profile: Profile,
     renderer: Arc<TileRenderer>,
-    mode: Mode,
-    page: usize,
+    page: Page,
+    screen: usize,
     selection: Selection,
     /// Hash of what we last sent for each key, so a reconcile that changes nothing sends
     /// nothing. Without this the deck would be repainted on every timer tick.
@@ -107,8 +107,8 @@ impl Session {
             capabilities,
             profile,
             renderer,
-            mode: Mode::default(),
-            page: 0,
+            page: Page::default(),
+            screen: 0,
             selection: Selection::default(),
             sent_keys: vec![None; key_count],
             sent_dials: vec![None; dial_count],
@@ -214,8 +214,8 @@ impl Session {
         ResolvedDeck::new(
             &self.profile,
             state,
-            self.mode,
             self.page,
+            self.screen,
             self.selection,
             &self.acked,
         )
@@ -298,21 +298,47 @@ impl Session {
                 }
             }
 
-            SlotAction::ToggleMode => {
-                // Asked of the resolved deck rather than of the mode, because where the cycle
-                // goes next depends on what herdr currently holds: a session with no worktrees
-                // has no third list, and a key that stopped at an empty one would be a press
-                // taken from everybody who does not use them.
-                let next = self.resolved(state).next_mode();
-                self.mode = next;
-                self.page = 0;
+            // One press, one intention: come home, and bring the agent that wants you with it.
+            //
+            // Both halves happen here rather than in two actions because they are two halves of
+            // one promise — that wherever you have wandered on this deck, the thing asking for
+            // you is one press away. Splitting it would make that promise cost two.
+            SlotAction::Attention { terminal_id } => {
+                let messages = self.go_home(state);
+                let Some(terminal_id) = terminal_id else {
+                    // Nothing is asking. The press was purely a way back, and on the agents page
+                    // with a clear queue it was not even that.
+                    return Outcome::just(messages);
+                };
+                match state.agent_by_terminal_id(&terminal_id) {
+                    Some(agent) => Outcome {
+                        messages,
+                        action: Some(PendingAction {
+                            command: DeckCommand::FocusPane {
+                                pane_id: agent.pane_id.clone(),
+                            },
+                            key,
+                        }),
+                    },
+                    None => Outcome::just([messages, alert(key, "that agent is gone")].concat()),
+                }
+            }
+
+            SlotAction::NextPage => {
+                // Asked of the resolved deck rather than of the page, because where the cycle
+                // goes next depends on what herdr currently holds and on what this hardware is
+                // already showing: a session with no worktrees has no worktree page, and a deck
+                // wide enough to show pane control permanently has no reason to stop at it.
+                let next = self.resolved(state).next_page();
+                self.page = next;
+                self.screen = 0;
                 Outcome::just(self.repaint(state))
             }
 
-            SlotAction::ChangePage { delta } => {
-                let pages = self.resolved(state).page_count();
-                let next = (self.page as i64 + delta as i64).rem_euclid(pages as i64) as usize;
-                self.page = next;
+            SlotAction::ChangeScreen { delta } => {
+                let screens = self.resolved(state).screen_count();
+                let next = (self.screen as i64 + delta as i64).rem_euclid(screens as i64) as usize;
+                self.screen = next;
                 Outcome::just(self.repaint(state))
             }
 
@@ -328,6 +354,16 @@ impl Session {
         self.resolved(state).scrub_len(target)
     }
 
+    /// Put the deck back on the top of the agents page, repainting only if that moved it.
+    fn go_home(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
+        if self.page == Page::Agents && self.screen == 0 {
+            return vec![];
+        }
+        self.page = Page::Agents;
+        self.screen = 0;
+        self.repaint(state)
+    }
+
     /// Repaint, sending only what changed.
     pub fn repaint(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
         // An acknowledgement whose agent moved on can never match again, so drop it here rather
@@ -337,9 +373,9 @@ impl Session {
         // Keep cursors valid: agents come and go underneath us constantly.
         let lengths = self.resolved(state).list_lengths();
         self.selection.clamp(lengths);
-        let pages = self.resolved(state).page_count();
-        if self.page >= pages {
-            self.page = pages - 1;
+        let screens = self.resolved(state).screen_count();
+        if self.screen >= screens {
+            self.screen = screens - 1;
         }
 
         let mut messages = Vec::new();
@@ -704,10 +740,10 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::NextAttention)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::Attention)
             .expect("this profile has an attention key");
         match session.tile_at(index, state) {
-            Tile::Attention { count } => count,
+            Tile::Attention { count, .. } => count,
             other => panic!("expected the attention tile, got {other:?}"),
         }
     }
@@ -1061,7 +1097,7 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
 
         let outcome = session.handle(
@@ -1087,7 +1123,7 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
 
         let now = Instant::now();
@@ -1174,7 +1210,7 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
         let outcome = send(&mut session, FrontendMessage::KeyDown { index: toggle }, &s);
         assert!(!outcome.messages.is_empty(), "mode change must repaint");
@@ -1365,7 +1401,7 @@ mod tests {
     fn a_hand_written_layout_is_padded_to_the_hardware_rather_than_leaving_keys_out_of_range() {
         let mut config = Config::default();
         config.layout = Some(herdr_deck_core::config::LayoutOverride {
-            keys: vec![herdr_deck_core::layout::KeyBinding::NextAttention],
+            keys: vec![herdr_deck_core::layout::KeyBinding::Attention],
             dials: vec![],
         });
         let session = Session::new(&plus_device(), &config, renderer());

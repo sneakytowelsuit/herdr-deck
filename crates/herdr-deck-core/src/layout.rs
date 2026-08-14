@@ -17,30 +17,129 @@ use crate::command::DeckCommand;
 use crate::config::{Config, Presets};
 use crate::render::{KeyGlyph, Tile};
 use crate::state::{Acknowledged, DeckState};
-use herdr_deck_herdr::wire::{AgentInfo, PaneDirection, SplitDirection, WorktreeInfo, ZoomMode};
+use herdr_deck_herdr::wire::{
+    AgentInfo, CreateSpec, PaneDirection, SplitDirection, WorktreeInfo, ZoomMode,
+};
 use serde::{Deserialize, Serialize};
 
-/// Which list the deck is currently showing.
+/// One page of the deck.
+///
+/// # Why pages, and why these
+///
+/// The deck started with two lists and a key that flipped between them. It now drives fifteen or
+/// so herdr commands, and eight keys cannot hold them all at once — so the keys that used to show
+/// "the current list" show *the current page*, and the page key walks the cycle.
+///
+/// A page is a **family of related controls**, not an arbitrary bank. Three of them are lists of
+/// things herdr holds ([`Page::Agents`], [`Page::Spaces`], [`Page::Trees`]) and two are fixed sets
+/// of commands ([`Page::Panes`], [`Page::Make`]). The split matters: a list page changes under you
+/// as agents come and go, and a command page is the same six keys every time you reach it, which
+/// is what lets it be pressed by feel.
+///
+/// The declaration order is the cycle order, and it is not arbitrary either: the pages that answer
+/// *where is it* come before the pages that answer *do this*, because the first question is the
+/// one this product exists for.
+///
+/// [`Page::Agents`] is first, is the default, and — uniquely — is never dropped from the cycle,
+/// however empty it gets. Every other page can be skipped: an empty list has nothing to show, and
+/// a page whose every entry is already pinned to keys of its own has nothing left to say (see
+/// [`ResolvedDeck::pages`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Mode {
+pub enum Page {
+    /// Every agent, in attention order. The reason the deck is on the desk.
     #[default]
     Agents,
-    Workspaces,
+    /// herdr's workspaces.
+    Spaces,
     /// The git worktrees of the repository the focused workspace belongs to.
-    ///
-    /// Only ever reached when there are some — see [`ResolvedDeck::next_mode`]. A third stop on
-    /// the mode key that showed an empty grid to everybody who does not use worktrees would be a
-    /// press taken from the people who do.
-    Worktrees,
+    Trees,
+    /// Moving around, and between, the panes of the tab you are already in.
+    Panes,
+    /// The commands that bring something into being: splits, tabs, workspaces, worktrees, and any
+    /// layout named in config.
+    Make,
 }
 
-impl Mode {
+impl Page {
+    /// Every page, in the order the page key walks them.
+    pub const ALL: [Page; 5] = [
+        Page::Agents,
+        Page::Spaces,
+        Page::Trees,
+        Page::Panes,
+        Page::Make,
+    ];
+
+    /// What the page key calls this page.
+    ///
+    /// One word, because it shares a 72px key with the name of the page after it.
     pub fn label(self) -> &'static str {
         match self {
-            Mode::Agents => "agents",
-            Mode::Workspaces => "spaces",
-            Mode::Worktrees => "trees",
+            Page::Agents => "agents",
+            Page::Spaces => "spaces",
+            Page::Trees => "trees",
+            Page::Panes => "panes",
+            Page::Make => "make",
+        }
+    }
+
+    /// The commands this page offers, in the order they are shown.
+    ///
+    /// Answerable without any state, which is the point: the layout engine has to know how long a
+    /// page is *before* there is a herdr to ask, because that is what decides whether a deck has
+    /// room to show the whole of it at once.
+    ///
+    /// Both command pages are ordered by how often a hand reaches for them, and neither contains
+    /// anything destructive. Closing a pane, closing a tab and removing a worktree exist, are
+    /// guarded by a hold, and have to be asked for by name in a config file; a deck should not
+    /// offer to destroy work to somebody who never went looking for that.
+    pub fn commands(self, presets: &Presets) -> Vec<DeckCommand> {
+        match self {
+            // Directions first — they are pressed in sequence and by feel — then the pair that
+            // changes what fills the screen. Exactly six, which is what a Stream Deck + has room for
+            // once the attention key and the page key have taken theirs.
+            Page::Panes => {
+                let mut commands: Vec<DeckCommand> = PaneDirection::ALL
+                    .into_iter()
+                    .map(|direction| DeckCommand::MovePaneFocus { direction })
+                    .collect();
+                commands.extend(
+                    ZoomMode::ALL
+                        .into_iter()
+                        .map(|zoom| DeckCommand::ZoomPane { zoom }),
+                );
+                commands
+            }
+            // Splitting a pane belongs here rather than with the arrows: it does not move you around
+            // an arrangement, it makes a new shell. Grouping it with the other four ways of starting
+            // something also happens to leave the panes page at exactly the size a small deck holds.
+            Page::Make => {
+                let mut commands: Vec<DeckCommand> = SplitDirection::ALL
+                    .into_iter()
+                    .map(|direction| DeckCommand::SplitPane { direction })
+                    .collect();
+                commands.push(DeckCommand::CreateTab {
+                    preset: None,
+                    spec: CreateSpec::default(),
+                });
+                commands.push(DeckCommand::CreateWorkspace {
+                    preset: None,
+                    spec: CreateSpec::default(),
+                });
+                commands.push(DeckCommand::CreateWorktree);
+                // Named layouts land last and in the order the config's map holds them, which is
+                // alphabetical — so the same config always produces the same deck, and a key does not
+                // move under a thumb because somebody reordered a table.
+                commands.extend(presets.layouts.iter().map(|(preset, layout)| {
+                    DeckCommand::ApplyLayout {
+                        preset: preset.clone(),
+                        layout: layout.clone(),
+                    }
+                }));
+                commands
+            }
+            Page::Agents | Page::Spaces | Page::Trees => vec![],
         }
     }
 }
@@ -81,10 +180,21 @@ impl ScrubTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum KeyBinding {
-    /// The Nth entry of the current mode's list. Contents change as agents come and go —
-    /// this is what makes the deck useful with zero configuration.
+    /// The Nth entry of a page. Contents change as agents come and go — this is what makes the
+    /// deck useful with zero configuration.
+    ///
+    /// `page` is the whole of the page system on the key side. Left out, the key follows whichever
+    /// page the deck is on, which is what every key on a small deck does. Named, the key shows
+    /// that page whatever the deck is on — which is how a deck with keys to spare stops paging
+    /// between control families and simply shows two of them at once.
+    ///
+    /// A pinned key is not paged: it shows entry `rank` of its page and nothing else. That is the
+    /// point of pinning — a key that moved when you paged the *other* half of the deck would be
+    /// worse than no key at all.
     Dynamic {
         rank: usize,
+        #[serde(default)]
+        page: Option<Page>,
     },
     /// Always this agent, whatever it is doing.
     PinnedAgent {
@@ -146,12 +256,32 @@ pub enum KeyBinding {
     /// in herdr's listing — otherwise herdr would refuse it, and a key that draws as usable and
     /// then refuses is a key that has to be tried to be understood.
     RemoveWorktree,
-    /// Jump straight to the top-ranked agent that wants you.
-    NextAttention,
-    /// Switch between agents and workspaces.
-    ModeToggle,
-    PagePrev,
-    PageNext,
+    /// Come home to the agents page — and, if anything is asking for you, go to it.
+    ///
+    /// The one key that is on every page and means the same thing on all of them. It carries the
+    /// whole of the promise this product makes: wherever you have wandered on the deck, one press
+    /// puts you in front of the agent that needs you, and leaves the deck showing the agents. That
+    /// is why the count lives on this key rather than on the page key — the thing that tells you
+    /// something is wrong should be the thing that fixes it.
+    ///
+    /// Named `attention` and aliased from the older `next_attention`, which described only half of
+    /// what it now does; a config written against the old name still loads.
+    #[serde(alias = "next_attention")]
+    Attention,
+    /// Walk to the next page — agents, spaces, trees, panes, make.
+    ///
+    /// Aliased from `mode_toggle`, which is what it was called when there were two pages and the
+    /// word "toggle" was still true.
+    #[serde(alias = "mode_toggle")]
+    PageCycle,
+    /// Move the window the deck shows over a page that is longer than the keys it has.
+    ///
+    /// Aliased from `page_prev`/`page_next`, which is what these were called before a *page* meant
+    /// a family of controls and this became a screen within one.
+    #[serde(alias = "page_prev")]
+    ScreenPrev,
+    #[serde(alias = "page_next")]
+    ScreenNext,
     /// Dial degradation for hardware without encoders.
     Scrub {
         target: ScrubTarget,
@@ -193,8 +323,18 @@ pub enum SlotAction {
     AcknowledgeAgent {
         terminal_id: String,
     },
-    ToggleMode,
-    ChangePage {
+    /// Come home to the agents page, and take the agent that wants you most with it.
+    ///
+    /// One action rather than two because it is one press and one intention. The terminal id is
+    /// resolved here, at the moment the key goes down, and is `None` when nothing is asking — in
+    /// which case the press is purely a way home.
+    Attention {
+        terminal_id: Option<String>,
+    },
+    /// Walk the page cycle one stop.
+    NextPage,
+    /// Move the window over a page too long for the keys showing it.
+    ChangeScreen {
         delta: i32,
     },
     Scrub {
@@ -362,64 +502,64 @@ impl Profile {
     /// Build the default layout for this hardware and this config's presets, ignoring any
     /// hand-written one.
     ///
-    /// The presets are an input to the *layout* and not only to the keys: a deck with room to
-    /// spare grows one key per named layout, because a layout nobody can reach is one nobody
-    /// meant to write down.
+    /// The presets are an input to the *layout* and not only to the keys: they lengthen the
+    /// [`Page::Make`] page, which is what decides whether a deck has room to show that page
+    /// permanently or has to reach it through the cycle.
     pub fn derive(caps: &DeckCapabilities, config: &Config) -> Self {
+        let presets = config.presets();
         let dials = default_dials(caps.dials);
-        let keys = default_keys(caps, !dials.is_empty(), &config.layouts);
+        let keys = default_keys(caps, !dials.is_empty(), &presets);
         Self {
             keys,
             dials,
-            presets: config.presets(),
+            presets,
         }
     }
 
-    /// How many keys show list entries.
+    /// How many keys follow whichever page the deck is on.
     pub fn dynamic_slots(&self) -> usize {
         self.keys
             .iter()
-            .filter(|k| matches!(k, KeyBinding::Dynamic { .. }))
+            .filter(|k| matches!(k, KeyBinding::Dynamic { page: None, .. }))
+            .count()
+    }
+
+    /// How many keys show `page` whatever page the deck is on.
+    pub fn pinned_slots(&self, page: Page) -> usize {
+        self.keys
+            .iter()
+            .filter(|k| matches!(k, KeyBinding::Dynamic { page: Some(p), .. } if *p == page))
             .count()
     }
 
     pub fn has_paging(&self) -> bool {
         self.keys
             .iter()
-            .any(|k| matches!(k, KeyBinding::PagePrev | KeyBinding::PageNext))
+            .any(|k| matches!(k, KeyBinding::ScreenPrev | KeyBinding::ScreenNext))
     }
 }
 
-/// How many keys a deck needs before pane control appears without being asked for.
+/// How many keys a deck needs before whole pages get keys of their own.
 ///
 /// Chosen as the point where the agent slots stop being the scarce thing: below it a key spent on
 /// a pane arrow is a key taken off an agent, and above it the deck already shows more agents at
-/// once than anybody runs.
-const PANE_CLUSTER_MIN_KEYS: usize = 24;
+/// once than anybody runs. A deck this size stops *paging* between control families and simply
+/// shows two of them, which is the whole difference a big deck should buy you.
+const PINNED_PAGE_MIN_KEYS: usize = 24;
 
-/// Pane control, in the order a hand reaches for it.
+/// The pages a deck with room gets permanently, in the order they are laid down.
 ///
-/// Directions first because they are the ones pressed by feel and in sequence; the pair that
-/// changes what is on screen next; the pair that adds a shell last. Every one of them is a single
-/// unambiguous outcome with nothing to type — which is what makes them worth a physical key at all.
-fn pane_cluster() -> Vec<KeyBinding> {
-    let mut keys: Vec<KeyBinding> = PaneDirection::ALL
-        .into_iter()
-        .map(|direction| KeyBinding::Command {
-            command: DeckCommand::MovePaneFocus { direction },
-        })
-        .collect();
-    keys.extend(ZoomMode::ALL.into_iter().map(|zoom| KeyBinding::Command {
-        command: DeckCommand::ZoomPane { zoom },
-    }));
-    keys.extend(
-        SplitDirection::ALL
-            .into_iter()
-            .map(|direction| KeyBinding::Command {
-                command: DeckCommand::SplitPane { direction },
-            }),
-    );
-    keys
+/// Only the two command pages. The list pages are deliberately absent: pinning half of a list that
+/// grows and shrinks would give you a row of keys whose meaning depends on how many agents happen
+/// to exist, which is the opposite of a key you can press by feel.
+const PINNED_PAGES: [Page; 2] = [Page::Panes, Page::Make];
+
+/// The first `count` keys of one page, pinned so they are on the deck whatever page it is on.
+fn pinned_keys(page: Page, count: usize) -> impl Iterator<Item = KeyBinding> {
+    (0..count).map(move |rank| KeyBinding::Dynamic {
+        rank,
+        page: Some(page),
+    })
 }
 
 /// Dials get the four most useful scrub targets, in the order you reach for them.
@@ -438,11 +578,7 @@ fn default_dials(count: u8) -> Vec<DialBinding> {
         .collect()
 }
 
-fn default_keys<V>(
-    caps: &DeckCapabilities,
-    has_dials: bool,
-    layouts: &std::collections::BTreeMap<String, V>,
-) -> Vec<KeyBinding> {
+fn default_keys(caps: &DeckCapabilities, has_dials: bool, presets: &Presets) -> Vec<KeyBinding> {
     let total = caps.key_count();
     if total == 0 {
         return vec![];
@@ -450,7 +586,7 @@ fn default_keys<V>(
 
     // A Pedal has no screen: give it the three actions that make sense blind.
     if !caps.has_display() {
-        let mut keys = vec![KeyBinding::NextAttention];
+        let mut keys = vec![KeyBinding::Attention];
         if total > 1 {
             keys.push(KeyBinding::Scrub {
                 target: ScrubTarget::Attention,
@@ -467,45 +603,59 @@ fn default_keys<V>(
         return keys;
     }
 
-    // Fixed controls, allocated from the end of the deck.
-    let mut reserved: Vec<KeyBinding> = Vec::new();
+    // The two keys that must survive whatever else has to go. The attention key is the way home
+    // from every page and the only place a blocked agent is visible from one; the page key is the
+    // only way to anywhere else. A deck without both is a deck you can get stranded on.
+    let mut home: Vec<KeyBinding> = Vec::new();
     if total >= 4 {
-        reserved.push(KeyBinding::NextAttention);
-        reserved.push(KeyBinding::ModeToggle);
+        home.push(KeyBinding::Attention);
+        home.push(KeyBinding::PageCycle);
     }
-    // Without dials, small decks need a way to reach agents past the first page.
+    // Without dials, a deck needs a way to reach a page longer than its keys. With dials, the
+    // dials scrub the lists and a page that overruns grows a "more" key of its own instead — see
+    // [`ResolvedDeck::needs_more_key`].
+    let mut paging: Vec<KeyBinding> = Vec::new();
     if !has_dials && total >= 8 {
-        reserved.push(KeyBinding::PagePrev);
-        reserved.push(KeyBinding::PageNext);
+        paging.push(KeyBinding::ScreenPrev);
+        paging.push(KeyBinding::ScreenNext);
     }
-    // A key per named layout, ahead of pane control in the queue because these were asked for by
-    // name in a config file and pane control was not. Alphabetical, so the same config always
-    // produces the same deck and a key does not move under a thumb because a table was reordered.
-    reserved.extend(layouts.keys().map(|preset| KeyBinding::Layout {
-        preset: preset.clone(),
-    }));
-    // Pane control, but only where it is free. On an eight-key deck four arrows would be half the
-    // surface, and the agents are the reason the deck is on the desk at all — so the Plus, the
-    // Mini and the 15-key get none of this by default and bind it by hand if they want it. Past
-    // twenty-four keys there are already more agent slots than anyone has agents, and the cluster
-    // costs nothing anybody was using.
-    //
-    // Nothing destructive is in here. Closing a pane is available, guarded, to anyone who asks for
-    // it in their config; it is not something a deck should offer to someone who never did.
-    if total >= PANE_CLUSTER_MIN_KEYS {
-        reserved.extend(pane_cluster());
-    }
-    // Never let fixed controls crowd out the agents they are meant to navigate. Pane control is
-    // last in the list so that, if anything has to go, it goes before the paging keys that make
-    // the rest of the agents reachable at all.
-    let max_reserved = total.saturating_sub(1).min(total / 2);
-    reserved.truncate(max_reserved);
 
-    let dynamic = total - reserved.len();
+    // Never let fixed controls crowd out the agents they are meant to navigate.
+    let budget = total.saturating_sub(1).min(total / 2);
+    let mut room = budget.saturating_sub(home.len() + paging.len());
+
+    // The control block, in the order it is laid out left to right after the agent keys. On an
+    // eight-wide deck this lands as two whole rows: pane control and the paging pair, then the
+    // make page and the two keys that are on every page.
+    let mut controls: Vec<KeyBinding> = Vec::new();
+    let pinned = total >= PINNED_PAGE_MIN_KEYS;
+    if pinned {
+        let shown = PINNED_PAGES[0].commands(presets).len().min(room);
+        controls.extend(pinned_keys(PINNED_PAGES[0], shown));
+        room -= shown;
+    }
+    controls.extend(paging);
+    if pinned {
+        let shown = PINNED_PAGES[1].commands(presets).len().min(room);
+        controls.extend(pinned_keys(PINNED_PAGES[1], shown));
+    }
+    // A control block that stopped part-way along a row would have to be found by counting rather
+    // than by feel, so on a deck big enough to have given whole rows away, the block is padded out
+    // to a whole number of them. The dark key this can leave is where the first named layout goes.
+    if pinned && caps.columns > 1 {
+        let columns = caps.columns as usize;
+        let short = (controls.len() + home.len()) % columns;
+        if short != 0 {
+            controls.resize(controls.len() + columns - short, KeyBinding::Empty);
+        }
+    }
+    controls.extend(home);
+
+    let dynamic = total.saturating_sub(controls.len());
     let mut keys: Vec<KeyBinding> = (0..dynamic)
-        .map(|rank| KeyBinding::Dynamic { rank })
+        .map(|rank| KeyBinding::Dynamic { rank, page: None })
         .collect();
-    keys.extend(reserved);
+    keys.extend(controls);
     keys
 }
 
@@ -514,8 +664,8 @@ fn default_keys<V>(
 pub struct ResolvedDeck<'a> {
     profile: &'a Profile,
     state: &'a DeckState,
-    mode: Mode,
-    page: usize,
+    page: Page,
+    screen: usize,
     selection: Selection,
     acked: &'a Acknowledged,
     /// Agents in attention order with the acknowledged ones demoted. Held rather than recomputed
@@ -527,45 +677,102 @@ impl<'a> ResolvedDeck<'a> {
     pub fn new(
         profile: &'a Profile,
         state: &'a DeckState,
-        mode: Mode,
-        page: usize,
+        page: Page,
+        screen: usize,
         selection: Selection,
         acked: &'a Acknowledged,
     ) -> Self {
         Self {
             profile,
             state,
-            mode,
             page,
+            screen,
             selection,
             acked,
             order: state.attention_order_with(acked),
         }
     }
 
-    /// The list index a dynamic slot of this rank refers to, accounting for the page.
+    /// The index into the current page that a following key of this rank refers to.
     fn list_index(&self, rank: usize) -> usize {
-        self.page * self.profile.dynamic_slots().max(1) + rank
+        self.screen * self.visible_slots().max(1) + rank
     }
 
-    fn list_len(&self) -> usize {
-        match self.mode {
-            Mode::Agents => self.order.len(),
-            Mode::Workspaces => self.state.workspaces.len(),
-            Mode::Worktrees => self.state.worktrees.len(),
+    /// How many entries a page has right now.
+    pub fn page_len(&self, page: Page) -> usize {
+        match page {
+            Page::Agents => self.order.len(),
+            Page::Spaces => self.state.workspaces.len(),
+            Page::Trees => self.state.worktrees.len(),
+            Page::Panes | Page::Make => page.commands(&self.profile.presets).len(),
         }
     }
 
-    /// Where the mode key goes next.
+    /// Whether the last following key has to become a "more" key to reach the rest of this page.
     ///
-    /// Worktrees are skipped when there are none, so the third stop only exists for the people who
-    /// have a third list — everybody else keeps the two-press cycle they had. Leaving worktree
-    /// mode is unconditional, so a list that empties underneath you never traps the key.
-    pub fn next_mode(&self) -> Mode {
-        match self.mode {
-            Mode::Agents => Mode::Workspaces,
-            Mode::Workspaces if !self.state.worktrees.is_empty() => Mode::Worktrees,
-            Mode::Workspaces | Mode::Worktrees => Mode::Agents,
+    /// The alternative is a deck that quietly shows six of nine things, which is exactly the
+    /// silence this project refuses everywhere else. A deck with paging keys already has an
+    /// answer and keeps all its slots; a deck without one — the Stream Deck +, whose dials scrub
+    /// the *lists* but know nothing about a page of commands — spends a slot, and only on the page
+    /// that needs it.
+    fn needs_more_key(&self) -> bool {
+        !self.profile.has_paging()
+            && self.profile.dynamic_slots() > 1
+            && self.page_len(self.page) > self.profile.dynamic_slots()
+    }
+
+    /// Following keys actually showing entries, once any "more" key has taken its slot.
+    fn visible_slots(&self) -> usize {
+        self.profile.dynamic_slots() - usize::from(self.needs_more_key())
+    }
+
+    /// Is this following key the one carrying the rest of the page?
+    fn is_more_slot(&self, rank: usize) -> bool {
+        self.needs_more_key() && rank + 1 >= self.profile.dynamic_slots()
+    }
+
+    /// The agent list index a dynamic key stands for, or `None` when it stands for no agent —
+    /// because it is the "more" key, and a key that pages the list is not a key about an agent.
+    fn agent_index(&self, rank: usize, page: Option<Page>) -> Option<usize> {
+        match page {
+            Some(_) => Some(rank),
+            None if self.is_more_slot(rank) => None,
+            None => Some(self.list_index(rank)),
+        }
+    }
+
+    /// Is every entry of `page` already on a key of its own?
+    ///
+    /// A deck big enough to show the whole of a page permanently has nothing to gain from a cycle
+    /// stop that would repaint the same six commands somewhere else. A page only *partly* pinned
+    /// stays in the cycle, because the entries that did not fit have to be reachable somehow.
+    fn shown_elsewhere(&self, page: Page) -> bool {
+        let pinned = self.profile.pinned_slots(page);
+        pinned > 0 && pinned >= self.page_len(page)
+    }
+
+    /// The pages this deck's page key actually stops at, in order.
+    ///
+    /// Three ways a page drops out, and the agents page is exempt from all of them: it is what the
+    /// deck is for, and a cycle that could not reach it would be a bug wearing a rule's clothes.
+    pub fn pages(&self) -> Vec<Page> {
+        Page::ALL
+            .into_iter()
+            .filter(|page| {
+                *page == Page::Agents || (self.page_len(*page) > 0 && !self.shown_elsewhere(*page))
+            })
+            .collect()
+    }
+
+    /// Where the page key goes next.
+    pub fn next_page(&self) -> Page {
+        let pages = self.pages();
+        match pages.iter().position(|page| *page == self.page) {
+            Some(index) => pages[(index + 1) % pages.len()],
+            // The page we are on has stopped being offered — its list emptied underneath us, or
+            // the hardware started showing it somewhere else. Home is the right answer to "where
+            // next" from nowhere, and it is what stops an emptying list ever trapping the key.
+            None => Page::Agents,
         }
     }
 
@@ -613,9 +820,10 @@ impl<'a> ResolvedDeck<'a> {
         }
     }
 
-    pub fn page_count(&self) -> usize {
-        let per_page = self.profile.dynamic_slots().max(1);
-        self.list_len().div_ceil(per_page).max(1)
+    /// How many screens the current page takes on this hardware.
+    pub fn screen_count(&self) -> usize {
+        let per_screen = self.visible_slots().max(1);
+        self.page_len(self.page).div_ceil(per_screen).max(1)
     }
 
     /// What to draw on key `index`.
@@ -631,7 +839,17 @@ impl<'a> ResolvedDeck<'a> {
             return Tile::Empty;
         };
         match binding {
-            KeyBinding::Dynamic { rank } => self.list_tile(self.list_index(*rank)),
+            KeyBinding::Dynamic {
+                rank,
+                page: Some(page),
+            } => self.entry_tile(*page, *rank),
+            KeyBinding::Dynamic { rank, page: None } if self.is_more_slot(*rank) => Tile::Label {
+                label: format!("more {}/{}", self.screen + 1, self.screen_count()),
+                active: true,
+            },
+            KeyBinding::Dynamic { rank, page: None } => {
+                self.entry_tile(self.page, self.list_index(*rank))
+            }
             KeyBinding::PinnedAgent { terminal_id } => self
                 .state
                 .agent_by_terminal_id(terminal_id)
@@ -681,22 +899,34 @@ impl<'a> ResolvedDeck<'a> {
                 },
                 self.removable_worktree().is_some(),
             ),
-            KeyBinding::NextAttention => Tile::Attention {
+            KeyBinding::Attention => Tile::Attention {
                 count: self.attention_count(),
+                // The key is also the way back, and on a page that is not the agents page it has
+                // to say so — a key whose second job is invisible is a key nobody presses for it.
+                away: self.page != Page::Agents || self.screen > 0,
             },
-            KeyBinding::ModeToggle => Tile::Mode {
-                label: self.next_mode().label().to_string(),
-                active: false,
+            // Where you are, in the size it is read at, and where the next press goes underneath
+            // it. Naming only the destination — which is what this key used to do — answers
+            // "what happens if I press this" and leaves "which page am I on" to be worked out by
+            // counting presses, on a deck whose whole point is not making you count anything.
+            KeyBinding::PageCycle => {
+                let next = self.next_page();
+                Tile::Page {
+                    current: self.page.label().to_string(),
+                    next: (next != self.page).then(|| next.label().to_string()),
+                    screen: (self.screen_count() > 1)
+                        .then(|| (self.screen + 1, self.screen_count())),
+                }
+            }
+            KeyBinding::ScreenPrev => Tile::Label {
+                label: "◀ more".to_string(),
+                active: self.screen > 0,
             },
-            KeyBinding::PagePrev => Tile::Mode {
-                label: "◀ page".to_string(),
-                active: self.page > 0,
+            KeyBinding::ScreenNext => Tile::Label {
+                label: "more ▶".to_string(),
+                active: self.screen + 1 < self.screen_count(),
             },
-            KeyBinding::PageNext => Tile::Mode {
-                label: "page ▶".to_string(),
-                active: self.page + 1 < self.page_count(),
-            },
-            KeyBinding::Scrub { target, delta } => Tile::Mode {
+            KeyBinding::Scrub { target, delta } => Tile::Label {
                 label: format!("{} {}", if *delta < 0 { "◀" } else { "▶" }, target.label()),
                 active: true,
             },
@@ -704,23 +934,29 @@ impl<'a> ResolvedDeck<'a> {
         }
     }
 
-    fn list_tile(&self, index: usize) -> Tile {
-        match self.mode {
-            Mode::Agents => self
+    /// What the `index`th entry of `page` draws.
+    fn entry_tile(&self, page: Page, index: usize) -> Tile {
+        match page {
+            Page::Agents => self
                 .agent_at(index)
                 .map(|agent| agent_tile(self.state, agent, self.acked))
                 .unwrap_or(Tile::Empty),
-            Mode::Workspaces => self
+            Page::Spaces => self
                 .state
                 .workspaces
                 .get(index)
                 .map(workspace_tile)
                 .unwrap_or(Tile::Empty),
-            Mode::Worktrees => self
+            Page::Trees => self
                 .state
                 .worktrees
                 .get(index)
                 .map(|tree| worktree_tile(self.state, tree))
+                .unwrap_or(Tile::Empty),
+            Page::Panes | Page::Make => page
+                .commands(&self.profile.presets)
+                .get(index)
+                .map(|command| command_tile(command, true))
                 .unwrap_or(Tile::Empty),
         }
     }
@@ -789,7 +1025,16 @@ impl<'a> ResolvedDeck<'a> {
             return SlotAction::None;
         };
         match binding {
-            KeyBinding::Dynamic { rank } => self.list_action(self.list_index(*rank)),
+            KeyBinding::Dynamic {
+                rank,
+                page: Some(page),
+            } => self.entry_action(*page, *rank),
+            KeyBinding::Dynamic { rank, page: None } if self.is_more_slot(*rank) => {
+                SlotAction::ChangeScreen { delta: 1 }
+            }
+            KeyBinding::Dynamic { rank, page: None } => {
+                self.entry_action(self.page, self.list_index(*rank))
+            }
             KeyBinding::PinnedAgent { terminal_id } => {
                 if self.state.agent_by_terminal_id(terminal_id).is_some() {
                     SlotAction::FocusAgent {
@@ -851,16 +1096,15 @@ impl<'a> ResolvedDeck<'a> {
                     message: "this workspace is not a worktree".to_string(),
                 },
             },
-            KeyBinding::NextAttention => self
-                .needing_attention()
-                .next()
-                .map(|a| SlotAction::FocusAgent {
-                    terminal_id: a.terminal_id.clone(),
-                })
-                .unwrap_or(SlotAction::None),
-            KeyBinding::ModeToggle => SlotAction::ToggleMode,
-            KeyBinding::PagePrev => SlotAction::ChangePage { delta: -1 },
-            KeyBinding::PageNext => SlotAction::ChangePage { delta: 1 },
+            KeyBinding::Attention => SlotAction::Attention {
+                terminal_id: self
+                    .needing_attention()
+                    .next()
+                    .map(|agent| agent.terminal_id.clone()),
+            },
+            KeyBinding::PageCycle => SlotAction::NextPage,
+            KeyBinding::ScreenPrev => SlotAction::ChangeScreen { delta: -1 },
+            KeyBinding::ScreenNext => SlotAction::ChangeScreen { delta: 1 },
             KeyBinding::Scrub { target, delta } => SlotAction::Scrub {
                 target: *target,
                 delta: *delta,
@@ -869,15 +1113,16 @@ impl<'a> ResolvedDeck<'a> {
         }
     }
 
-    fn list_action(&self, index: usize) -> SlotAction {
-        match self.mode {
-            Mode::Agents => self
+    /// What pressing the `index`th entry of `page` does.
+    fn entry_action(&self, page: Page, index: usize) -> SlotAction {
+        match page {
+            Page::Agents => self
                 .agent_at(index)
                 .map(|a| SlotAction::FocusAgent {
                     terminal_id: a.terminal_id.clone(),
                 })
                 .unwrap_or(SlotAction::None),
-            Mode::Workspaces => self
+            Page::Spaces => self
                 .state
                 .workspaces
                 .get(index)
@@ -890,7 +1135,7 @@ impl<'a> ResolvedDeck<'a> {
             // Always an open, never a workspace focus, even for a checkout herdr already has
             // open: `worktree.open` is idempotent and focuses what it finds, so one path covers
             // both cases and there is no state the deck could be wrong about.
-            Mode::Worktrees => self
+            Page::Trees => self
                 .state
                 .worktrees
                 .get(index)
@@ -899,6 +1144,12 @@ impl<'a> ResolvedDeck<'a> {
                         path: tree.path.clone(),
                     })
                 })
+                .unwrap_or(SlotAction::None),
+            Page::Panes | Page::Make => page
+                .commands(&self.profile.presets)
+                .get(index)
+                .cloned()
+                .map(SlotAction::Command)
                 .unwrap_or(SlotAction::None),
         }
     }
@@ -935,10 +1186,17 @@ impl<'a> ResolvedDeck<'a> {
             }
         };
         match self.profile.keys.get(index) {
-            Some(KeyBinding::Dynamic { rank }) if self.mode == Mode::Agents => self
-                .agent_at(self.list_index(*rank))
-                .map(acknowledge)
-                .unwrap_or(SlotAction::None),
+            Some(KeyBinding::Dynamic { rank, page })
+                if page.unwrap_or(self.page) == Page::Agents =>
+            {
+                match self.agent_index(*rank, *page) {
+                    Some(index) => self
+                        .agent_at(index)
+                        .map(acknowledge)
+                        .unwrap_or(SlotAction::None),
+                    None => SlotAction::None,
+                }
+            }
             Some(KeyBinding::PinnedAgent { terminal_id }) => self
                 .state
                 .agent_by_terminal_id(terminal_id)
@@ -1115,7 +1373,7 @@ fn command_tile(command: &DeckCommand, enabled: bool) -> Tile {
         // A focus takes you to a named thing and no shape can say *which*, so the caption is the
         // whole message and it gets the plain labelled key. An arrow here would be decoration
         // pretending to be information.
-        None => Tile::Mode {
+        None => Tile::Label {
             label: if hold {
                 format!("hold: {label}")
             } else {
@@ -1275,7 +1533,7 @@ mod tests {
         let profile = Profile::for_capabilities(&caps);
         assert_eq!(profile.keys.len(), 3);
         assert_eq!(profile.dynamic_slots(), 0);
-        assert_eq!(profile.keys[0], KeyBinding::NextAttention);
+        assert_eq!(profile.keys[0], KeyBinding::Attention);
     }
 
     #[test]
@@ -1290,7 +1548,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -1315,7 +1573,7 @@ mod tests {
         state: &'a DeckState,
         acked: &'a Acknowledged,
     ) -> ResolvedDeck<'a> {
-        ResolvedDeck::new(profile, state, Mode::Agents, 0, Selection::default(), acked)
+        ResolvedDeck::new(profile, state, Page::Agents, 0, Selection::default(), acked)
     }
 
     #[test]
@@ -1365,10 +1623,10 @@ mod tests {
         let acked = Acknowledged::default();
         let deck = plus_deck(&profile, &state, &acked);
         for binding in [
-            KeyBinding::NextAttention,
-            KeyBinding::ModeToggle,
-            KeyBinding::PagePrev,
-            KeyBinding::PageNext,
+            KeyBinding::Attention,
+            KeyBinding::PageCycle,
+            KeyBinding::ScreenPrev,
+            KeyBinding::ScreenNext,
         ] {
             let index = profile
                 .keys
@@ -1396,7 +1654,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Workspaces,
+            Page::Spaces,
             0,
             Selection::default(),
             &acked,
@@ -1495,10 +1753,20 @@ mod tests {
 
     // --- Pane control -------------------------------------------------------------------------
 
-    /// A deck whose keys are the whole pane cluster, in the order the layout engine lays it out.
+    /// A deck whose keys are every pane command, in the order the pages lay them out: the panes
+    /// page entire, then the two splits that live on the make page because they make something.
     fn pane_deck() -> Profile {
+        let mut commands = Page::Panes.commands(&Presets::default());
+        commands.extend(
+            SplitDirection::ALL
+                .into_iter()
+                .map(|direction| DeckCommand::SplitPane { direction }),
+        );
         Profile {
-            keys: pane_cluster(),
+            keys: commands
+                .into_iter()
+                .map(|command| KeyBinding::Command { command })
+                .collect(),
             dials: vec![],
             presets: Presets::default(),
         }
@@ -1659,37 +1927,48 @@ mod tests {
     #[test]
     fn pane_control_never_costs_an_eight_key_deck_a_single_agent() {
         // Four arrows would be half a Stream Deck +, and the agents are the reason the deck is on
-        // the desk at all. Anybody who wants them there can say so in their config.
+        // the desk at all. On a small deck pane control lives one press away, on a page, and every
+        // key the deck has is still an agent when it is showing agents.
         for model in [DeckModel::Plus, DeckModel::Mini, DeckModel::Original] {
-            let profile = Profile::for_capabilities(&model.capabilities());
-            assert!(
-                !profile
-                    .keys
-                    .iter()
-                    .any(|k| matches!(k, KeyBinding::Command { .. })),
+            let caps = model.capabilities();
+            let profile = Profile::for_capabilities(&caps);
+            assert_eq!(
+                profile.pinned_slots(Page::Panes),
+                0,
                 "{model:?} gave keys away to pane control"
+            );
+            assert_eq!(
+                profile.pinned_slots(Page::Make),
+                0,
+                "{model:?} gave keys away to the make page"
             );
         }
     }
 
     #[test]
-    fn a_deck_with_keys_to_spare_gets_the_whole_pane_cluster_and_still_shows_more_agents() {
-        // Past two dozen keys there are already more agent slots than anyone has agents, so the
-        // cluster costs nothing that was being used.
-        let profile = Profile::for_capabilities(&DeckModel::Xl.capabilities());
-        let commands: Vec<_> = profile
-            .keys
-            .iter()
-            .filter_map(|k| match k {
-                KeyBinding::Command { command } => Some(command.name()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(commands.len(), pane_cluster().len());
+    fn a_deck_with_keys_to_spare_shows_the_command_pages_instead_of_paging_to_them() {
+        // Past two dozen keys there are already more agent slots than anyone has agents, so whole
+        // pages cost nothing that was being used — and a page permanently on the deck is a page
+        // the user never has to walk the cycle to reach.
+        let caps = DeckModel::Xl.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let presets = Presets::default();
+
+        assert_eq!(
+            profile.pinned_slots(Page::Panes),
+            Page::Panes.commands(&presets).len(),
+            "the whole panes page has to be there, or a key would be unreachable"
+        );
+        assert_eq!(
+            profile.pinned_slots(Page::Make),
+            Page::Make.commands(&presets).len()
+        );
         assert!(
-            profile.dynamic_slots() > commands.len(),
+            profile.dynamic_slots() > profile.pinned_slots(Page::Panes),
             "the agents must still have the larger share"
         );
+        // Two whole rows for the agents, two for the controls: a block found by feel, not counted.
+        assert_eq!(profile.dynamic_slots() % caps.columns as usize, 0);
     }
 
     #[test]
@@ -1758,7 +2037,7 @@ mod tests {
     }
 
     fn deck_of(profile: &Profile, state: &DeckState, acked: &Acknowledged) -> SlotAction {
-        ResolvedDeck::new(profile, state, Mode::Agents, 0, Selection::default(), acked)
+        ResolvedDeck::new(profile, state, Page::Agents, 0, Selection::default(), acked)
             .key_action(0)
     }
 
@@ -1814,32 +2093,37 @@ mod tests {
     }
 
     #[test]
-    fn a_deck_with_room_grows_one_key_per_named_layout_and_a_deck_without_grows_none() {
-        // A layout nobody can press is a layout nobody meant to write down. But the agents are
-        // still why the deck is on the desk, so the same cap that keeps pane control off a small
-        // deck applies here too.
+    fn a_named_layout_joins_the_make_page_rather_than_taking_a_key_off_the_agents() {
+        // A layout nobody can press is a layout nobody meant to write down — but it reaching a key
+        // must not be at the agents' expense, and ten presets must not be able to swallow a deck.
+        // Putting them on a page rather than in the reserved block is what makes both true: the
+        // page grows, the number of keys does not, and a deck too small to show it all pages.
         let config = config_with_presets();
-        let big = Profile::derive(&DeckModel::Xl.capabilities(), &config);
-        let layouts: Vec<_> = big
-            .keys
-            .iter()
-            .filter_map(|k| match k {
-                KeyBinding::Layout { preset } => Some(preset.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(layouts, vec!["dev"]);
+        let commands = Page::Make.commands(&config.presets());
         assert!(
-            big.dynamic_slots() > layouts.len(),
-            "the agents must still have the larger share"
+            commands.iter().any(|command| matches!(
+                command,
+                DeckCommand::ApplyLayout { preset, .. } if preset == "dev"
+            )),
+            "the dev layout has to be somewhere a key can reach it: {commands:?}"
         );
 
-        // ...and a deck with no presets configured is exactly the deck it was before.
-        let plain = Profile::derive(&DeckModel::Xl.capabilities(), &Config::default());
-        assert!(!plain
-            .keys
-            .iter()
-            .any(|k| matches!(k, KeyBinding::Layout { .. })));
+        // The Plus has six slots and no paging keys, so a preset is exactly what tips the make
+        // page over into needing a "more" key — and the deck says so rather than dropping one.
+        let plus = Profile::derive(&DeckModel::Plus.capabilities(), &config);
+        assert_eq!(
+            plus.dynamic_slots(),
+            6,
+            "the agents keep every key they had"
+        );
+
+        // A deck with room shows the whole page, preset and all, without a cycle stop for it.
+        let big = Profile::derive(&DeckModel::Xl.capabilities(), &config);
+        assert_eq!(big.pinned_slots(Page::Make), commands.len());
+        assert!(
+            big.dynamic_slots() > big.pinned_slots(Page::Make),
+            "the agents must still have the larger share"
+        );
     }
 
     #[test]
@@ -1890,7 +2174,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Worktrees,
+            Page::Trees,
             0,
             Selection::default(),
             &acked,
@@ -1925,7 +2209,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Worktrees,
+            Page::Trees,
             0,
             Selection::default(),
             &acked,
@@ -2156,18 +2440,24 @@ mod tests {
         let next_key = profile
             .keys
             .iter()
-            .position(|k| *k == KeyBinding::NextAttention)
+            .position(|k| *k == KeyBinding::Attention)
             .unwrap();
 
         let mut acked = Acknowledged::default();
         acked.acknowledge(state.agent_by_terminal_id("finished").unwrap());
         let deck = plus_deck(&profile, &state, &acked);
 
-        assert_eq!(deck.tile(next_key), Tile::Attention { count: 1 });
+        assert_eq!(
+            deck.tile(next_key),
+            Tile::Attention {
+                count: 1,
+                away: false
+            }
+        );
         assert_eq!(
             deck.key_action(next_key),
-            SlotAction::FocusAgent {
-                terminal_id: "stuck".into()
+            SlotAction::Attention {
+                terminal_id: Some("stuck".into())
             },
             "the attention key must skip what you already dismissed"
         );
@@ -2333,7 +2623,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Workspaces,
+            Page::Spaces,
             0,
             Selection::default(),
             &acked,
@@ -2354,7 +2644,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2362,12 +2652,12 @@ mod tests {
         let next_key = profile
             .keys
             .iter()
-            .position(|k| *k == KeyBinding::NextAttention)
+            .position(|k| *k == KeyBinding::Attention)
             .expect("profile has a next-attention key");
         assert_eq!(
             deck.key_action(next_key),
-            SlotAction::FocusAgent {
-                terminal_id: "fresh_block".into()
+            SlotAction::Attention {
+                terminal_id: Some("fresh_block".into())
             }
         );
     }
@@ -2381,7 +2671,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2389,10 +2679,21 @@ mod tests {
         let next_key = profile
             .keys
             .iter()
-            .position(|k| *k == KeyBinding::NextAttention)
+            .position(|k| *k == KeyBinding::Attention)
             .unwrap();
-        assert_eq!(deck.key_action(next_key), SlotAction::None);
-        assert_eq!(deck.tile(next_key), Tile::Attention { count: 0 });
+        // Still an action, and still worth pressing: with nothing asking it is purely the way
+        // home. Reporting `None` would make the key inert on the page where it matters most.
+        assert_eq!(
+            deck.key_action(next_key),
+            SlotAction::Attention { terminal_id: None }
+        );
+        assert_eq!(
+            deck.tile(next_key),
+            Tile::Attention {
+                count: 0,
+                away: false
+            }
+        );
     }
 
     #[test]
@@ -2404,7 +2705,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2422,7 +2723,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2448,7 +2749,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Workspaces,
+            Page::Spaces,
             0,
             Selection::default(),
             &acked,
@@ -2464,7 +2765,8 @@ mod tests {
 
     #[test]
     fn paging_moves_the_window_over_the_agent_list() {
-        // 6 dynamic slots on a Plus; page 1 starts at index 6.
+        // A Plus has six following keys and no paging keys, so ten agents cost the last of them:
+        // five agents and a key that says there are more. Screen 1 therefore starts at index 5.
         let caps = DeckModel::Plus.capabilities();
         let profile = Profile::for_capabilities(&caps);
         let agents: Vec<_> = (0..10)
@@ -2475,7 +2777,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             1,
             Selection::default(),
             &acked,
@@ -2483,10 +2785,10 @@ mod tests {
         assert_eq!(
             deck.key_action(0),
             SlotAction::FocusAgent {
-                terminal_id: "a06".into()
+                terminal_id: "a05".into()
             }
         );
-        assert_eq!(deck.page_count(), 2);
+        assert_eq!(deck.screen_count(), 2);
     }
 
     #[test]
@@ -2502,7 +2804,7 @@ mod tests {
             ..Default::default()
         };
         let acked = Acknowledged::default();
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
+        let deck = ResolvedDeck::new(&profile, &state, Page::Agents, 0, selection, &acked);
         assert_eq!(
             deck.dial_press_action(0),
             SlotAction::FocusAgent {
@@ -2525,7 +2827,7 @@ mod tests {
             ..Default::default()
         };
         let acked = Acknowledged::default();
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
+        let deck = ResolvedDeck::new(&profile, &state, Page::Agents, 0, selection, &acked);
         // Index 1 of the attention list is the `done` agent — the working one is skipped.
         assert_eq!(
             deck.dial_press_action(3),
@@ -2559,7 +2861,7 @@ mod tests {
             ..Default::default()
         };
         let acked = Acknowledged::default();
-        let deck = ResolvedDeck::new(&profile, &state, Mode::Agents, 0, selection, &acked);
+        let deck = ResolvedDeck::new(&profile, &state, Page::Agents, 0, selection, &acked);
         assert_eq!(
             deck.dial_press_action(2),
             SlotAction::Command(DeckCommand::FocusTab {
@@ -2577,7 +2879,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2649,7 +2951,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2669,7 +2971,7 @@ mod tests {
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Agents,
+            Page::Agents,
             0,
             Selection::default(),
             &acked,
@@ -2678,51 +2980,249 @@ mod tests {
         assert_eq!(value, "all clear");
     }
 
-    #[test]
-    fn the_mode_key_cycles_agents_and_workspaces_when_there_are_no_worktrees() {
-        // Which is most sessions. A third stop showing an empty grid would cost everybody who
-        // does not use worktrees an extra press to get back to their agents.
-        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
-        let state = state_with(vec![]);
+    // --- Pages ----------------------------------------------------------------------------------
+
+    /// A session as most people have one: an agent, the workspace it lives in, no worktrees.
+    fn ordinary_state() -> DeckState {
+        DeckState::from_snapshot(SessionSnapshot {
+            agents: vec![agent("a1", AgentStatus::Blocked, 1)],
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// Every stop the page key makes, starting from the agents page and going all the way round.
+    fn cycle(profile: &Profile, state: &DeckState) -> Vec<Page> {
         let acked = Acknowledged::default();
-        let at = |mode| {
-            ResolvedDeck::new(&profile, &state, mode, 0, Selection::default(), &acked).next_mode()
-        };
-        assert_eq!(at(Mode::Agents), Mode::Workspaces);
-        assert_eq!(at(Mode::Workspaces), Mode::Agents);
+        let mut seen = vec![Page::Agents];
+        let mut page = Page::Agents;
+        // Bounded rather than "until it repeats", so a cycle that never came home fails here
+        // instead of hanging the suite.
+        for _ in 0..Page::ALL.len() + 1 {
+            page = ResolvedDeck::new(profile, state, page, 0, Selection::default(), &acked)
+                .next_page();
+            if page == Page::Agents {
+                return seen;
+            }
+            seen.push(page);
+        }
+        panic!("the page cycle never came back to the agents: {seen:?}");
     }
 
     #[test]
-    fn a_session_with_worktrees_gets_a_third_stop_on_the_same_key() {
+    fn the_page_key_walks_the_lists_first_and_the_command_pages_after_them() {
+        // "Where is it" before "do this": the first question is the one this product exists for,
+        // and it should not be behind the second.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        assert_eq!(
+            cycle(&profile, &ordinary_state()),
+            vec![Page::Agents, Page::Spaces, Page::Panes, Page::Make]
+        );
+    }
+
+    #[test]
+    fn a_session_with_worktrees_gets_a_stop_for_them_and_a_session_without_never_sees_one() {
         // No new key, no configuration: the deck that has worktrees grows a place to see them and
-        // the deck that does not is unchanged.
+        // the deck that does not is unchanged. A stop showing an empty grid would cost everybody
+        // who does not use worktrees a press on the way back to their agents.
         let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
-        let state = state_with(vec![]).with_worktrees(vec![worktree("fix-auth", None)]);
-        let acked = Acknowledged::default();
-        let at = |mode| {
-            ResolvedDeck::new(&profile, &state, mode, 0, Selection::default(), &acked).next_mode()
-        };
-        assert_eq!(at(Mode::Agents), Mode::Workspaces);
-        assert_eq!(at(Mode::Workspaces), Mode::Worktrees);
-        assert_eq!(at(Mode::Worktrees), Mode::Agents);
+        let with_trees = ordinary_state().with_worktrees(vec![worktree("fix-auth", None)]);
+        assert_eq!(
+            cycle(&profile, &with_trees),
+            vec![
+                Page::Agents,
+                Page::Spaces,
+                Page::Trees,
+                Page::Panes,
+                Page::Make
+            ]
+        );
+        assert!(!cycle(&profile, &ordinary_state()).contains(&Page::Trees));
     }
 
     #[test]
-    fn leaving_worktree_mode_always_works_even_once_the_list_has_emptied() {
-        // The list is refreshed underneath the deck, so it can empty while somebody is looking at
-        // it. Leaving has to be unconditional or the mode key becomes a trap.
+    fn a_deck_showing_a_page_already_does_not_stop_at_it_again() {
+        // The whole difference a big deck buys: pane control and the make page are on its keys, so
+        // the cycle is the three lists and nothing else. Walking to a page you can already see
+        // would be a press that changes nothing but the half of the deck you were reading.
+        let profile = Profile::for_capabilities(&DeckModel::Xl.capabilities());
+        let stops = cycle(&profile, &ordinary_state());
+        assert_eq!(stops, vec![Page::Agents, Page::Spaces]);
+        assert!(
+            !stops.contains(&Page::Panes) && !stops.contains(&Page::Make),
+            "a page already on the keys has nothing to show elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_page_only_half_shown_stays_in_the_cycle_so_the_rest_is_still_reachable() {
+        // The dangerous half of the rule above. An XL pins six make keys; a config with enough
+        // presets makes the page longer than that, and the entries that did not fit have to be
+        // reachable somehow or they are keys that exist and cannot be pressed.
+        let mut config = Config::default();
+        for name in ["dev", "review", "release", "scratch"] {
+            config.layouts.insert(name.into(), LayoutPreset::default());
+        }
+        let profile = Profile::derive(&DeckModel::Xl.capabilities(), &config);
+        let commands = Page::Make.commands(&config.presets());
+        assert!(
+            profile.pinned_slots(Page::Make) < commands.len(),
+            "this test is only meaningful when the page overflows its keys"
+        );
+        assert!(cycle(&profile, &ordinary_state()).contains(&Page::Make));
+    }
+
+    #[test]
+    fn leaving_a_page_whose_list_emptied_always_works_rather_than_trapping_the_key() {
+        // Worktrees are refreshed underneath the deck, so the list can empty while somebody is
+        // looking at it. Leaving has to be unconditional or the page key becomes a trap.
         let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
-        let state = state_with(vec![]);
+        let state = ordinary_state();
         let acked = Acknowledged::default();
         let deck = ResolvedDeck::new(
             &profile,
             &state,
-            Mode::Worktrees,
+            Page::Trees,
             0,
             Selection::default(),
             &acked,
         );
-        assert_eq!(deck.next_mode(), Mode::Agents);
+        assert_eq!(deck.next_page(), Page::Agents);
+    }
+
+    #[test]
+    fn the_agents_page_is_one_press_away_from_every_page_on_every_deck() {
+        // The promise the whole product rests on. However far the control surface grows, the
+        // agent that needs you is never more than one key away — so every deck that can leave the
+        // agents page must carry the key that comes back, and that key must mean the same thing
+        // from every page it can be pressed on.
+        let state = ordinary_state();
+        let acked = Acknowledged::default();
+        for model in [
+            DeckModel::Plus,
+            DeckModel::Mini,
+            DeckModel::Original,
+            DeckModel::Xl,
+            DeckModel::Neo,
+            DeckModel::Pedal,
+        ] {
+            let profile = Profile::for_capabilities(&model.capabilities());
+            let home = profile
+                .keys
+                .iter()
+                .position(|key| *key == KeyBinding::Attention)
+                .unwrap_or_else(|| panic!("{model:?} has no way back to the agents"));
+            for page in Page::ALL {
+                let deck =
+                    ResolvedDeck::new(&profile, &state, page, 0, Selection::default(), &acked);
+                assert!(
+                    matches!(deck.key_action(home), SlotAction::Attention { .. }),
+                    "{model:?} loses its way home on the {} page",
+                    page.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_agent_that_wants_you_is_visible_from_every_page_and_not_only_from_the_agents() {
+        // A control surface that could hide a blocked agent behind a page would be a control
+        // surface that broke the one thing this deck is for.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = ordinary_state();
+        let acked = Acknowledged::default();
+        let home = profile
+            .keys
+            .iter()
+            .position(|key| *key == KeyBinding::Attention)
+            .expect("the plus has an attention key");
+        for page in Page::ALL {
+            let deck = ResolvedDeck::new(&profile, &state, page, 0, Selection::default(), &acked);
+            match deck.tile(home) {
+                Tile::Attention { count, away } => {
+                    assert_eq!(count, 1, "the count must survive leaving the agents page");
+                    assert_eq!(
+                        away,
+                        page != Page::Agents,
+                        "the key has to say it is also the way back, and only when it is"
+                    );
+                }
+                other => panic!("expected the attention key, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_page_says_which_page_it_is_rather_than_only_where_the_next_press_goes() {
+        // Counting presses to work out where you are is exactly the work this deck exists to save.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = ordinary_state();
+        let acked = Acknowledged::default();
+        let key = profile
+            .keys
+            .iter()
+            .position(|key| *key == KeyBinding::PageCycle)
+            .expect("the plus has a page key");
+        for page in Page::ALL {
+            let deck = ResolvedDeck::new(&profile, &state, page, 0, Selection::default(), &acked);
+            match deck.tile(key) {
+                Tile::Page { current, next, .. } => {
+                    assert_eq!(current, page.label());
+                    assert_ne!(next.as_deref(), Some(page.label()), "a key to nowhere");
+                }
+                other => panic!("expected the page key, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_model_lays_out_without_a_key_that_addresses_nothing() {
+        // The layout engine hands out ranks and page pins by arithmetic, and arithmetic against a
+        // key count is where an off-by-one lands somebody a deck with a key that draws nothing and
+        // does nothing. Every model, every page, every key.
+        let state = ordinary_state().with_worktrees(vec![worktree("fix-auth", Some("w2"))]);
+        let acked = Acknowledged::default();
+        for model in [
+            DeckModel::Plus,
+            DeckModel::Mini,
+            DeckModel::Original,
+            DeckModel::Xl,
+            DeckModel::Neo,
+            DeckModel::Pedal,
+            DeckModel::Unknown,
+        ] {
+            let caps = model.capabilities();
+            let profile = Profile::for_capabilities(&caps);
+            assert_eq!(profile.keys.len(), caps.key_count(), "{model:?}");
+            assert_eq!(profile.dials.len(), caps.dials as usize, "{model:?}");
+            for page in Page::ALL {
+                let deck =
+                    ResolvedDeck::new(&profile, &state, page, 0, Selection::default(), &acked);
+                // A pinned key never pages, so its rank is a promise about a page's length that
+                // the layout engine made when it had no state to check it against.
+                for (index, key) in profile.keys.iter().enumerate() {
+                    if let KeyBinding::Dynamic {
+                        rank,
+                        page: Some(pinned),
+                    } = key
+                    {
+                        assert!(
+                            *rank < deck.page_len(*pinned),
+                            "{model:?} key {index} pins entry {rank} of a {}-entry page",
+                            deck.page_len(*pinned)
+                        );
+                    }
+                    // And resolving is its own assertion: an index past the end of a list has to
+                    // come back as an empty key, never as a panic.
+                    deck.tile(index);
+                    deck.key_action(index);
+                    deck.key_long_press_action(index);
+                }
+            }
+        }
     }
 
     // --- The project footer ------------------------------------------------------------------

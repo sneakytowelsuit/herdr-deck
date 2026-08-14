@@ -219,19 +219,25 @@ fn a_focused_workspace_tile_pins_its_layout_without_a_sublabel_or_footer() {
 
 #[test]
 fn attention_with_agents_waiting_pins_the_alert_palette() {
-    let tile = Tile::Attention { count: 3 };
+    let tile = Tile::Attention {
+        count: 3,
+        away: false,
+    };
     assert_key_matches_golden("attention_waiting", &tile, 120);
 }
 
 #[test]
 fn attention_with_nothing_waiting_pins_the_all_clear_palette() {
-    let tile = Tile::Attention { count: 0 };
+    let tile = Tile::Attention {
+        count: 0,
+        away: false,
+    };
     assert_key_matches_golden("attention_all_clear", &tile, 120);
 }
 
 #[test]
 fn an_active_mode_tile_pins_its_underline_indicator() {
-    let tile = Tile::Mode {
+    let tile = Tile::Label {
         label: "agents".into(),
         active: true,
     };
@@ -240,7 +246,7 @@ fn an_active_mode_tile_pins_its_underline_indicator() {
 
 #[test]
 fn an_inactive_mode_tile_pins_the_dimmed_look_with_no_indicator() {
-    let tile = Tile::Mode {
+    let tile = Tile::Label {
         label: "agents".into(),
         active: false,
     };

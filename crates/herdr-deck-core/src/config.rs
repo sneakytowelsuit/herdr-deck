@@ -307,14 +307,20 @@ mod tests {
         )
         .unwrap();
         let layout = config.layout.expect("layout parsed");
-        assert_eq!(layout.keys[0], KeyBinding::Dynamic { rank: 0 });
+        assert_eq!(
+            layout.keys[0],
+            KeyBinding::Dynamic {
+                rank: 0,
+                page: None
+            }
+        );
         assert_eq!(
             layout.keys[1],
             KeyBinding::PinnedAgent {
                 terminal_id: "term_abc".into()
             }
         );
-        assert_eq!(layout.keys[2], KeyBinding::NextAttention);
+        assert_eq!(layout.keys[2], KeyBinding::Attention);
         assert_eq!(
             layout.dials[0],
             DialBinding::Scrub {
