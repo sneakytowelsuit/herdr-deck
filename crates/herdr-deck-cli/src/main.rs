@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(report.exit_code());
         }
         Command::Status { json } => status(&config, args.session.as_deref(), json).await,
-        Command::Layout { model } => layout(&model),
+        Command::Layout { model } => layout(&config, &model),
         Command::Install { force, write_udev } => {
             install(&config_path, force, write_udev).map(|_| ())
         }
@@ -153,10 +153,12 @@ async fn status(config: &Config, session: Option<&str>, json: bool) -> anyhow::R
     Ok(())
 }
 
-fn layout(model: &str) -> anyhow::Result<()> {
+fn layout(config: &Config, model: &str) -> anyhow::Result<()> {
     let model = parse_model(model)?;
     let capabilities = model.capabilities();
-    let profile = Profile::for_capabilities(&capabilities);
+    // Built from the config as well as the hardware, because named layouts earn keys of their own
+    // — printing a deck that ignored them would be printing a deck nobody has.
+    let profile = Profile::derive(&capabilities, config);
 
     println!("{}\n", capabilities.describe());
     for (index, binding) in profile.keys.iter().enumerate() {
@@ -182,15 +184,18 @@ fn describe_key(binding: &KeyBinding) -> String {
         // Naming the gesture matters more than naming the command: a key that only works when
         // held is the one thing about a layout you cannot discover by looking at the deck.
         KeyBinding::Command { command } if command.is_destructive() => {
-            format!("{} {} — hold to confirm", command.label(), command.target())
+            format!("{} — hold to confirm", describe_command(command))
         }
-        // A pane command names a direction or a state rather than a thing, so the verb is the
-        // whole of it — spelling the parameter out again gives you "split right right".
-        KeyBinding::Command { command } if !command.names_an_object() => {
-            command.label().to_string()
-        }
-        KeyBinding::Command { command } => format!("{} {}", command.label(), command.target()),
+        KeyBinding::Command { command } => describe_command(command),
+        KeyBinding::Layout { preset } => format!("apply the `{preset}` layout as a new tab"),
+        KeyBinding::NewWorkspace { preset } => describe_new("workspace", preset),
+        KeyBinding::NewTab { preset } => describe_new("tab", preset),
+        KeyBinding::NewWorktree => "new git worktree, opened and focused".to_string(),
         KeyBinding::ClosePane => "close the focused pane — hold to confirm".to_string(),
+        KeyBinding::CloseTab => "close the focused tab — hold to confirm".to_string(),
+        KeyBinding::RemoveWorktree => {
+            "give the focused worktree back to git — hold to confirm".to_string()
+        }
         KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
         KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
         KeyBinding::PagePrev => "previous page".to_string(),
@@ -201,6 +206,25 @@ fn describe_key(binding: &KeyBinding) -> String {
             target.label()
         ),
         KeyBinding::Empty => "—".to_string(),
+    }
+}
+
+/// One command, said the way a person reads it.
+///
+/// A command that names a direction or a state rather than a thing is complete as its verb —
+/// spelling the parameter out again gives you "split right right" — and a command that names
+/// nothing it may write down has nothing to add either.
+fn describe_command(command: &herdr_deck_core::command::DeckCommand) -> String {
+    match command.target().filter(|_| command.names_an_object()) {
+        Some(target) => format!("{} {target}", command.label()),
+        None => command.label().to_string(),
+    }
+}
+
+fn describe_new(kind: &str, preset: &Option<String>) -> String {
+    match preset {
+        Some(preset) => format!("new {kind} from the `{preset}` preset"),
+        None => format!("new {kind}"),
     }
 }
 
@@ -347,8 +371,27 @@ mod tests {
     #[test]
     fn layout_renders_for_every_supported_model() {
         for model in ["plus", "original", "mini", "xl", "neo", "pedal"] {
-            layout(model).unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
+            layout(&Config::default(), model)
+                .unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
         }
+    }
+
+    #[test]
+    fn a_named_layout_shows_up_as_a_key_of_its_own_when_the_deck_has_room() {
+        // `herdr-deck layout` is how somebody checks what their config did before plugging the
+        // deck in. A preset that earns a key and does not appear here is a preset they will only
+        // find by pressing things.
+        let mut config = Config::default();
+        config.layouts.insert(
+            "dev".into(),
+            herdr_deck_herdr::wire::LayoutPreset::default(),
+        );
+        let profile = Profile::derive(&DeckModel::Xl.capabilities(), &config);
+        let described: Vec<_> = profile.keys.iter().map(describe_key).collect();
+        assert!(
+            described.iter().any(|line| line.contains("`dev` layout")),
+            "the dev layout key is missing from {described:?}"
+        );
     }
 
     #[test]

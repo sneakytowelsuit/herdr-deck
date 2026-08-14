@@ -27,7 +27,9 @@ pub mod mock;
 pub use client::HerdrClient;
 pub use events::{EventStream, HerdrEvent};
 pub use socket::SocketPath;
-pub use wire::{AgentInfo, AgentStatus, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo};
+pub use wire::{
+    AgentInfo, AgentStatus, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo, WorktreeInfo,
+};
 
 /// The herdr socket protocol version this crate was written against.
 ///

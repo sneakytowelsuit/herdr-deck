@@ -132,6 +132,11 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> a
         }
     }
 
+    // Where a command that herdr will not answer quickly sends its verdict once it lands. Bounded
+    // and small: a human cannot press more than a couple of slow keys before the first answers,
+    // and a queue that grew without limit would be a memory leak wearing a feature's clothes.
+    let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::channel::<Vec<DaemonMessage>>(8);
+
     let mut session = Session::new(&device, &context.config, Arc::clone(&context.renderer));
     tracing::info!(
         frontend = %frontend,
@@ -187,9 +192,29 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> a
                 write_all(&mut write_half, &outcome.messages).await?;
 
                 if let Some(action) = outcome.action {
-                    let feedback = perform(&context, action).await;
-                    write_all(&mut write_half, &feedback).await?;
+                    // Making or removing a git worktree is the only thing herdr does not answer
+                    // at once, and on a large repository it is seconds. Carrying that out inside
+                    // this loop would freeze the whole deck for the duration — no repaints, no
+                    // other keys — so it goes alongside the loop instead and reports back when
+                    // git is done. Everything else stays inline, where the ordering is obvious.
+                    if action.command.may_take_a_while() {
+                        let context = Arc::clone(&context);
+                        let feedback_tx = feedback_tx.clone();
+                        tokio::spawn(async move {
+                            let feedback = perform(&context, action).await;
+                            let _ = feedback_tx.send(feedback).await;
+                        });
+                    } else {
+                        let feedback = perform(&context, action).await;
+                        write_all(&mut write_half, &feedback).await?;
+                    }
                 }
+            }
+
+            // A slow command finished. It may well be several seconds after the key was let go,
+            // which is the honest picture: the key is reporting on git, and git took that long.
+            Some(feedback) = feedback_rx.recv() => {
+                write_all(&mut write_half, &feedback).await?;
             }
 
             changed = state_rx.changed() => {

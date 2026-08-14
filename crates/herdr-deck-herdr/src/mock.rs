@@ -191,6 +191,71 @@ impl MockHerdr {
             .await;
         self.with_attached_client().await;
         self.serve_panes().await;
+        self.serve_structure().await;
+    }
+
+    /// Accept every command that drives herdr's own structure — worktrees, workspaces, tabs and
+    /// layouts — answering as a herdr that carried each one out.
+    ///
+    /// Folded into [`Self::serve_session`] for the same reason [`Self::serve_panes`] is: a test
+    /// about something else should never have to know these commands exist.
+    pub async fn serve_structure(&self) {
+        self.reply(
+            "worktree.open",
+            json!({ "type": "worktree_opened", "already_open": false }),
+        )
+        .await;
+        self.reply("worktree.create", json!({ "type": "worktree_created" }))
+            .await;
+        self.reply("worktree.remove", json!({ "type": "worktree_removed" }))
+            .await;
+        self.reply("workspace.create", json!({ "type": "workspace_created" }))
+            .await;
+        self.reply("tab.create", json!({ "type": "tab_created" }))
+            .await;
+        self.reply("tab.close", json!({ "type": "ok" })).await;
+        self.reply("layout.apply", json!({ "type": "layout_apply" }))
+            .await;
+        self.with_worktrees(&[]).await;
+    }
+
+    /// Answer worktree listings with exactly these checkouts.
+    ///
+    /// Takes the typed wire struct rather than JSON so a consumer test builds its fixtures the
+    /// same way the daemon reads them, and cannot accidentally pin a field name this crate is
+    /// free to change.
+    pub async fn with_worktrees(&self, worktrees: &[crate::wire::WorktreeInfo]) {
+        self.reply(
+            "worktree.list",
+            json!({ "type": "worktree_list", "worktrees": worktrees }),
+        )
+        .await;
+    }
+
+    /// Answer worktree listings the way herdr does outside a git repository.
+    pub async fn with_nothing_under_git(&self) {
+        self.reply_error(
+            "worktree.list",
+            "not_git_worktree",
+            "this workspace is not inside a git repository",
+        )
+        .await;
+    }
+
+    /// The path of each worktree the deck asked to open, in order.
+    pub async fn worktree_open_paths(&self) -> Vec<String> {
+        self.observed_string_params("worktree.open", "path").await
+    }
+
+    /// The workspace id of each worktree removal asked for, in order.
+    pub async fn worktree_remove_ids(&self) -> Vec<String> {
+        self.observed_string_params("worktree.remove", "workspace_id")
+            .await
+    }
+
+    /// The tab id of each tab close asked for, in order.
+    pub async fn tab_close_ids(&self) -> Vec<String> {
+        self.observed_string_params("tab.close", "tab_id").await
     }
 
     /// Accept every pane command, answering as a herdr that carried each one out.

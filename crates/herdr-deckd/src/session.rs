@@ -114,9 +114,13 @@ impl Session {
                     capabilities.dials as usize,
                     herdr_deck_core::layout::DialBinding::Unused,
                 );
-                Profile { keys, dials }
+                Profile {
+                    keys,
+                    dials,
+                    presets: config.presets(),
+                }
             }
-            _ => Profile::for_capabilities(&capabilities),
+            _ => Profile::derive(&capabilities, config),
         };
         let key_count = profile.keys.len();
         let dial_count = profile.dials.len();
@@ -316,7 +320,12 @@ impl Session {
             }
 
             SlotAction::ToggleMode => {
-                self.mode = self.mode.toggled();
+                // Asked of the resolved deck rather than of the mode, because where the cycle
+                // goes next depends on what herdr currently holds: a session with no worktrees
+                // has no third list, and a key that stopped at an empty one would be a press
+                // taken from everybody who does not use them.
+                let next = self.resolved(state).next_mode();
+                self.mode = next;
                 self.page = 0;
                 Outcome::just(self.repaint(state))
             }
@@ -347,8 +356,8 @@ impl Session {
         self.acked.forget_stale(state);
 
         // Keep cursors valid: agents come and go underneath us constantly.
-        let (agents, workspaces, tabs, attention) = self.resolved(state).list_lengths();
-        self.selection.clamp(agents, workspaces, tabs, attention);
+        let lengths = self.resolved(state).list_lengths();
+        self.selection.clamp(lengths);
         let pages = self.resolved(state).page_count();
         if self.page >= pages {
             self.page = pages - 1;

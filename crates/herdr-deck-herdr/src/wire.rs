@@ -406,6 +406,257 @@ pub struct PaneZoomResult {
     pub zoom: Option<PaneChange>,
 }
 
+// ----- structure -------------------------------------------------------------------------------
+//
+// Worktrees, layouts and the parameters that create a workspace or a tab. Like the pane
+// vocabularies above, these live here because they are herdr's shapes rather than the deck's —
+// and because two of them double as *config* shapes, which means the spelling a user types and
+// the spelling herdr reads are pinned side by side in one file rather than drifting apart in two.
+
+/// One checkout from `worktree.list`.
+///
+/// herdr builds this by shelling out to `git worktree list --porcelain`, so every field here is
+/// git's opinion rather than herdr's, with one exception: `open_workspace_id`, which is herdr
+/// saying "I already have this one open as a workspace".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    /// The absolute path of the checkout. The only field guaranteed to be present, and therefore
+    /// the one the deck opens by.
+    pub path: String,
+    /// Absent on a detached checkout.
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub is_bare: bool,
+    #[serde(default)]
+    pub is_detached: bool,
+    /// git has lost the checkout — the directory is gone but the administrative file remains.
+    #[serde(default)]
+    pub is_prunable: bool,
+    /// False for the source checkout the other worktrees hang off.
+    #[serde(default)]
+    pub is_linked_worktree: bool,
+    /// The workspace this checkout is already open as, when it is.
+    #[serde(default)]
+    pub open_workspace_id: Option<String>,
+}
+
+impl WorktreeInfo {
+    /// The best short human name, in decreasing order of specificity.
+    ///
+    /// A branch name beats a path because that is what the work is called; the last path component
+    /// is the fallback because a worktree directory is nearly always named after its branch anyway.
+    pub fn label(&self) -> &str {
+        self.label
+            .as_deref()
+            .or(self.branch.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                self.path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&self.path)
+            })
+    }
+
+    /// Can `worktree.open` actually open this one?
+    ///
+    /// herdr refuses bare and prunable entries with `worktree_not_found`. Offering them on a key
+    /// would be offering a press that cannot work, so they never reach the deck at all.
+    pub fn openable(&self) -> bool {
+        !self.is_bare && !self.is_prunable && !self.path.is_empty()
+    }
+}
+
+/// `worktree.list`'s envelope. The `source` block it also carries is not modelled: the deck shows
+/// the checkouts, and the repository they belong to is the one the user is already looking at.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorktreeListResult {
+    #[serde(default)]
+    pub worktrees: Vec<WorktreeInfo>,
+}
+
+/// What to put in a new workspace or a new tab.
+///
+/// Every field is free text, which is exactly why this is a *config* type: a deck has no keyboard,
+/// so the only way any of it can be supplied is by being written down in advance and given a name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CreateSpec {
+    pub label: Option<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl CreateSpec {
+    /// The parameters herdr wants, with everything unset left out rather than sent as null.
+    pub(crate) fn to_params(&self, focus: bool) -> serde_json::Value {
+        let mut params = serde_json::json!({ "focus": focus });
+        if let Some(label) = &self.label {
+            params["label"] = serde_json::json!(label);
+        }
+        if let Some(cwd) = &self.cwd {
+            params["cwd"] = serde_json::json!(cwd);
+        }
+        if !self.env.is_empty() {
+            params["env"] = serde_json::json!(self.env);
+        }
+        params
+    }
+}
+
+/// How many panes a layout tree may describe, and how deeply it may nest.
+///
+/// herdr's own limits. Checked here so a preset that breaks them is refused when the config is
+/// read, rather than accepted and then rejected by herdr the first time somebody presses the key.
+pub const MAX_LAYOUT_PANES: usize = 24;
+pub const MAX_LAYOUT_DEPTH: usize = 16;
+
+/// One node of a layout tree: either a pane, or a split holding two more nodes.
+///
+/// Flat rather than an enum because this is a *TOML* shape before it is a JSON one, and a tagged
+/// enum would put `type = "pane"` on every leaf of a tree that is mostly leaves. `split` is the
+/// discriminator: with it the node is a split and needs both children, without it the node is a
+/// pane. [`LayoutNode::validate`] is what makes that rule an error rather than a surprise.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutNode {
+    /// Set to make this a split.
+    pub split: Option<SplitDirection>,
+    /// How much of the space the first child gets, as a percentage.
+    ///
+    /// A whole number rather than herdr's fraction, for two reasons. `50` is what a person writing
+    /// a config means, and an integer keeps every command the deck can issue comparable by value —
+    /// a float in here would make two identical keys unable to agree that they are identical.
+    pub ratio: Option<u8>,
+    pub first: Option<Box<LayoutNode>>,
+    pub second: Option<Box<LayoutNode>>,
+
+    /// Pane fields. All free text, all optional, and all only reachable from a named preset.
+    pub cwd: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub label: Option<String>,
+}
+
+impl LayoutNode {
+    pub fn is_split(&self) -> bool {
+        self.split.is_some()
+    }
+
+    /// herdr's smallest and largest ratios. It clamps silently rather than complaining, so
+    /// anything outside this is refused here instead — a key that asked for 95% and quietly got
+    /// 90% is a key whose config lies about what it does.
+    const RATIO_RANGE: std::ops::RangeInclusive<u8> = 10..=90;
+
+    /// Check the tree against herdr's rules and this crate's own.
+    ///
+    /// Returns the reason as prose, because the only place it can go is a config error in front of
+    /// somebody who is editing the file right now.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let mut panes = 0usize;
+        self.check(1, &mut panes)?;
+        if panes > MAX_LAYOUT_PANES {
+            return Err(format!(
+                "describes {panes} panes; herdr accepts at most {MAX_LAYOUT_PANES}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check(&self, depth: usize, panes: &mut usize) -> std::result::Result<(), String> {
+        if depth > MAX_LAYOUT_DEPTH {
+            return Err(format!(
+                "nests more than {MAX_LAYOUT_DEPTH} levels deep, which herdr will not accept"
+            ));
+        }
+        match self.split {
+            Some(_) => {
+                if self.cwd.is_some() || self.command.is_some() || self.label.is_some() {
+                    return Err(
+                        "a `split` also carries pane settings; move `cwd`, `command` or `label` \
+                         onto one of its children"
+                            .to_string(),
+                    );
+                }
+                let ratio = self.ratio.unwrap_or(50);
+                if !Self::RATIO_RANGE.contains(&ratio) {
+                    return Err(format!(
+                        "has ratio {ratio}; herdr only honours {}..={}",
+                        Self::RATIO_RANGE.start(),
+                        Self::RATIO_RANGE.end()
+                    ));
+                }
+                let (Some(first), Some(second)) = (&self.first, &self.second) else {
+                    return Err("a `split` needs both a `first` and a `second` child".to_string());
+                };
+                first.check(depth + 1, panes)?;
+                second.check(depth + 1, panes)
+            }
+            None => {
+                if self.first.is_some() || self.second.is_some() || self.ratio.is_some() {
+                    return Err(
+                        "has children or a ratio but no `split` saying which way it divides"
+                            .to_string(),
+                    );
+                }
+                *panes += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// The JSON herdr wants. Only reached after [`Self::validate`] has passed.
+    pub(crate) fn to_params(&self) -> serde_json::Value {
+        match self.split {
+            Some(direction) => {
+                let empty = LayoutNode::default();
+                serde_json::json!({
+                    "type": "split",
+                    "direction": direction,
+                    // Divided as a double, not a float: `60f32 / 100.0` serialises as
+                    // 0.6000000238418579, which is a true value of the float and a startling thing
+                    // to find in a request when you wrote `ratio = 60`.
+                    "ratio": f64::from(self.ratio.unwrap_or(50)) / 100.0,
+                    "first": self.first.as_deref().unwrap_or(&empty).to_params(),
+                    "second": self.second.as_deref().unwrap_or(&empty).to_params(),
+                })
+            }
+            None => {
+                let mut pane = serde_json::json!({ "type": "pane" });
+                if let Some(cwd) = &self.cwd {
+                    pane["cwd"] = serde_json::json!(cwd);
+                }
+                if let Some(command) = &self.command {
+                    pane["command"] = serde_json::json!(command);
+                }
+                if let Some(label) = &self.label {
+                    pane["label"] = serde_json::json!(label);
+                }
+                pane
+            }
+        }
+    }
+}
+
+/// A named arrangement of panes, from config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutPreset {
+    /// What to call the tab this makes. Optional; herdr names it itself otherwise.
+    pub label: Option<String>,
+    pub root: LayoutNode,
+}
+
+impl LayoutPreset {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        self.root.validate()
+    }
+}
+
 /// A request line on the herdr socket.
 #[derive(Debug, Clone, Serialize)]
 pub struct Request<'a> {
@@ -693,6 +944,176 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ZoomMode::ALL).unwrap(),
             serde_json::json!(["on", "off"]),
+        );
+    }
+
+    // --- Structure ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_worktree_listing_parses_and_says_which_checkouts_are_already_open() {
+        let raw = r#"{"type":"worktree_list",
+            "source":{"repo_key":"k","repo_name":"api","repo_root":"/src/api"},
+            "worktrees":[
+              {"path":"/src/api","branch":"main","is_linked_worktree":false,
+               "open_workspace_id":"w1","label":"api"},
+              {"path":"/src/.worktrees/api/fix-auth","branch":"fix-auth",
+               "is_linked_worktree":true}
+            ]}"#;
+        let result: WorktreeListResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.worktrees.len(), 2);
+        assert_eq!(result.worktrees[0].open_workspace_id.as_deref(), Some("w1"));
+        assert_eq!(result.worktrees[1].open_workspace_id, None);
+    }
+
+    #[test]
+    fn a_worktree_names_itself_by_branch_and_falls_back_to_its_directory() {
+        // A detached checkout has no branch at all, and a key showing its full path would show
+        // nothing but the shared prefix every worktree on the machine has.
+        let detached = WorktreeInfo {
+            path: "/home/dev/.worktrees/api/spike/".into(),
+            is_detached: true,
+            ..Default::default()
+        };
+        assert_eq!(detached.label(), "spike");
+
+        let named = WorktreeInfo {
+            path: "/home/dev/.worktrees/api/spike".into(),
+            branch: Some("fix-auth".into()),
+            ..Default::default()
+        };
+        assert_eq!(named.label(), "fix-auth");
+    }
+
+    #[test]
+    fn a_checkout_herdr_would_refuse_to_open_says_so_before_it_reaches_a_key() {
+        // herdr answers `worktree_not_found` for bare and prunable entries. A key that offered one
+        // would be a key that cannot work, which is worse than a key that is not there.
+        let bare = WorktreeInfo {
+            path: "/src/api.git".into(),
+            is_bare: true,
+            ..Default::default()
+        };
+        let gone = WorktreeInfo {
+            path: "/src/gone".into(),
+            is_prunable: true,
+            ..Default::default()
+        };
+        let ordinary = WorktreeInfo {
+            path: "/src/api".into(),
+            ..Default::default()
+        };
+        assert!(!bare.openable());
+        assert!(!gone.openable());
+        assert!(ordinary.openable());
+    }
+
+    #[test]
+    fn a_layout_preset_reaches_herdr_as_the_tree_it_describes() {
+        let preset: LayoutPreset = toml::from_str(
+            r#"
+            label = "dev"
+            [root]
+            split = "right"
+            ratio = 60
+            [root.first]
+            [root.second]
+            command = ["cargo", "watch"]
+            "#,
+        )
+        .unwrap();
+        preset.validate().unwrap();
+
+        assert_eq!(
+            preset.root.to_params(),
+            serde_json::json!({
+                "type": "split",
+                "direction": "right",
+                "ratio": 0.6,
+                "first": {"type": "pane"},
+                "second": {"type": "pane", "command": ["cargo", "watch"]},
+            })
+        );
+    }
+
+    #[test]
+    fn a_layout_with_a_ratio_herdr_would_silently_clamp_is_refused_instead() {
+        // herdr accepts 0.95 and quietly gives you 0.9. A config that says one thing and does
+        // another is worse than a config that will not load.
+        let node = LayoutNode {
+            split: Some(SplitDirection::Down),
+            ratio: Some(95),
+            first: Some(Box::default()),
+            second: Some(Box::default()),
+            ..Default::default()
+        };
+        let err = node.validate().unwrap_err();
+        assert!(err.contains("95"), "got {err}");
+    }
+
+    #[test]
+    fn a_split_missing_half_of_itself_is_an_error_and_not_an_empty_pane() {
+        let node = LayoutNode {
+            split: Some(SplitDirection::Right),
+            first: Some(Box::default()),
+            ..Default::default()
+        };
+        assert!(node.validate().unwrap_err().contains("second"));
+    }
+
+    #[test]
+    fn a_pane_that_was_given_children_without_a_split_says_which_field_is_missing() {
+        // The likeliest typo in the whole schema: writing `first`/`second` and forgetting to say
+        // which way the divider goes. Without this it would load as a bare pane and silently drop
+        // everything underneath it.
+        let node = LayoutNode {
+            first: Some(Box::default()),
+            second: Some(Box::default()),
+            ..Default::default()
+        };
+        assert!(node.validate().unwrap_err().contains("split"));
+    }
+
+    #[test]
+    fn a_layout_larger_than_herdr_accepts_is_refused_when_the_config_is_read() {
+        // Twenty-five panes, built as a spine of splits. herdr would reject this at press time
+        // with `invalid_layout`; catching it at load means the user learns while they are looking
+        // at the file.
+        let mut node = LayoutNode::default();
+        for _ in 0..MAX_LAYOUT_PANES {
+            node = LayoutNode {
+                split: Some(SplitDirection::Down),
+                first: Some(Box::default()),
+                second: Some(Box::new(node)),
+                ..Default::default()
+            };
+        }
+        let err = node.validate().unwrap_err();
+        assert!(
+            err.contains("deep") || err.contains("panes"),
+            "an oversized layout must say so: {err}"
+        );
+    }
+
+    #[test]
+    fn a_create_preset_sends_only_what_it_was_given() {
+        // Sending `label: null` is not the same as not sending `label`, and herdr's create methods
+        // treat the absent form as "use your own default".
+        let bare = CreateSpec::default();
+        assert_eq!(bare.to_params(true), serde_json::json!({"focus": true}));
+
+        let full = CreateSpec {
+            label: Some("notes".into()),
+            cwd: Some("/home/dev/notes".into()),
+            env: BTreeMap::from([("EDITOR".to_string(), "hx".to_string())]),
+        };
+        assert_eq!(
+            full.to_params(true),
+            serde_json::json!({
+                "focus": true,
+                "label": "notes",
+                "cwd": "/home/dev/notes",
+                "env": {"EDITOR": "hx"},
+            })
         );
     }
 

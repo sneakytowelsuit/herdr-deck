@@ -29,6 +29,41 @@ const RETRY_MAX: Duration = Duration::from_secs(10);
 /// per event; with it, a burst costs one snapshot.
 const COALESCE: Duration = Duration::from_millis(60);
 
+/// How stale the worktree listing is allowed to get.
+///
+/// Deliberately far slower than the reconcile. `worktree.list` makes herdr shell out to `git
+/// worktree list`, and a subprocess every two seconds for a list that changes when somebody runs
+/// `git worktree add` is a bad trade. Anything herdr does to worktrees is caught long before this
+/// expires — see [`WorktreeCache::wants_refresh`] — so this timer only exists to notice changes
+/// made outside herdr entirely.
+const WORKTREE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The worktree listing, and what it was true of.
+///
+/// Held across reconciles rather than fetched with each one, and refreshed on two triggers: the
+/// slow timer above, and any change to the *set* of workspaces herdr holds. The second is what
+/// makes the deck feel immediate — opening, creating or removing a worktree all add or remove a
+/// workspace, so the listing catches up on the very next reconcile rather than up to fifteen
+/// seconds later.
+#[derive(Default)]
+struct WorktreeCache {
+    worktrees: Vec<herdr_deck_herdr::WorktreeInfo>,
+    workspace_ids: Vec<String>,
+    fetched_at: Option<Instant>,
+}
+
+impl WorktreeCache {
+    fn wants_refresh(&self, workspace_ids: &[String], now: Instant) -> bool {
+        match self.fetched_at {
+            None => true,
+            Some(at) => {
+                self.workspace_ids != workspace_ids
+                    || now.saturating_duration_since(at) >= WORKTREE_INTERVAL
+            }
+        }
+    }
+}
+
 /// Watches herdr and publishes state.
 pub struct Watcher {
     client: HerdrClient,
@@ -57,8 +92,12 @@ impl Watcher {
         // after it — same `state_change_seq` — has been waiting the whole time, and resetting
         // its clock here would quietly turn a ten-minute wait back into a fresh one.
         let mut clock = WaitClock::default();
+        // Kept across connections too. A herdr restart does not move anybody's worktrees, and
+        // re-shelling out to git for a list we already have would only make the deck slower to
+        // come back.
+        let mut worktrees = WorktreeCache::default();
         loop {
-            match self.connected_loop(&tx, &mut clock).await {
+            match self.connected_loop(&tx, &mut clock, &mut worktrees).await {
                 Ok(()) => {
                     // The subscription ended cleanly — herdr restarted or shut down. Retry
                     // promptly rather than backing off; this is the common case after a herdr
@@ -80,11 +119,12 @@ impl Watcher {
         &self,
         tx: &watch::Sender<Arc<DeckState>>,
         clock: &mut WaitClock,
+        worktrees: &mut WorktreeCache,
     ) -> Result<(), HerdrError> {
         // Subscribe *before* the first snapshot so no change can slip through the gap between
         // reading state and starting to listen.
         let mut events = EventStream::subscribe(&self.client).await?;
-        self.reconcile(tx, clock).await?;
+        self.reconcile(tx, clock, worktrees).await?;
 
         loop {
             let next = tokio::time::timeout(self.reconcile_interval, events.next()).await;
@@ -96,13 +136,13 @@ impl Watcher {
                         tokio::time::timeout(Duration::from_millis(1), events.next()).await
                     {
                     }
-                    self.reconcile(tx, clock).await?;
+                    self.reconcile(tx, clock, worktrees).await?;
                 }
                 // herdr closed the subscription.
                 Ok(Ok(None)) => return Ok(()),
                 Ok(Err(e)) => return Err(e),
                 // Nothing happened for a while; reconcile anyway as the safety net.
-                Err(_) => self.reconcile(tx, clock).await?,
+                Err(_) => self.reconcile(tx, clock, worktrees).await?,
             }
         }
     }
@@ -111,15 +151,52 @@ impl Watcher {
         &self,
         tx: &watch::Sender<Arc<DeckState>>,
         clock: &mut WaitClock,
+        worktrees: &mut WorktreeCache,
     ) -> Result<(), HerdrError> {
         let snapshot = self.client.session_snapshot().await?;
         warn_on_protocol_mismatch(snapshot.protocol);
-        let mut state = DeckState::from_snapshot(snapshot);
+        let now = Instant::now();
+
+        let workspace_ids: Vec<String> = snapshot
+            .workspaces
+            .iter()
+            .map(|w| w.workspace_id.clone())
+            .collect();
+        if worktrees.wants_refresh(&workspace_ids, now) {
+            self.refresh_worktrees(worktrees, workspace_ids, now).await;
+        }
+
+        let mut state =
+            DeckState::from_snapshot(snapshot).with_worktrees(worktrees.worktrees.clone());
         // Stamped here rather than in `from_snapshot` because this is the only layer that has
         // both the fresh state and a clock older than it.
-        clock.stamp(&mut state, Instant::now());
+        clock.stamp(&mut state, now);
         let _ = tx.send(Arc::new(state));
         Ok(())
+    }
+
+    /// Re-read the worktree listing, and treat any failure as "there are none".
+    ///
+    /// Not a `Result`, on purpose. herdr answers `not_git_worktree` for a perfectly healthy
+    /// session that simply is not inside a repository, and letting that bubble up would take the
+    /// whole deck offline — every agent key gone — over a list most people never look at. The
+    /// cache is stamped either way so a session outside git does not shell out every two seconds
+    /// forever.
+    async fn refresh_worktrees(
+        &self,
+        cache: &mut WorktreeCache,
+        workspace_ids: Vec<String>,
+        now: Instant,
+    ) {
+        match self.client.worktree_list().await {
+            Ok(worktrees) => cache.worktrees = worktrees,
+            Err(e) => {
+                tracing::debug!(error = %e, "no worktree listing; showing none");
+                cache.worktrees.clear();
+            }
+        }
+        cache.workspace_ids = workspace_ids;
+        cache.fetched_at = Some(now);
     }
 }
 

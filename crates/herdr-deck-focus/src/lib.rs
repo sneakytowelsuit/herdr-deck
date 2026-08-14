@@ -388,6 +388,29 @@ impl<R: CommandRunner> FocusEngine<R> {
                     .await
                     .map(|()| PaneOutcome::Changed),
             ),
+
+            // Opening a worktree is the one structural command that is a journey, so it is the one
+            // that also fetches the window — see [`DeckCommand::raises_the_window`].
+            DeckCommand::OpenWorktree { path } => {
+                self.report(self.client.worktree_open(path).await).await
+            }
+
+            // Everything below makes or unmakes part of herdr's structure around the terminal the
+            // user is already at.
+            DeckCommand::ApplyLayout { layout, .. } => {
+                in_place(done(self.client.layout_apply(layout).await))
+            }
+            DeckCommand::CreateWorkspace { spec, .. } => {
+                in_place(done(self.client.workspace_create(spec).await))
+            }
+            DeckCommand::CreateTab { spec, .. } => {
+                in_place(done(self.client.tab_create(spec).await))
+            }
+            DeckCommand::CreateWorktree => in_place(done(self.client.worktree_create().await)),
+            DeckCommand::RemoveWorktree { workspace_id } => {
+                in_place(done(self.client.worktree_remove(workspace_id).await))
+            }
+            DeckCommand::CloseTab { tab_id } => in_place(done(self.client.tab_close(tab_id).await)),
         }
     }
 
@@ -506,6 +529,15 @@ impl<R: CommandRunner> FocusEngine<R> {
 /// a failure. Collapsing the middle one into either of the others is the mistake that would make
 /// this deck's alerts worthless — a thumb run along a row of direction keys ends at an edge every
 /// single time.
+/// herdr answered a bare `ok`, so there was nothing for it to report but success.
+///
+/// Most of herdr's structural commands are like this: they make a thing, and the only two answers
+/// are "made it" and an error. Naming the conversion rather than writing the same `map` at every
+/// call site is what keeps the arms above readable as a list of one-line commands.
+fn done(result: herdr_deck_herdr::Result<()>) -> herdr_deck_herdr::Result<PaneOutcome> {
+    result.map(|()| PaneOutcome::Changed)
+}
+
 fn in_place(result: herdr_deck_herdr::Result<PaneOutcome>) -> FocusReport {
     match result {
         Ok(PaneOutcome::Changed) => FocusReport {

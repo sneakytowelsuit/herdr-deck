@@ -56,6 +56,16 @@ pub enum Tile {
         status: AgentStatus,
         focused: bool,
     },
+    /// A git worktree, for the worktree page.
+    ///
+    /// No status: a checkout cannot be blocked or done, and giving it one would mean inventing a
+    /// state herdr never reported. What it has instead is `open` — whether herdr already holds it
+    /// as a workspace — which is the one thing worth knowing before pressing it.
+    Worktree {
+        label: String,
+        open: bool,
+        focused: bool,
+    },
     /// "N agents want you" — dark when nothing does.
     Attention { count: usize },
     /// A mode/page toggle.
@@ -101,6 +111,16 @@ pub enum KeyGlyph {
     ZoomOut,
     /// A pane with a line drawn through it.
     Close,
+    /// A tab, drawn as a pane with a strip along its top — and the same shape crossed out.
+    NewTab,
+    CloseTab,
+    /// Two panes offset behind one another, which is what a workspace looks like from outside it.
+    NewWorkspace,
+    /// A pane divided the way a saved layout divides one.
+    Layout,
+    /// A fork: a trunk with a branch leaving it, and the same shape crossed out.
+    NewWorktree,
+    RemoveWorktree,
 }
 
 /// Everything the shared agent/workspace layout draws.
@@ -240,6 +260,24 @@ impl TileRenderer {
                     },
                 )
             }
+            Tile::Worktree {
+                label,
+                open,
+                focused,
+            } => self.agent_svg(
+                s,
+                AgentFace {
+                    label,
+                    // The caption says what pressing it does, which for a checkout that is already
+                    // open is "take me there" rather than "open it" — the same key either way,
+                    // because `worktree.open` is idempotent, but not the same sentence.
+                    sublabel: Some(if *open { "open" } else { "not open" }),
+                    workspace: None,
+                    style: self.theme.worktree(*open),
+                    focused: *focused,
+                    waiting: None,
+                },
+            ),
             Tile::Attention { count } => self.attention_svg(s, *count),
             Tile::Mode { label, active } => self.mode_svg(s, label, *active),
             Tile::Command {
@@ -636,6 +674,43 @@ fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
             r##"<line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{colour}" stroke-width="{stroke:.2}" stroke-linecap="round"/>"##
         )
     };
+    // A cross inside a `d`-sided box: what "this one goes away" looks like on every key that says
+    // it. One shape for one meaning, so a crossed-out anything reads without being learned.
+    let cross = |x: f32, y: f32, d: f32| {
+        format!(
+            "{}{}",
+            line(x + d * 0.26, y + d * 0.26, x + d * 0.74, y + d * 0.74),
+            line(x + d * 0.74, y + d * 0.26, x + d * 0.26, y + d * 0.74)
+        )
+    };
+    // ...and a plus for "one more of these", by the same rule.
+    let plus = |cx: f32, cy: f32, size: f32| {
+        let h = size / 2.0;
+        format!(
+            "{}{}",
+            line(cx - h, cy, cx + h, cy),
+            line(cx, cy - h, cx, cy + h)
+        )
+    };
+    // A trunk with one branch leaving it — git's own picture of a worktree, and the only shape
+    // here that is not a rectangle, which is what keeps it findable by feel in a row of panes.
+    let fork = || {
+        let trunk = x0 + d * 0.26;
+        let branch = x0 + d * 0.74;
+        let dot = |cx: f32, cy: f32| {
+            format!(
+                r##"<circle cx="{cx:.2}" cy="{cy:.2}" r="{r:.2}" fill="{colour}"/>"##,
+                r = d * 0.13
+            )
+        };
+        format!(
+            "{}{}{}{}",
+            line(trunk, y0 + d * 0.10, trunk, y0 + d * 0.90),
+            line(trunk, y0 + d * 0.34, branch, y0 + d * 0.34),
+            dot(trunk, y0 + d * 0.10),
+            dot(branch, y0 + d * 0.34),
+        )
+    };
 
     match glyph {
         KeyGlyph::Arrow(direction) => triangle(match direction {
@@ -713,12 +788,63 @@ fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
             line(x0 + d / 2.0, y0, x0 + d / 2.0, y0 + d),
             line(x0, y0 + d / 2.0, x0 + d, y0 + d / 2.0)
         ),
-        KeyGlyph::Close => format!(
+        KeyGlyph::Close => format!("{}{}", outline, cross(x0, y0, d)),
+
+        // A tab is a pane wearing a strip: the same body as every pane shape above, with the
+        // header the tab bar draws. That makes "tab" and "pane" tell each other apart at a glance
+        // while keeping the family resemblance that says they are the same kind of thing.
+        KeyGlyph::NewTab => format!(
             "{}{}{}",
             outline,
-            line(x0 + d * 0.26, y0 + d * 0.26, x0 + d * 0.74, y0 + d * 0.74),
-            line(x0 + d * 0.74, y0 + d * 0.26, x0 + d * 0.26, y0 + d * 0.74)
+            fill(x0 + stroke, y0 + stroke, d * 0.42, d * 0.16),
+            plus(x0 + d / 2.0, y0 + d * 0.60, d * 0.34)
         ),
+        KeyGlyph::CloseTab => format!(
+            "{}{}{}",
+            outline,
+            fill(x0 + stroke, y0 + stroke, d * 0.42, d * 0.16),
+            cross(x0 + d * 0.08, y0 + d * 0.18, d * 0.84)
+        ),
+        // A workspace holds tabs the way a stack of paper holds sheets: what you see from outside
+        // is the one on top and the corner of the one behind it.
+        KeyGlyph::NewWorkspace => format!(
+            r##"<rect x="{bx:.2}" y="{by:.2}" width="{bd:.2}" height="{bd:.2}" rx="{r:.2}" fill="none" stroke="{colour}" stroke-width="{stroke:.2}" opacity="0.55"/>{front}{plus}"##,
+            bx = x0 + d * 0.18,
+            by = y0,
+            bd = d * 0.82,
+            r = d * 0.10,
+            front = format_args!(
+                r##"<rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{w:.2}" rx="{r:.2}" fill="{bgish}" stroke="{colour}" stroke-width="{stroke:.2}"/>"##,
+                x = x0,
+                y = y0 + d * 0.18,
+                w = d * 0.82,
+                r = d * 0.10,
+                // Painted, not transparent, so the sheet behind it genuinely goes behind rather
+                // than showing through and turning two squares into a lattice.
+                bgish = "#0E0F12",
+            ),
+            plus = plus(x0 + d * 0.41, y0 + d * 0.59, d * 0.36),
+        ),
+        // A saved layout is not one pane and not four equal ones — it is a deliberate, uneven
+        // arrangement, and the shape says so by being uneven.
+        KeyGlyph::Layout => format!(
+            "{}{}{}",
+            outline,
+            line(x0 + d * 0.42, y0, x0 + d * 0.42, y0 + d),
+            line(x0 + d * 0.42, y0 + d * 0.55, x0 + d, y0 + d * 0.55)
+        ),
+        // A worktree is made, or given back: the fork with a plus on the branch, or with the
+        // branch struck out.
+        KeyGlyph::NewWorktree => {
+            format!("{}{}", fork(), plus(x0 + d * 0.74, y0 + d * 0.78, d * 0.36))
+        }
+        KeyGlyph::RemoveWorktree => {
+            format!(
+                "{}{}",
+                fork(),
+                cross(x0 + d * 0.56, y0 + d * 0.60, d * 0.36)
+            )
+        }
     }
 }
 

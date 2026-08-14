@@ -14,9 +14,10 @@
 
 use crate::capabilities::DeckCapabilities;
 use crate::command::DeckCommand;
+use crate::config::{Config, Presets};
 use crate::render::{KeyGlyph, Tile};
 use crate::state::{Acknowledged, DeckState};
-use herdr_deck_herdr::wire::{AgentInfo, PaneDirection, SplitDirection, ZoomMode};
+use herdr_deck_herdr::wire::{AgentInfo, PaneDirection, SplitDirection, WorktreeInfo, ZoomMode};
 use serde::{Deserialize, Serialize};
 
 /// Which list the deck is currently showing.
@@ -26,20 +27,20 @@ pub enum Mode {
     #[default]
     Agents,
     Workspaces,
+    /// The git worktrees of the repository the focused workspace belongs to.
+    ///
+    /// Only ever reached when there are some — see [`ResolvedDeck::next_mode`]. A third stop on
+    /// the mode key that showed an empty grid to everybody who does not use worktrees would be a
+    /// press taken from the people who do.
+    Worktrees,
 }
 
 impl Mode {
-    pub fn toggled(self) -> Self {
-        match self {
-            Mode::Agents => Mode::Workspaces,
-            Mode::Workspaces => Mode::Agents,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Mode::Agents => "agents",
             Mode::Workspaces => "spaces",
+            Mode::Worktrees => "trees",
         }
     }
 }
@@ -56,6 +57,8 @@ pub enum ScrubTarget {
     Tabs,
     /// Only agents that are blocked or done.
     Attention,
+    /// The git worktrees of the repository the focused workspace belongs to.
+    Worktrees,
 }
 
 impl ScrubTarget {
@@ -65,6 +68,7 @@ impl ScrubTarget {
             ScrubTarget::Workspaces => "space",
             ScrubTarget::Tabs => "tab",
             ScrubTarget::Attention => "needs you",
+            ScrubTarget::Worktrees => "worktree",
         }
     }
 }
@@ -107,6 +111,41 @@ pub enum KeyBinding {
     /// there now. The deck resolves it against live state instead, and refuses when herdr reports
     /// nothing focused.
     ClosePane,
+    /// Build a new tab from a layout named in config.
+    ///
+    /// The tree itself lives in `[layouts.<name>]` rather than on the key, because a key is a
+    /// place to say *which* and a config file is the place to say *what*. A key naming a layout
+    /// that is not defined is refused when the config is read; the dimmed face it would otherwise
+    /// draw exists only for the layout a herdr-deck upgrade might one day take away.
+    Layout {
+        preset: String,
+    },
+    /// Make a new workspace, from `[workspaces.<name>]` when one is named.
+    NewWorkspace {
+        #[serde(default)]
+        preset: Option<String>,
+    },
+    /// Make a new tab in the workspace you are in, from `[tabs.<name>]` when one is named.
+    NewTab {
+        #[serde(default)]
+        preset: Option<String>,
+    },
+    /// Make a new git worktree and go to it.
+    ///
+    /// Takes nothing, and needs nothing: herdr invents the branch name. This is the only key on
+    /// the deck that starts a piece of work rather than navigating to one.
+    NewWorktree,
+    /// Close whichever tab herdr says is focused.
+    ///
+    /// Argument-less for the same reason [`KeyBinding::ClosePane`] is: an id written into a config
+    /// file names whatever answers to it now, not what it named when it was written.
+    CloseTab,
+    /// Give the focused workspace's worktree back to git.
+    ///
+    /// Only offers itself when the focused workspace really is a linked worktree the deck has seen
+    /// in herdr's listing — otherwise herdr would refuse it, and a key that draws as usable and
+    /// then refuses is a key that has to be tried to be understood.
+    RemoveWorktree,
     /// Jump straight to the top-ranked agent that wants you.
     NextAttention,
     /// Switch between agents and workspaces.
@@ -206,6 +245,19 @@ fn guard_tap(action: SlotAction) -> SlotAction {
     }
 }
 
+/// How long the list behind each scrub target is right now.
+///
+/// A named struct rather than a tuple because there are five of them and they are all `usize`:
+/// two of them swapped at a call site would be a bug nothing could catch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListLengths {
+    pub agents: usize,
+    pub workspaces: usize,
+    pub tabs: usize,
+    pub attention: usize,
+    pub worktrees: usize,
+}
+
 /// Where each scrub cursor currently sits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -213,6 +265,7 @@ pub struct Selection {
     pub workspaces: usize,
     pub tabs: usize,
     pub attention: usize,
+    pub worktrees: usize,
 }
 
 impl Selection {
@@ -222,6 +275,7 @@ impl Selection {
             ScrubTarget::Workspaces => self.workspaces,
             ScrubTarget::Tabs => self.tabs,
             ScrubTarget::Attention => self.attention,
+            ScrubTarget::Worktrees => self.worktrees,
         }
     }
 
@@ -232,6 +286,7 @@ impl Selection {
             ScrubTarget::Workspaces => &mut self.workspaces,
             ScrubTarget::Tabs => &mut self.tabs,
             ScrubTarget::Attention => &mut self.attention,
+            ScrubTarget::Worktrees => &mut self.worktrees,
         };
         if len == 0 {
             *slot = 0;
@@ -243,7 +298,7 @@ impl Selection {
     }
 
     /// Keep cursors in range after the underlying lists change.
-    pub fn clamp(&mut self, agents: usize, workspaces: usize, tabs: usize, attention: usize) {
+    pub fn clamp(&mut self, lengths: ListLengths) {
         let fix = |v: &mut usize, len: usize| {
             if len == 0 {
                 *v = 0;
@@ -251,26 +306,47 @@ impl Selection {
                 *v = len - 1;
             }
         };
-        fix(&mut self.agents, agents);
-        fix(&mut self.workspaces, workspaces);
-        fix(&mut self.tabs, tabs);
-        fix(&mut self.attention, attention);
+        fix(&mut self.agents, lengths.agents);
+        fix(&mut self.workspaces, lengths.workspaces);
+        fix(&mut self.tabs, lengths.tabs);
+        fix(&mut self.attention, lengths.attention);
+        fix(&mut self.worktrees, lengths.worktrees);
     }
 }
 
 /// A concrete assignment of bindings to physical controls.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Profile {
     pub keys: Vec<KeyBinding>,
     pub dials: Vec<DialBinding>,
+    /// The named layouts, workspaces and tabs a key here may refer to.
+    ///
+    /// Carried by the profile rather than fetched from the config at press time, so that resolving
+    /// a key needs nothing the layout engine does not already hold — and so a key naming a preset
+    /// that has gone missing degrades to a dimmed face that says so, rather than to a panic.
+    #[serde(default)]
+    pub presets: Presets,
 }
 
 impl Profile {
-    /// Build the default layout for this hardware.
+    /// Build the default layout for this hardware alone.
     pub fn for_capabilities(caps: &DeckCapabilities) -> Self {
+        Self::derive(caps, &Config::default())
+    }
+
+    /// Build the default layout for this hardware and this config's presets.
+    ///
+    /// The presets are an input to the *layout* and not only to the keys: a deck with room to
+    /// spare grows one key per named layout, because a layout nobody can reach is one nobody
+    /// meant to write down.
+    pub fn derive(caps: &DeckCapabilities, config: &Config) -> Self {
         let dials = default_dials(caps.dials);
-        let keys = default_keys(caps, !dials.is_empty());
-        Self { keys, dials }
+        let keys = default_keys(caps, !dials.is_empty(), &config.layouts);
+        Self {
+            keys,
+            dials,
+            presets: config.presets(),
+        }
     }
 
     /// How many keys show list entries.
@@ -336,7 +412,11 @@ fn default_dials(count: u8) -> Vec<DialBinding> {
         .collect()
 }
 
-fn default_keys(caps: &DeckCapabilities, has_dials: bool) -> Vec<KeyBinding> {
+fn default_keys<V>(
+    caps: &DeckCapabilities,
+    has_dials: bool,
+    layouts: &std::collections::BTreeMap<String, V>,
+) -> Vec<KeyBinding> {
     let total = caps.key_count();
     if total == 0 {
         return vec![];
@@ -372,6 +452,12 @@ fn default_keys(caps: &DeckCapabilities, has_dials: bool) -> Vec<KeyBinding> {
         reserved.push(KeyBinding::PagePrev);
         reserved.push(KeyBinding::PageNext);
     }
+    // A key per named layout, ahead of pane control in the queue because these were asked for by
+    // name in a config file and pane control was not. Alphabetical, so the same config always
+    // produces the same deck and a key does not move under a thumb because a table was reordered.
+    reserved.extend(layouts.keys().map(|preset| KeyBinding::Layout {
+        preset: preset.clone(),
+    }));
     // Pane control, but only where it is free. On an eight-key deck four arrows would be half the
     // surface, and the agents are the reason the deck is on the desk at all — so the Plus, the
     // Mini and the 15-key get none of this by default and bind it by hand if they want it. Past
@@ -440,6 +526,20 @@ impl<'a> ResolvedDeck<'a> {
         match self.mode {
             Mode::Agents => self.order.len(),
             Mode::Workspaces => self.state.workspaces.len(),
+            Mode::Worktrees => self.state.worktrees.len(),
+        }
+    }
+
+    /// Where the mode key goes next.
+    ///
+    /// Worktrees are skipped when there are none, so the third stop only exists for the people who
+    /// have a third list — everybody else keeps the two-press cycle they had. Leaving worktree
+    /// mode is unconditional, so a list that empties underneath you never traps the key.
+    pub fn next_mode(&self) -> Mode {
+        match self.mode {
+            Mode::Agents => Mode::Workspaces,
+            Mode::Workspaces if !self.state.worktrees.is_empty() => Mode::Worktrees,
+            Mode::Workspaces | Mode::Worktrees => Mode::Agents,
         }
     }
 
@@ -461,27 +561,29 @@ impl<'a> ResolvedDeck<'a> {
         self.needing_attention().count()
     }
 
-    /// Lengths for every scrub target, in the order [`Selection`] wants them.
+    /// Lengths for every scrub target.
     ///
     /// Cursors have to be clamped against the same lists the keys resolve against, so handing
     /// them out together is what stops the two drifting apart.
-    pub fn list_lengths(&self) -> (usize, usize, usize, usize) {
-        (
-            self.order.len(),
-            self.state.workspaces.len(),
-            self.state.tabs.len(),
-            self.attention_count(),
-        )
+    pub fn list_lengths(&self) -> ListLengths {
+        ListLengths {
+            agents: self.order.len(),
+            workspaces: self.state.workspaces.len(),
+            tabs: self.state.tabs.len(),
+            attention: self.attention_count(),
+            worktrees: self.state.worktrees.len(),
+        }
     }
 
     /// How long the list behind one scrub target is right now.
     pub fn scrub_len(&self, target: ScrubTarget) -> usize {
-        let (agents, workspaces, tabs, attention) = self.list_lengths();
+        let lengths = self.list_lengths();
         match target {
-            ScrubTarget::Agents => agents,
-            ScrubTarget::Workspaces => workspaces,
-            ScrubTarget::Tabs => tabs,
-            ScrubTarget::Attention => attention,
+            ScrubTarget::Agents => lengths.agents,
+            ScrubTarget::Workspaces => lengths.workspaces,
+            ScrubTarget::Tabs => lengths.tabs,
+            ScrubTarget::Attention => lengths.attention,
+            ScrubTarget::Worktrees => lengths.worktrees,
         }
     }
 
@@ -524,11 +626,40 @@ impl<'a> ResolvedDeck<'a> {
                 },
                 self.state.focused_pane_id.is_some(),
             ),
+            // Every one of these draws the same face whether or not it can act right now, dimmed
+            // when it cannot. The alternative — a key that disappears — takes its neighbours'
+            // positions with it, and this deck is meant to be found by feel.
+            KeyBinding::Layout { preset } => match self.layout_preset(preset) {
+                Some(command) => command_tile(&command, true),
+                None => Tile::Command {
+                    glyph: KeyGlyph::Layout,
+                    label: preset.clone(),
+                    hold: false,
+                    enabled: false,
+                },
+            },
+            KeyBinding::NewWorkspace { preset } => {
+                command_tile(&self.create_workspace(preset), true)
+            }
+            KeyBinding::NewTab { preset } => command_tile(&self.create_tab(preset), true),
+            KeyBinding::NewWorktree => command_tile(&DeckCommand::CreateWorktree, true),
+            KeyBinding::CloseTab => command_tile(
+                &DeckCommand::CloseTab {
+                    tab_id: String::new(),
+                },
+                self.state.focused_tab_id.is_some(),
+            ),
+            KeyBinding::RemoveWorktree => command_tile(
+                &DeckCommand::RemoveWorktree {
+                    workspace_id: String::new(),
+                },
+                self.removable_worktree().is_some(),
+            ),
             KeyBinding::NextAttention => Tile::Attention {
                 count: self.attention_count(),
             },
             KeyBinding::ModeToggle => Tile::Mode {
-                label: self.mode.toggled().label().to_string(),
+                label: self.next_mode().label().to_string(),
                 active: false,
             },
             KeyBinding::PagePrev => Tile::Mode {
@@ -559,7 +690,63 @@ impl<'a> ResolvedDeck<'a> {
                 .get(index)
                 .map(workspace_tile)
                 .unwrap_or(Tile::Empty),
+            Mode::Worktrees => self
+                .state
+                .worktrees
+                .get(index)
+                .map(|tree| worktree_tile(self.state, tree))
+                .unwrap_or(Tile::Empty),
         }
+    }
+
+    /// The command a layout key means, when the layout it names is still there.
+    fn layout_preset(&self, preset: &str) -> Option<DeckCommand> {
+        self.profile
+            .presets
+            .layouts
+            .get(preset)
+            .map(|layout| DeckCommand::ApplyLayout {
+                preset: preset.to_string(),
+                layout: layout.clone(),
+            })
+    }
+
+    /// What a "new workspace" key means. An unnamed one still works — herdr picks the working
+    /// directory from the pane you are in, which is nearly always the one you meant.
+    fn create_workspace(&self, preset: &Option<String>) -> DeckCommand {
+        DeckCommand::CreateWorkspace {
+            preset: preset.clone(),
+            spec: self.spec(&self.profile.presets.workspaces, preset),
+        }
+    }
+
+    fn create_tab(&self, preset: &Option<String>) -> DeckCommand {
+        DeckCommand::CreateTab {
+            preset: preset.clone(),
+            spec: self.spec(&self.profile.presets.tabs, preset),
+        }
+    }
+
+    fn spec(
+        &self,
+        book: &std::collections::BTreeMap<String, herdr_deck_herdr::wire::CreateSpec>,
+        preset: &Option<String>,
+    ) -> herdr_deck_herdr::wire::CreateSpec {
+        preset
+            .as_ref()
+            .and_then(|name| book.get(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The worktree a remove key would give back to git, when there is one.
+    ///
+    /// Only a *linked* checkout that the deck has actually seen in herdr's listing qualifies.
+    /// herdr refuses to remove the source repository — and finding that out by pressing a key
+    /// that looked usable is exactly the experience the dimming exists to avoid.
+    fn removable_worktree(&self) -> Option<&'a WorktreeInfo> {
+        let workspace_id = self.state.focused_workspace_id.as_deref()?;
+        self.state.linked_worktree_of(workspace_id)
     }
 
     /// What pressing key `index` should do.
@@ -604,6 +791,40 @@ impl<'a> ResolvedDeck<'a> {
                     message: "herdr reports no focused pane".to_string(),
                 },
             },
+            KeyBinding::Layout { preset } => match self.layout_preset(preset) {
+                Some(command) => SlotAction::Command(command),
+                None => SlotAction::Refuse {
+                    message: format!("no layout named {preset}"),
+                },
+            },
+            KeyBinding::NewWorkspace { preset } => {
+                SlotAction::Command(self.create_workspace(preset))
+            }
+            KeyBinding::NewTab { preset } => SlotAction::Command(self.create_tab(preset)),
+            KeyBinding::NewWorktree => SlotAction::Command(DeckCommand::CreateWorktree),
+            KeyBinding::CloseTab => match &self.state.focused_tab_id {
+                Some(tab_id) => SlotAction::Command(DeckCommand::CloseTab {
+                    tab_id: tab_id.clone(),
+                }),
+                None => SlotAction::Refuse {
+                    message: "herdr reports no focused tab".to_string(),
+                },
+            },
+            // Named by the workspace it is open as, which is a herdr id — not by its path, which
+            // would be a string from a config file pointing at a directory that has since moved.
+            KeyBinding::RemoveWorktree => match self.removable_worktree() {
+                Some(tree) => match &tree.open_workspace_id {
+                    Some(workspace_id) => SlotAction::Command(DeckCommand::RemoveWorktree {
+                        workspace_id: workspace_id.clone(),
+                    }),
+                    None => SlotAction::Refuse {
+                        message: "herdr has not opened that worktree".to_string(),
+                    },
+                },
+                None => SlotAction::Refuse {
+                    message: "this workspace is not a worktree".to_string(),
+                },
+            },
             KeyBinding::NextAttention => self
                 .needing_attention()
                 .next()
@@ -637,6 +858,19 @@ impl<'a> ResolvedDeck<'a> {
                 .map(|w| {
                     SlotAction::Command(DeckCommand::FocusWorkspace {
                         workspace_id: w.workspace_id.clone(),
+                    })
+                })
+                .unwrap_or(SlotAction::None),
+            // Always an open, never a workspace focus, even for a checkout herdr already has
+            // open: `worktree.open` is idempotent and focuses what it finds, so one path covers
+            // both cases and there is no state the deck could be wrong about.
+            Mode::Worktrees => self
+                .state
+                .worktrees
+                .get(index)
+                .map(|tree| {
+                    SlotAction::Command(DeckCommand::OpenWorktree {
+                        path: tree.path.clone(),
                     })
                 })
                 .unwrap_or(SlotAction::None),
@@ -749,6 +983,16 @@ impl<'a> ResolvedDeck<'a> {
                     })
                 })
                 .unwrap_or(SlotAction::None),
+            ScrubTarget::Worktrees => self
+                .state
+                .worktrees
+                .get(cursor)
+                .map(|tree| {
+                    SlotAction::Command(DeckCommand::OpenWorktree {
+                        path: tree.path.clone(),
+                    })
+                })
+                .unwrap_or(SlotAction::None),
         }
     }
 
@@ -790,6 +1034,14 @@ impl<'a> ResolvedDeck<'a> {
                         Some(t.agent_status),
                     )
                 })
+                .unwrap_or_else(|| ("—".to_string(), None)),
+            // No status: a worktree is a checkout, not something that can be blocked. Handing the
+            // strip a colour here would be inventing a state herdr never reported.
+            ScrubTarget::Worktrees => self
+                .state
+                .worktrees
+                .get(cursor)
+                .map(|tree| (tree.label().to_string(), None))
                 .unwrap_or_else(|| ("—".to_string(), None)),
         };
         (target.label().to_string(), value, status)
@@ -864,9 +1116,30 @@ fn command_glyph(command: &DeckCommand) -> Option<KeyGlyph> {
             SplitDirection::Down => KeyGlyph::SplitDown,
         }),
         DeckCommand::ClosePane { .. } => Some(KeyGlyph::Close),
+        DeckCommand::ApplyLayout { .. } => Some(KeyGlyph::Layout),
+        DeckCommand::CreateWorkspace { .. } => Some(KeyGlyph::NewWorkspace),
+        DeckCommand::CreateTab { .. } => Some(KeyGlyph::NewTab),
+        DeckCommand::CreateWorktree => Some(KeyGlyph::NewWorktree),
+        DeckCommand::RemoveWorktree { .. } => Some(KeyGlyph::RemoveWorktree),
+        DeckCommand::CloseTab { .. } => Some(KeyGlyph::CloseTab),
+        // A focus takes you to a named thing and no shape can say which. Opening a worktree is
+        // the same: the list is what says which one, so these arrive on a dynamic tile with a
+        // name on it rather than on a key with a shape.
         DeckCommand::FocusPane { .. }
         | DeckCommand::FocusWorkspace { .. }
-        | DeckCommand::FocusTab { .. } => None,
+        | DeckCommand::FocusTab { .. }
+        | DeckCommand::OpenWorktree { .. } => None,
+    }
+}
+
+/// Needs the whole state to answer the one question a worktree key is pressed to settle: am I in
+/// this one already?
+fn worktree_tile(state: &DeckState, tree: &WorktreeInfo) -> Tile {
+    Tile::Worktree {
+        label: tree.label().to_string(),
+        open: tree.open_workspace_id.is_some(),
+        focused: tree.open_workspace_id.is_some()
+            && tree.open_workspace_id == state.focused_workspace_id,
     }
 }
 
@@ -882,7 +1155,21 @@ fn workspace_tile(ws: &herdr_deck_herdr::wire::WorkspaceInfo) -> Tile {
 mod tests {
     use super::*;
     use crate::capabilities::DeckModel;
-    use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
+    use herdr_deck_herdr::wire::{
+        AgentInfo, AgentStatus, CreateSpec, LayoutNode, LayoutPreset, SessionSnapshot, TabInfo,
+        WorkspaceInfo,
+    };
+
+    /// A linked worktree, optionally already open as a workspace.
+    fn worktree(branch: &str, open_as: Option<&str>) -> WorktreeInfo {
+        WorktreeInfo {
+            path: format!("/src/.worktrees/api/{branch}"),
+            branch: Some(branch.to_string()),
+            is_linked_worktree: true,
+            open_workspace_id: open_as.map(str::to_string),
+            ..Default::default()
+        }
+    }
 
     fn agent(id: &str, status: AgentStatus, seq: u64) -> AgentInfo {
         AgentInfo {
@@ -1029,6 +1316,7 @@ mod tests {
                 terminal_id: "pinned".into(),
             }],
             dials: vec![],
+            presets: Presets::default(),
         };
         let state = state_with(vec![agent("pinned", AgentStatus::Done, 4)]);
         let acked = Acknowledged::default();
@@ -1125,6 +1413,7 @@ mod tests {
             dials: vec![DialBinding::Scrub {
                 target: ScrubTarget::Workspaces,
             }],
+            presets: Presets::default(),
         };
         let mut state = state_with(vec![]);
         state.focused_pane_id = Some("w1:p2".into());
@@ -1185,6 +1474,7 @@ mod tests {
         Profile {
             keys: pane_cluster(),
             dials: vec![],
+            presets: Presets::default(),
         }
     }
 
@@ -1304,6 +1594,7 @@ mod tests {
         let profile = Profile {
             keys: vec![KeyBinding::ClosePane],
             dials: vec![],
+            presets: Presets::default(),
         };
         let mut state = state_with(vec![]);
         state.focused_pane_id = Some("w3:p7".into());
@@ -1325,6 +1616,7 @@ mod tests {
         let profile = Profile {
             keys: vec![KeyBinding::ClosePane],
             dials: vec![],
+            presets: Presets::default(),
         };
         let state = state_with(vec![]);
         let acked = Acknowledged::default();
@@ -1377,7 +1669,11 @@ mod tests {
     #[test]
     fn no_deck_is_given_a_key_that_closes_things_without_being_asked_for_one() {
         // The guard makes closing a pane safe to *offer*; it does not make it something to put in
-        // front of somebody who never went looking for it.
+        // front of somebody who never went looking for it. This is the whole list of destructive
+        // bindings, checked against every deck and against a config that names presets — because
+        // the derived layout grew a way to add keys, and that must not be a way to add these.
+        let mut config = Config::default();
+        config.layouts.insert("dev".into(), LayoutPreset::default());
         for model in [
             DeckModel::Mini,
             DeckModel::Original,
@@ -1385,18 +1681,380 @@ mod tests {
             DeckModel::Xl,
             DeckModel::Pedal,
         ] {
-            let profile = Profile::for_capabilities(&model.capabilities());
-            assert!(
-                !profile.keys.iter().any(|k| matches!(
-                    k,
-                    KeyBinding::ClosePane
-                        | KeyBinding::Command {
-                            command: DeckCommand::ClosePane { .. }
-                        }
-                )),
-                "{model:?} was handed a destructive key nobody asked for"
-            );
+            let profile = Profile::derive(&model.capabilities(), &config);
+            for key in &profile.keys {
+                let destructive = matches!(
+                    key,
+                    KeyBinding::ClosePane | KeyBinding::CloseTab | KeyBinding::RemoveWorktree
+                ) || matches!(key, KeyBinding::Command { command } if command.is_destructive());
+                assert!(
+                    !destructive,
+                    "{model:?} was handed {key:?}, a destructive key nobody asked for"
+                );
+            }
         }
+    }
+
+    // --- Structure: layouts, worktrees, and the things that make them --------------------------
+
+    /// A config with one named layout, one named workspace and one named tab.
+    fn config_with_presets() -> Config {
+        let mut config = Config::default();
+        config.layouts.insert(
+            "dev".into(),
+            LayoutPreset {
+                label: Some("dev".into()),
+                root: LayoutNode {
+                    split: Some(SplitDirection::Down),
+                    ratio: Some(70),
+                    first: Some(Box::default()),
+                    second: Some(Box::default()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.workspaces.insert(
+            "notes".into(),
+            CreateSpec {
+                label: Some("notes".into()),
+                cwd: Some("/home/dev/notes".into()),
+                ..Default::default()
+            },
+        );
+        config.tabs.insert(
+            "logs".into(),
+            CreateSpec {
+                label: Some("logs".into()),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn deck_of(profile: &Profile, state: &DeckState, acked: &Acknowledged) -> SlotAction {
+        ResolvedDeck::new(profile, state, Mode::Agents, 0, Selection::default(), acked)
+            .key_action(0)
+    }
+
+    #[test]
+    fn a_layout_key_carries_the_whole_arrangement_so_the_preset_cannot_go_missing_later() {
+        // The command holds the tree, not the preset's name. A key that only held the name would
+        // have to look it up at the moment it is pressed, and would have to have an answer for
+        // "it is not there any more" on the deck rather than in the config file.
+        let config = config_with_presets();
+        let profile = Profile {
+            keys: vec![KeyBinding::Layout {
+                preset: "dev".into(),
+            }],
+            dials: vec![],
+            presets: config.presets(),
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+
+        match deck_of(&profile, &state, &acked) {
+            SlotAction::Command(DeckCommand::ApplyLayout { preset, layout }) => {
+                assert_eq!(preset, "dev");
+                assert_eq!(layout, config.layouts["dev"]);
+            }
+            other => panic!("expected a layout command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_layout_key_naming_something_that_is_not_there_refuses_out_loud_and_draws_unusable() {
+        // Unreachable through a config file, which is checked at load. Reachable if a herdr-deck
+        // upgrade ever drops a preset out from under a running daemon — and a key that silently
+        // did nothing then would be indistinguishable from broken hardware.
+        let profile = Profile {
+            keys: vec![KeyBinding::Layout {
+                preset: "gone".into(),
+            }],
+            dials: vec![],
+            presets: Presets::default(),
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+
+        match deck_of(&profile, &state, &acked) {
+            SlotAction::Refuse { message } => assert!(message.contains("gone"), "got {message:?}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let deck = plus_deck(&profile, &state, &acked);
+        match deck.tile(0) {
+            Tile::Command { enabled, .. } => assert!(!enabled, "the key must look unusable"),
+            other => panic!("expected a command key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deck_with_room_grows_one_key_per_named_layout_and_a_deck_without_grows_none() {
+        // A layout nobody can press is a layout nobody meant to write down. But the agents are
+        // still why the deck is on the desk, so the same cap that keeps pane control off a small
+        // deck applies here too.
+        let config = config_with_presets();
+        let big = Profile::derive(&DeckModel::Xl.capabilities(), &config);
+        let layouts: Vec<_> = big
+            .keys
+            .iter()
+            .filter_map(|k| match k {
+                KeyBinding::Layout { preset } => Some(preset.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(layouts, vec!["dev"]);
+        assert!(
+            big.dynamic_slots() > layouts.len(),
+            "the agents must still have the larger share"
+        );
+
+        // ...and a deck with no presets configured is exactly the deck it was before.
+        let plain = Profile::derive(&DeckModel::Xl.capabilities(), &Config::default());
+        assert!(!plain
+            .keys
+            .iter()
+            .any(|k| matches!(k, KeyBinding::Layout { .. })));
+    }
+
+    #[test]
+    fn a_preset_key_means_the_preset_and_a_bare_one_means_herdrs_own_defaults() {
+        // Both are useful: a named workspace opens somewhere specific, an unnamed one opens
+        // wherever you already are. Neither needs anything typed.
+        let config = config_with_presets();
+        let profile = Profile {
+            keys: vec![
+                KeyBinding::NewWorkspace {
+                    preset: Some("notes".into()),
+                },
+                KeyBinding::NewTab { preset: None },
+            ],
+            dials: vec![],
+            presets: config.presets(),
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_action(0),
+            SlotAction::Command(DeckCommand::CreateWorkspace {
+                preset: Some("notes".into()),
+                spec: config.workspaces["notes"].clone(),
+            })
+        );
+        assert_eq!(
+            deck.key_action(1),
+            SlotAction::Command(DeckCommand::CreateTab {
+                preset: None,
+                spec: CreateSpec::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_worktree_key_opens_the_checkout_it_shows_by_path() {
+        // By path and not by branch, because a detached checkout has no branch — and a list where
+        // some entries work and others do not is worse than one that shows fewer.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = state_with(vec![]).with_worktrees(vec![
+            worktree("fix-auth", None),
+            worktree("spike", Some("w4")),
+        ]);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Worktrees,
+            0,
+            Selection::default(),
+            &acked,
+        );
+
+        assert_eq!(
+            deck.key_action(0),
+            SlotAction::Command(DeckCommand::OpenWorktree {
+                path: "/src/.worktrees/api/fix-auth".into()
+            })
+        );
+        // Already open is the same command, not a workspace focus: `worktree.open` is idempotent
+        // and focuses what it finds, so one key covers both and there is no state to be wrong.
+        assert_eq!(
+            deck.key_action(1),
+            SlotAction::Command(DeckCommand::OpenWorktree {
+                path: "/src/.worktrees/api/spike".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_worktree_tile_says_whether_herdr_already_has_it_and_whether_you_are_in_it() {
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let mut state = state_with(vec![]).with_worktrees(vec![
+            worktree("here", Some("w2")),
+            worktree("elsewhere", Some("w5")),
+            worktree("closed", None),
+        ]);
+        state.focused_workspace_id = Some("w2".into());
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Worktrees,
+            0,
+            Selection::default(),
+            &acked,
+        );
+
+        assert_eq!(
+            deck.tile(0),
+            Tile::Worktree {
+                label: "here".into(),
+                open: true,
+                focused: true
+            }
+        );
+        assert_eq!(
+            deck.tile(1),
+            Tile::Worktree {
+                label: "elsewhere".into(),
+                open: true,
+                focused: false
+            }
+        );
+        assert_eq!(
+            deck.tile(2),
+            Tile::Worktree {
+                label: "closed".into(),
+                open: false,
+                focused: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_checkout_herdr_would_refuse_to_open_never_reaches_a_key() {
+        // Bare and prunable entries answer `worktree_not_found`. Filtering them in the state keeps
+        // every count, cursor and key agreeing about how many worktrees there are.
+        let state = state_with(vec![]).with_worktrees(vec![
+            WorktreeInfo {
+                path: "/src/api.git".into(),
+                is_bare: true,
+                ..Default::default()
+            },
+            worktree("real", None),
+        ]);
+        assert_eq!(state.worktrees.len(), 1);
+        assert_eq!(state.worktrees[0].label(), "real");
+    }
+
+    #[test]
+    fn a_remove_key_names_the_workspace_herdr_has_the_worktree_open_as() {
+        // Not the path: a workspace id is a herdr id and safe to write to the command log, and it
+        // is what `worktree.remove` actually takes.
+        let profile = Profile {
+            keys: vec![KeyBinding::RemoveWorktree],
+            dials: vec![],
+            presets: Presets::default(),
+        };
+        let mut state = state_with(vec![]).with_worktrees(vec![worktree("fix-auth", Some("w3"))]);
+        state.focused_workspace_id = Some("w3".into());
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        // On the hold, because it is destructive — the tap only says so.
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::Command(DeckCommand::RemoveWorktree {
+                workspace_id: "w3".into()
+            })
+        );
+        assert!(matches!(deck.key_action(0), SlotAction::Refuse { .. }));
+    }
+
+    #[test]
+    fn a_remove_key_pointed_at_a_repository_rather_than_a_worktree_says_so_before_it_is_pressed() {
+        // herdr refuses to remove the source checkout, and the deck already holds the listing that
+        // says which one that is. Letting the key look usable and then fail would make the user
+        // press it to find out.
+        let profile = Profile {
+            keys: vec![KeyBinding::RemoveWorktree],
+            dials: vec![],
+            presets: Presets::default(),
+        };
+        let mut state = state_with(vec![]).with_worktrees(vec![WorktreeInfo {
+            path: "/src/api".into(),
+            branch: Some("main".into()),
+            is_linked_worktree: false,
+            open_workspace_id: Some("w1".into()),
+            ..Default::default()
+        }]);
+        state.focused_workspace_id = Some("w1".into());
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert!(matches!(deck.key_action(0), SlotAction::Refuse { .. }));
+        assert_eq!(deck.key_long_press_action(0), SlotAction::None);
+        match deck.tile(0) {
+            Tile::Command { enabled, .. } => assert!(!enabled, "the key must look unusable"),
+            other => panic!("expected a command key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_close_tab_key_names_the_tab_herdr_says_is_focused_and_only_acts_on_a_hold() {
+        let profile = Profile {
+            keys: vec![KeyBinding::CloseTab],
+            dials: vec![],
+            presets: Presets::default(),
+        };
+        let mut state = state_with(vec![]);
+        state.focused_tab_id = Some("w1:t2".into());
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert!(matches!(deck.key_action(0), SlotAction::Refuse { .. }));
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::Command(DeckCommand::CloseTab {
+                tab_id: "w1:t2".into()
+            })
+        );
+    }
+
+    #[test]
+    fn every_structural_key_draws_a_shape_no_other_one_draws() {
+        // These sit next to each other in a block and are pressed by feel. Colour is never the
+        // only signal on this deck, and neither is a caption.
+        let config = config_with_presets();
+        let profile = Profile {
+            keys: vec![
+                KeyBinding::Layout {
+                    preset: "dev".into(),
+                },
+                KeyBinding::NewWorkspace { preset: None },
+                KeyBinding::NewTab { preset: None },
+                KeyBinding::NewWorktree,
+                KeyBinding::CloseTab,
+                KeyBinding::RemoveWorktree,
+                KeyBinding::ClosePane,
+            ],
+            dials: vec![],
+            presets: config.presets(),
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        let mut glyphs: Vec<KeyGlyph> = (0..profile.keys.len())
+            .map(|index| match deck.tile(index) {
+                Tile::Command { glyph, .. } => glyph,
+                other => panic!("key {index} is not a command key: {other:?}"),
+            })
+            .collect();
+        let count = glyphs.len();
+        glyphs.sort_by_key(|g| format!("{g:?}"));
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), count, "two structural keys share a shape");
     }
 
     #[test]
@@ -1410,6 +2068,7 @@ mod tests {
                 },
             }],
             dials: vec![],
+            presets: Presets::default(),
         };
         let state = state_with(vec![]);
         let acked = Acknowledged::default();
@@ -1434,6 +2093,7 @@ mod tests {
             dials: vec![DialBinding::Scrub {
                 target: ScrubTarget::Workspaces,
             }],
+            presets: Presets::default(),
         };
         let mut state = state_with(vec![]);
         state.workspaces = vec![WorkspaceInfo {
@@ -1936,12 +2596,20 @@ mod tests {
             workspaces: 4,
             tabs: 2,
             attention: 3,
+            worktrees: 6,
         };
-        sel.clamp(2, 0, 5, 1);
+        sel.clamp(ListLengths {
+            agents: 2,
+            workspaces: 0,
+            tabs: 5,
+            attention: 1,
+            worktrees: 0,
+        });
         assert_eq!(sel.agents, 1);
         assert_eq!(sel.workspaces, 0);
         assert_eq!(sel.tabs, 2);
         assert_eq!(sel.attention, 0);
+        assert_eq!(sel.worktrees, 0);
     }
 
     #[test]
@@ -1985,9 +2653,50 @@ mod tests {
     }
 
     #[test]
-    fn mode_toggles_back_and_forth() {
-        assert_eq!(Mode::Agents.toggled(), Mode::Workspaces);
-        assert_eq!(Mode::Workspaces.toggled(), Mode::Agents);
+    fn the_mode_key_cycles_agents_and_workspaces_when_there_are_no_worktrees() {
+        // Which is most sessions. A third stop showing an empty grid would cost everybody who
+        // does not use worktrees an extra press to get back to their agents.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let at = |mode| {
+            ResolvedDeck::new(&profile, &state, mode, 0, Selection::default(), &acked).next_mode()
+        };
+        assert_eq!(at(Mode::Agents), Mode::Workspaces);
+        assert_eq!(at(Mode::Workspaces), Mode::Agents);
+    }
+
+    #[test]
+    fn a_session_with_worktrees_gets_a_third_stop_on_the_same_key() {
+        // No new key, no configuration: the deck that has worktrees grows a place to see them and
+        // the deck that does not is unchanged.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = state_with(vec![]).with_worktrees(vec![worktree("fix-auth", None)]);
+        let acked = Acknowledged::default();
+        let at = |mode| {
+            ResolvedDeck::new(&profile, &state, mode, 0, Selection::default(), &acked).next_mode()
+        };
+        assert_eq!(at(Mode::Agents), Mode::Workspaces);
+        assert_eq!(at(Mode::Workspaces), Mode::Worktrees);
+        assert_eq!(at(Mode::Worktrees), Mode::Agents);
+    }
+
+    #[test]
+    fn leaving_worktree_mode_always_works_even_once_the_list_has_emptied() {
+        // The list is refreshed underneath the deck, so it can empty while somebody is looking at
+        // it. Leaving has to be unconditional or the mode key becomes a trap.
+        let profile = Profile::for_capabilities(&DeckModel::Plus.capabilities());
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Mode::Worktrees,
+            0,
+            Selection::default(),
+            &acked,
+        );
+        assert_eq!(deck.next_mode(), Mode::Agents);
     }
 
     // --- The project footer ------------------------------------------------------------------
