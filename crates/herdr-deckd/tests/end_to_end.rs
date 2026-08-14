@@ -853,3 +853,322 @@ async fn closing_a_pane_takes_a_hold_and_a_tap_only_says_so() {
     assert_eq!(recorded[0]["command"], "close_pane");
     assert_eq!(recorded[0]["target"], "w1:p9");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Structure: layouts, worktrees, workspaces and tabs
+// ---------------------------------------------------------------------------------------------
+
+/// A config with one named layout and one named tab, and keys for both — plus the two destructive
+/// structural keys, which a derived layout would never hand out.
+fn structure_config() -> Config {
+    use herdr_deck_core::layout::KeyBinding;
+    use herdr_deck_herdr::wire::{CreateSpec, LayoutNode, LayoutPreset, SplitDirection};
+
+    let mut config = test_config();
+    config.layouts.insert(
+        "dev".to_string(),
+        LayoutPreset {
+            label: Some("dev".to_string()),
+            root: LayoutNode {
+                split: Some(SplitDirection::Down),
+                ratio: Some(70),
+                first: Some(Box::default()),
+                second: Some(Box::new(LayoutNode {
+                    command: Some(vec!["cargo".to_string(), "watch".to_string()]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        },
+    );
+    config.tabs.insert(
+        "logs".to_string(),
+        CreateSpec {
+            label: Some("logs".to_string()),
+            ..Default::default()
+        },
+    );
+    config.layout = Some(herdr_deck_core::config::LayoutOverride {
+        keys: vec![
+            KeyBinding::Layout {
+                preset: "dev".to_string(),
+            },
+            KeyBinding::NewTab {
+                preset: Some("logs".to_string()),
+            },
+            KeyBinding::NewWorktree,
+            KeyBinding::CloseTab,
+            KeyBinding::RemoveWorktree,
+            KeyBinding::Dynamic { rank: 0 },
+        ],
+        dials: vec![],
+    });
+    config
+}
+
+/// A herdr sitting in a linked worktree, with a sibling checkout that is not open.
+fn snapshot_in_a_worktree() -> SessionSnapshot {
+    let mut snapshot = snapshot(vec![agent(
+        "term_a",
+        "w1:p1",
+        "refactor-auth",
+        AgentStatus::Idle,
+        100,
+    )]);
+    snapshot.focused_workspace_id = Some("w1".to_string());
+    snapshot.focused_tab_id = Some("w1:t1".to_string());
+    snapshot
+}
+
+fn worktrees() -> Vec<herdr_deck_herdr::wire::WorktreeInfo> {
+    use herdr_deck_herdr::wire::WorktreeInfo;
+    vec![
+        WorktreeInfo {
+            path: "/src/api".to_string(),
+            branch: Some("main".to_string()),
+            is_linked_worktree: false,
+            open_workspace_id: Some("w2".to_string()),
+            ..Default::default()
+        },
+        WorktreeInfo {
+            path: "/src/.worktrees/api/fix-auth".to_string(),
+            branch: Some("fix-auth".to_string()),
+            is_linked_worktree: true,
+            open_workspace_id: Some("w1".to_string()),
+            ..Default::default()
+        },
+        WorktreeInfo {
+            path: "/src/.worktrees/api/spike".to_string(),
+            branch: Some("spike".to_string()),
+            is_linked_worktree: true,
+            ..Default::default()
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_layout_key_builds_a_new_tab_and_never_touches_the_one_you_are_in() {
+    // The end-to-end form of the constraint the whole layout preset feature is shaped around.
+    // `layout.apply` with a tab id closes the tab it names and kills every process in it; this
+    // asserts that pressing the key on a real deck, through a real socket, sends no tab id.
+    let mock = mock_herdr(snapshot_in_a_worktree()).await;
+    let mut daemon =
+        Daemon::start_with(HerdrClient::new(mock.socket_path()), structure_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(0).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 0 }
+    );
+
+    let params = mock
+        .observed_params("layout.apply")
+        .await
+        .expect("the key should have applied a layout");
+    assert!(
+        params.get("tab_id").is_none(),
+        "a preset key must never target an existing tab: {params}"
+    );
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded[0]["command"], "apply_layout");
+    assert_eq!(
+        recorded[0]["target"], "dev",
+        "the trail has to say which layout, or several keys become one line"
+    );
+}
+
+#[tokio::test]
+async fn a_preset_key_carries_the_settings_a_deck_could_never_have_typed() {
+    // The whole point of presets: a deck has no keyboard, so a label or a working directory only
+    // reaches herdr by being written down once and given a name.
+    let mock = mock_herdr(snapshot_in_a_worktree()).await;
+    let mut daemon =
+        Daemon::start_with(HerdrClient::new(mock.socket_path()), structure_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(1).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 1 }
+    );
+
+    let params = mock.observed_params("tab.create").await.expect("a new tab");
+    assert_eq!(params["label"], "logs");
+    assert_eq!(daemon.audit_lines().await[0]["target"], "logs");
+}
+
+#[tokio::test]
+async fn a_new_worktree_key_reports_back_without_freezing_the_rest_of_the_deck() {
+    // `worktree.create` is one of only two herdr methods that does not answer at once — it waits
+    // on git, which on a large repository is seconds. The daemon runs it alongside its event loop,
+    // so the key still reports what happened and everything else keeps working meanwhile.
+    let mock = mock_herdr(snapshot_in_a_worktree()).await;
+    let mut daemon =
+        Daemon::start_with(HerdrClient::new(mock.socket_path()), structure_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(2).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 2 }
+    );
+
+    let params = mock
+        .observed_params("worktree.create")
+        .await
+        .expect("the key should have made a worktree");
+    assert_eq!(
+        params.get("branch"),
+        None,
+        "herdr generates the branch name; that is what makes this key possible: {params}"
+    );
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded[0]["command"], "create_worktree");
+    assert!(
+        recorded[0]["target"].is_null(),
+        "a branch name is the user's, not ours: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn giving_a_worktree_back_to_git_takes_a_hold_and_is_never_forced() {
+    // Two things at once, because they are the same decision. The hold is what makes a destructive
+    // key safe to have; `force: false` is what makes this particular one safe to press, because a
+    // dirty checkout then makes git refuse and that refusal is the confirmation dialog this
+    // hardware has nowhere to show.
+    let mock = mock_herdr(snapshot_in_a_worktree()).await;
+    mock.with_worktrees(&worktrees()).await;
+    let mut daemon =
+        Daemon::start_with(HerdrClient::new(mock.socket_path()), structure_config()).await;
+    daemon
+        .wait_for_state(|state| !state.worktrees.is_empty())
+        .await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(4).await;
+    match feedback_from(&mut frontend).await {
+        DaemonMessage::Alert { message, .. } => assert!(message.contains("hold"), "got {message}"),
+        other => panic!("a tap must refuse out loud, got {other:?}"),
+    }
+    assert!(daemon.audit_lines().await.is_empty());
+
+    frontend.hold(4).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 4 }
+    );
+
+    let params = mock
+        .observed_params("worktree.remove")
+        .await
+        .expect("the hold should have removed a worktree");
+    assert_eq!(params["force"], false, "got {params}");
+    assert_eq!(
+        params["workspace_id"], "w1",
+        "it must name the workspace the user is actually in: {params}"
+    );
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded[0]["command"], "remove_worktree");
+    assert_eq!(recorded[0]["target"], "w1");
+}
+
+#[tokio::test]
+async fn a_worktree_key_pointed_at_a_repository_rather_than_a_worktree_refuses_both_gestures() {
+    // herdr will not remove the source checkout, and the deck already holds the listing that says
+    // which one that is. Letting the key look usable and then fail would make somebody press it to
+    // find out.
+    let mut snapshot = snapshot_in_a_worktree();
+    snapshot.focused_workspace_id = Some("w2".to_string()); // the source repo
+    let mock = mock_herdr(snapshot).await;
+    mock.with_worktrees(&worktrees()).await;
+    let mut daemon =
+        Daemon::start_with(HerdrClient::new(mock.socket_path()), structure_config()).await;
+    daemon
+        .wait_for_state(|state| !state.worktrees.is_empty())
+        .await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(4).await;
+    assert!(matches!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Alert { .. }
+    ));
+    frontend.hold(4).await;
+    assert!(matches!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Alert { .. }
+    ));
+    assert!(
+        daemon.audit_lines().await.is_empty(),
+        "neither gesture may reach herdr"
+    );
+}
+
+#[tokio::test]
+async fn a_deck_with_worktrees_can_reach_them_from_the_mode_key_and_open_one() {
+    // No extra key and no configuration: the mode key grows a third stop for the sessions that
+    // have worktrees, and opening one is the same press as focusing an agent.
+    let mock = mock_herdr(snapshot_in_a_worktree()).await;
+    mock.with_worktrees(&worktrees()).await;
+    let mut daemon = Daemon::start(HerdrClient::new(mock.socket_path())).await;
+    daemon
+        .wait_for_state(|state| !state.worktrees.is_empty())
+        .await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    // Agents -> spaces -> trees. This frontend reports no dials, so it gets paging keys and the
+    // mode toggle lands at key 5.
+    frontend.tap(5).await;
+    frontend.drain_to_pong().await;
+    frontend.tap(5).await;
+    frontend.drain_to_pong().await;
+
+    frontend.tap(0).await;
+    // Window raising is switched off in these tests, and a worktree key is a *journey* — so it
+    // reports the same half-done outcome an agent key does here, for the same reason and in the
+    // same words. That it alerts at all is the proof it asked for the window.
+    match feedback_from(&mut frontend).await {
+        DaemonMessage::Alert { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("raising is disabled"), "got {message}");
+        }
+        other => panic!("opening a worktree must go looking for the window, got {other:?}"),
+    }
+
+    assert_eq!(
+        mock.worktree_open_paths().await,
+        vec!["/src/api"],
+        "the first worktree key should have opened the first checkout"
+    );
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded[0]["command"], "open_worktree");
+    assert!(
+        recorded[0]["target"].is_null(),
+        "a checkout path is the user's, not ours: {recorded:?}"
+    );
+}

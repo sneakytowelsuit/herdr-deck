@@ -168,7 +168,9 @@ impl DeckCommand {
             DeckCommand::CreateTab { preset, .. } => preset.as_deref().unwrap_or("new tab"),
             DeckCommand::OpenWorktree { .. } => "worktree",
             DeckCommand::CreateWorktree => "new tree",
-            DeckCommand::RemoveWorktree { .. } => "remove tree",
+            // Six characters because a key caption gets about ten before it is truncated, and
+            // "remove tr…" is not a word. The crossed-out fork above it already says what of.
+            DeckCommand::RemoveWorktree { .. } => "remove",
             DeckCommand::CloseTab { .. } => "close tab",
         }
     }

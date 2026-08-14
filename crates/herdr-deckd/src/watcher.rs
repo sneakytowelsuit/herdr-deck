@@ -383,6 +383,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_published_state_carries_the_worktrees_of_the_repository_in_front_of_the_user() {
+        use herdr_deck_herdr::wire::{SessionSnapshot, WorktreeInfo};
+
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot {
+            protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+            ..Default::default()
+        })
+        .await;
+        mock.with_worktrees(&[
+            WorktreeInfo {
+                path: "/src/api".into(),
+                branch: Some("main".into()),
+                open_workspace_id: Some("w1".into()),
+                ..Default::default()
+            },
+            WorktreeInfo {
+                path: "/src/.worktrees/api/gone".into(),
+                is_prunable: true,
+                ..Default::default()
+            },
+        ])
+        .await;
+
+        let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &Config::default());
+        let mut rx = watcher.spawn();
+        let state = wait_for(&mut rx, |s| !s.is_offline()).await;
+
+        assert_eq!(
+            state.worktrees.len(),
+            1,
+            "a checkout herdr would refuse to open must never reach a key"
+        );
+        assert_eq!(state.worktrees[0].label(), "main");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_is_not_in_a_repository_still_gets_a_working_deck() {
+        // herdr answers `not_git_worktree` for a perfectly healthy session outside git. Letting
+        // that bubble up would take every agent key off the deck over a list most people never
+        // look at.
+        use herdr_deck_herdr::wire::SessionSnapshot;
+
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot {
+            protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+            agents: vec![herdr_deck_herdr::wire::AgentInfo {
+                terminal_id: "term_a".into(),
+                agent_status: AgentStatus::Blocked,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        mock.with_nothing_under_git().await;
+
+        let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &Config::default());
+        let mut rx = watcher.spawn();
+        let state = wait_for(&mut rx, |s| !s.is_offline()).await;
+
+        assert_eq!(state.agents.len(), 1);
+        assert!(state.worktrees.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_worktree_listing_is_not_re_read_on_every_reconcile() {
+        // It makes herdr shell out to `git worktree list`. Fetching it as often as the snapshot
+        // would spend a subprocess every couple of seconds on a list that changes about once an
+        // hour — and events fire constantly, so "every reconcile" is not a slow rate.
+        use herdr_deck_herdr::wire::SessionSnapshot;
+
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot {
+            protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+            ..Default::default()
+        })
+        .await;
+        // Reconcile as fast as the config allows, so several go by inside the test.
+        let config = Config::from_toml("reconcile_interval_ms = 250").unwrap();
+        let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &config);
+        let mut rx = watcher.spawn();
+        wait_for(&mut rx, |s| !s.is_offline()).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.snapshot_count().await < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("several reconciles should have happened");
+
+        assert_eq!(
+            mock.call_count("worktree.list").await,
+            1,
+            "the listing should have been read once and then left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_appearing_refreshes_the_listing_without_waiting_for_the_slow_timer() {
+        // Opening, creating or removing a worktree all add or remove a workspace, so this is what
+        // makes a worktree key feel immediate rather than up to fifteen seconds late.
+        use herdr_deck_herdr::wire::{SessionSnapshot, WorkspaceInfo};
+
+        let one = SessionSnapshot {
+            protocol: Some(herdr_deck_herdr::EXPECTED_PROTOCOL),
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&one).await;
+        let config = Config::from_toml("reconcile_interval_ms = 250").unwrap();
+        let watcher = Watcher::new(HerdrClient::new(mock.socket_path()), &config);
+        let mut rx = watcher.spawn();
+        wait_for(&mut rx, |s| !s.is_offline()).await;
+        assert_eq!(mock.call_count("worktree.list").await, 1);
+
+        // A second workspace appears — as it would the moment a worktree was opened.
+        let mut two = one.clone();
+        two.workspaces.push(WorkspaceInfo {
+            workspace_id: "w2".into(),
+            ..Default::default()
+        });
+        mock.serve_session(&two).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.call_count("worktree.list").await < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a new workspace should have refreshed the worktree listing");
+    }
+
+    #[tokio::test]
     async fn reports_offline_when_herdr_is_not_running() {
         let socket = herdr_deck_herdr::SocketPath {
             path: "/nonexistent/herdr.sock".into(),

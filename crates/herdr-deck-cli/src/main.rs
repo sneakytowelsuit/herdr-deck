@@ -197,7 +197,9 @@ fn describe_key(binding: &KeyBinding) -> String {
             "give the focused worktree back to git — hold to confirm".to_string()
         }
         KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
-        KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
+        // Worktrees are only in the cycle for a session that has some, so the key names all
+        // three rather than claiming the one it happens to be pointing at.
+        KeyBinding::ModeToggle => "cycle agents / workspaces / worktrees".to_string(),
         KeyBinding::PagePrev => "previous page".to_string(),
         KeyBinding::PageNext => "next page".to_string(),
         KeyBinding::Scrub { target, delta } => format!(

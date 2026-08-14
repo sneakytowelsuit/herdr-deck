@@ -1150,6 +1150,173 @@ mod tests {
         assert!(mock.tab_focus_ids().await.is_empty());
     }
 
+    // --- Structure ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opening_a_worktree_focuses_and_raises_exactly_as_focusing_an_agent_does() {
+        // This is the promise the worktree list is for: it is the same "get me there" motion, and
+        // half of getting there is the window. A worktree key that switched herdr and left the
+        // user staring at a browser would be the half-done outcome the whole crate exists to
+        // report loudly.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        let report = engine
+            .perform(&DeckCommand::OpenWorktree {
+                path: "/src/.worktrees/api/fix".into(),
+            })
+            .await;
+
+        assert!(report.fully_succeeded(), "{report:?}");
+        assert_eq!(
+            mock.worktree_open_paths().await,
+            vec!["/src/.worktrees/api/fix"]
+        );
+        assert_eq!(runner.ran().len(), 1, "the window has to come forward too");
+    }
+
+    #[tokio::test]
+    async fn making_something_never_fetches_the_window() {
+        // You are already at the terminal — you just asked it for a new tab. Raising would spend a
+        // round trip nobody asked for and, on a desktop that cannot raise windows at all, would
+        // turn every one of these into an alert about a failure that never happened.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        for command in DeckCommand::every()
+            .into_iter()
+            .filter(|c| !c.raises_the_window())
+        {
+            let report = engine.perform(&command).await;
+            assert_eq!(
+                report.raise,
+                RaiseOutcome::NotNeeded,
+                "{} went looking for a window",
+                command.name()
+            );
+        }
+        assert!(runner.ran().is_empty());
+    }
+
+    #[tokio::test]
+    async fn applying_a_named_layout_makes_a_tab_and_never_touches_an_existing_one() {
+        // The single most dangerous thing in this step. With a tab id, `layout.apply` builds the
+        // replacement and then closes the tab it was given, killing every process in it — with no
+        // confirmation and nothing in its name to warn you. The client cannot express that; this
+        // is the test standing behind that decision from above.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::ApplyLayout {
+                preset: "dev".into(),
+                layout: herdr_deck_herdr::wire::LayoutPreset {
+                    label: Some("dev".into()),
+                    root: herdr_deck_herdr::wire::LayoutNode::default(),
+                },
+            })
+            .await;
+
+        let params = mock.observed_params("layout.apply").await.unwrap();
+        assert!(
+            params.get("tab_id").is_none(),
+            "a preset key must never target an existing tab: {params}"
+        );
+        assert_eq!(mock.tab_close_ids().await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn removing_a_worktree_is_never_forced_however_it_is_asked_for() {
+        // Forcing kills the workspace's agents *before* git runs, and then deletes uncommitted and
+        // untracked files. Unforced, git refuses a dirty checkout — and that refusal is the only
+        // confirmation prompt a device with no screen can offer.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::RemoveWorktree {
+                workspace_id: "w3".into(),
+            })
+            .await;
+
+        assert_eq!(mock.worktree_remove_ids().await, vec!["w3"]);
+        let params = mock.observed_params("worktree.remove").await.unwrap();
+        assert_eq!(params["force"], false, "got {params}");
+    }
+
+    #[tokio::test]
+    async fn git_refusing_to_remove_a_dirty_worktree_lands_on_the_key_and_is_not_swallowed() {
+        // The refusal *is* the safety mechanism. Reporting it as a success would leave somebody
+        // believing their worktree was gone when it is still there — and, worse, teach them that
+        // this key does not really work so they should force it somehow.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.reply_error(
+            "worktree.remove",
+            "worktree_remove_failed",
+            "contains modified or untracked files, use --force to delete it",
+        )
+        .await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::RemoveWorktree {
+                workspace_id: "w3".into(),
+            })
+            .await;
+
+        assert!(report.verdict().is_error(), "{report:?}");
+        assert!(report.describe().contains("untracked"), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_preset_reaches_herdr_as_the_working_directory_and_label_it_names() {
+        // Presets are the only way any of this reaches herdr from a deck, so a preset that arrived
+        // stripped of its settings would look exactly like a key that works and quietly does the
+        // wrong thing.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::CreateWorkspace {
+                preset: Some("notes".into()),
+                spec: herdr_deck_herdr::wire::CreateSpec {
+                    label: Some("notes".into()),
+                    cwd: Some("/home/dev/notes".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let params = mock.observed_params("workspace.create").await.unwrap();
+        assert_eq!(params["label"], "notes");
+        assert_eq!(params["cwd"], "/home/dev/notes");
+    }
+
+    #[tokio::test]
+    async fn a_structural_command_reaches_herdr_as_one_call_and_drags_no_focus_with_it() {
+        // Same discipline as everywhere else: herdr resolves "where I am" itself, and a helpful
+        // workspace focus sent first would cost a round trip and hand herdr a target the deck read
+        // seconds ago.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine.perform(&DeckCommand::CreateWorktree).await;
+
+        assert_eq!(mock.call_count("worktree.create").await, 1);
+        assert!(mock.agent_focus_targets().await.is_empty());
+        assert!(mock.workspace_focus_ids().await.is_empty());
+        assert!(mock.tab_focus_ids().await.is_empty());
+    }
+
     #[tokio::test]
     async fn focusing_a_tab_follows_the_same_two_step_path() {
         // A tab focus that skipped the raise would switch herdr underneath a window the user

@@ -477,3 +477,71 @@ fn an_agent_name_with_xml_metacharacters_pins_correctly_escaped_output() {
     };
     assert_key_matches_golden("agent_xml_metacharacters", &tile, 120);
 }
+
+// --- Structure ---------------------------------------------------------------------------------
+
+#[test]
+fn every_structural_key_pins_a_silhouette_that_says_what_it_makes_or_unmakes() {
+    // Six keys that could sit in one block on a large deck. Each pairs a base shape — a tab, a
+    // stack of tabs, a divided pane, a git fork — with either a plus or a cross, so "one more of
+    // these" and "this one goes away" read the same way wherever they appear. These fixtures are
+    // where a change that makes two of them look alike gets caught.
+    for (glyph, label, name) in [
+        (KeyGlyph::NewTab, "new tab", "command_new_tab_120"),
+        (KeyGlyph::CloseTab, "close tab", "command_close_tab_120"),
+        (
+            KeyGlyph::NewWorkspace,
+            "new space",
+            "command_new_workspace_120",
+        ),
+        (KeyGlyph::Layout, "dev", "command_layout_120"),
+        (
+            KeyGlyph::NewWorktree,
+            "new tree",
+            "command_new_worktree_120",
+        ),
+        (
+            KeyGlyph::RemoveWorktree,
+            "remove",
+            "command_remove_worktree_120",
+        ),
+    ] {
+        let tile = Tile::Command {
+            glyph,
+            label: label.into(),
+            // The two destructive ones wear the guard, exactly as they do on a real deck.
+            hold: matches!(glyph, KeyGlyph::CloseTab | KeyGlyph::RemoveWorktree),
+            enabled: true,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn a_worktree_tile_pins_the_difference_between_one_herdr_holds_and_one_it_does_not() {
+    // Filled circle against hollow, and two different greys behind them. The shape is the signal
+    // that survives a washed-out LCD seen off-axis; the colour is only the second one. This is the
+    // fixture that proves the two are actually distinguishable rather than merely different.
+    for (open, name) in [
+        (true, "worktree_open_120"),
+        (false, "worktree_not_open_120"),
+    ] {
+        let tile = Tile::Worktree {
+            label: "fix-auth".into(),
+            open,
+            focused: false,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn the_worktree_you_are_actually_in_pins_the_same_ring_a_focused_agent_wears() {
+    // One ring, one meaning, wherever it appears: herdr is on this thing right now.
+    let tile = Tile::Worktree {
+        label: "fix-auth".into(),
+        open: true,
+        focused: true,
+    };
+    assert_key_matches_golden("worktree_focused_120", &tile, 120);
+}
