@@ -891,6 +891,18 @@ mod tests {
                 label: "agents".into(),
                 active: true,
             },
+            Tile::Command {
+                glyph: KeyGlyph::Arrow(PaneDirection::Down),
+                label: "down".into(),
+                hold: false,
+                enabled: true,
+            },
+            Tile::Command {
+                glyph: KeyGlyph::Close,
+                label: "close".into(),
+                hold: true,
+                enabled: false,
+            },
             Tile::Empty,
             Tile::Offline {
                 message: "herdr offline".into(),
@@ -1044,6 +1056,68 @@ mod tests {
             overdue < 120.0 * 0.1,
             "the bar has grown into a band and is eating the tile"
         );
+    }
+
+    #[test]
+    fn every_command_shape_draws_something_no_other_one_draws() {
+        // These keys sit in a block and are pressed by feel, so a shape that came out identical to
+        // its neighbour would make two keys indistinguishable without reading them — which is the
+        // one thing they exist to avoid. Byte inequality is a weak check; the golden fixtures carry
+        // the real judgement about whether each is legible. This just stops one being added and
+        // silently drawing nothing.
+        let r = renderer();
+        let glyphs = [
+            KeyGlyph::Arrow(PaneDirection::Left),
+            KeyGlyph::Arrow(PaneDirection::Right),
+            KeyGlyph::Arrow(PaneDirection::Up),
+            KeyGlyph::Arrow(PaneDirection::Down),
+            KeyGlyph::SplitRight,
+            KeyGlyph::SplitDown,
+            KeyGlyph::ZoomIn,
+            KeyGlyph::ZoomOut,
+            KeyGlyph::Close,
+        ];
+        // Rendered with the same caption throughout, so any difference is the shape and not the
+        // word underneath it — and at 72px, where a shape one notch too large turns into a smudge.
+        let rendered: Vec<_> = glyphs
+            .iter()
+            .map(|glyph| {
+                r.render_key(
+                    &Tile::Command {
+                        glyph: *glyph,
+                        label: "key".into(),
+                        hold: false,
+                        enabled: true,
+                    },
+                    72,
+                )
+                .unwrap()
+            })
+            .collect();
+        for (i, a) in rendered.iter().enumerate() {
+            for (j, b) in rendered.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} draw identically", glyphs[i], glyphs[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_guarded_key_and_an_unusable_one_each_look_different_from_a_plain_one() {
+        // Both are things the key has to say before it is pressed: one that it needs a hold, one
+        // that it cannot act at all. A treatment that rendered the same as an ordinary key would
+        // be a guard nobody can see and a dead key that looks alive.
+        let r = renderer();
+        let tile = |hold, enabled| Tile::Command {
+            glyph: KeyGlyph::Close,
+            label: "close".into(),
+            hold,
+            enabled,
+        };
+        let plain = r.render_key(&tile(false, true), 120).unwrap();
+        let guarded = r.render_key(&tile(true, true), 120).unwrap();
+        let unusable = r.render_key(&tile(true, false), 120).unwrap();
+        assert_ne!(plain, guarded);
+        assert_ne!(guarded, unusable);
     }
 
     #[test]
