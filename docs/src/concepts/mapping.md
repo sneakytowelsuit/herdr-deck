@@ -16,7 +16,7 @@ is replaced, the agent goes with it.
 ## What lands on a key
 
 By default, keys show **agents**, because an agent is the thing that can need you. Pressing the
-mode toggle switches the deck to **workspaces**, which is the level you navigate at.
+mode key switches the deck to **workspaces**, which is the level you navigate at.
 
 There is a third list that is not in that tree at all: **worktrees**. A git worktree is a checkout
 on disk, and herdr opens one as a workspace — so it sits *outside* the nesting above, and the only

@@ -21,7 +21,8 @@ running.
 - **One press to focus.** herdr switches to that pane and your terminal window comes forward.
 - **Dials** on a Stream Deck +: scrub agents, workspaces, tabs, or just the ones that need you,
   and press to jump there.
-- **Workspace navigation** — toggle the deck between agents and workspaces.
+- **Workspace and worktree navigation** — cycle the deck between agents, workspaces and the git
+  worktrees of the repository you are in, and press one to go there.
 - **macOS and Linux**, looking and behaving identically.
 
 ## Two things to know up front

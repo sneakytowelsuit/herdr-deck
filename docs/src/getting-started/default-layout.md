@@ -9,7 +9,7 @@ lays itself out to fit.
 |---|---|
 | Keys 1–6 | The first six agents **in attention order**. Press to focus, hold to acknowledge. |
 | Key 7 | *Next attention* — jumps to the agent that needs you most. Dark when nothing does. |
-| Key 8 | Toggles the deck between agents and workspaces. |
+| Key 8 | Cycles the deck between agents, workspaces, and — where the session has any — worktrees. |
 | Dial 1 | Rotate: scrub all agents. Press: focus. |
 | Dial 2 | Rotate: cycle workspaces. Press: focus. |
 | Dial 3 | Rotate: cycle tabs. Press: focus. |
