@@ -65,7 +65,9 @@ pub enum HerdrError {
     /// An ordinary refusal means nothing happened and nothing is waiting; this one means herdr is
     /// now sitting in a modal the user did not open and the deck has no way to answer or dismiss.
     /// The only honest thing a key can do is say where the question went.
-    #[error("herdr is asking you to confirm this in its own window — the deck cannot answer for you")]
+    #[error(
+        "herdr is asking you to confirm this in its own window — the deck cannot answer for you"
+    )]
     ConfirmationRequired { method: String },
 
     #[error("could not parse herdr's response to `{method}`: {source}")]

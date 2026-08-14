@@ -70,8 +70,12 @@ impl ScrubTarget {
 }
 
 /// What a key does.
+///
+/// `deny_unknown_fields` for the same reason the config as a whole has it: a field that does not
+/// belong to the binding it was written on is a misunderstanding, and the deck saying so beats the
+/// user staring at a key that quietly ignores half of what they asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum KeyBinding {
     /// The Nth entry of the current mode's list. Contents change as agents come and go —
     /// this is what makes the deck useful with zero configuration.
@@ -834,7 +838,11 @@ fn command_tile(command: &DeckCommand, enabled: bool) -> Tile {
         // whole message and it gets the plain labelled key. An arrow here would be decoration
         // pretending to be information.
         None => Tile::Mode {
-            label: if hold { format!("hold: {label}") } else { label },
+            label: if hold {
+                format!("hold: {label}")
+            } else {
+                label
+            },
             active: enabled,
         },
     }

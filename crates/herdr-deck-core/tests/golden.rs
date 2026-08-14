@@ -26,10 +26,10 @@
 //! viewer, not just `git diff --stat` — before committing; `UPDATE_GOLDEN` will happily "fix" a
 //! genuine regression by baking it in as the new expectation.
 
-use herdr_deck_core::render::{Tile, TileRenderer};
+use herdr_deck_core::render::{KeyGlyph, Tile, TileRenderer};
 use herdr_deck_core::state::WaitBucket;
 use herdr_deck_core::theme::Theme;
-use herdr_deck_herdr::wire::AgentStatus;
+use herdr_deck_herdr::wire::{AgentStatus, PaneDirection};
 use std::path::PathBuf;
 
 fn renderer() -> TileRenderer {
@@ -245,6 +245,82 @@ fn an_inactive_mode_tile_pins_the_dimmed_look_with_no_indicator() {
         active: false,
     };
     assert_key_matches_golden("mode_inactive", &tile, 120);
+}
+
+// --- Pane control -----------------------------------------------------------------------------
+//
+// These keys are pressed by feel, in a block, without being read — so what the fixtures are
+// guarding is the *silhouette*: an arrow that reads as an arrow, a filled half that says which
+// side the new pane lands on, a cross that could not be mistaken for a grid. They are drawn from
+// geometry rather than typeset, so nothing here depends on the font having a square with its
+// bottom half filled; what it does depend on is a set of fractions that were chosen by looking at
+// the result, which is exactly what a fixture is for. Rendered at 72px, the smallest deck we
+// support and the size where a shape one notch too large turns into a smudge.
+
+#[test]
+fn a_direction_key_pins_the_arrow_it_is_meant_to_be_read_by() {
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Arrow(PaneDirection::Left),
+        label: "left".into(),
+        hold: false,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_arrow_left_72", &tile, 72);
+}
+
+#[test]
+fn a_split_key_pins_which_half_of_the_tab_the_new_pane_takes() {
+    let tile = Tile::Command {
+        glyph: KeyGlyph::SplitDown,
+        label: "split down".into(),
+        hold: false,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_split_down_120", &tile, 120);
+}
+
+#[test]
+fn the_two_zoom_keys_pin_shapes_that_could_not_be_confused_for_each_other() {
+    // They sit side by side and mean opposite things, so "one is filled and one is not" has to be
+    // legible from an angle, at arm's length, without reading either caption.
+    for (glyph, label, name) in [
+        (KeyGlyph::ZoomIn, "zoom", "command_zoom_in_120"),
+        (KeyGlyph::ZoomOut, "unzoom", "command_zoom_out_120"),
+    ] {
+        let tile = Tile::Command {
+            glyph,
+            label: label.into(),
+            hold: false,
+            enabled: true,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn a_guarded_key_pins_the_word_that_says_a_tap_will_not_do_it() {
+    // The whole point of the guard being visible. This fixture is the only place anyone can check
+    // that "hold" is legible without crowding the shape it sits above.
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Close,
+        label: "close".into(),
+        hold: true,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_close_hold_120", &tile, 120);
+}
+
+#[test]
+fn a_command_key_with_nothing_to_act_on_pins_the_dimmed_look_it_degrades_to() {
+    // herdr reports no focused pane, so the key cannot do its job — and says so by going dim
+    // rather than by disappearing and taking its neighbours' positions with it.
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Close,
+        label: "close".into(),
+        hold: true,
+        enabled: false,
+    };
+    assert_key_matches_golden("command_close_disabled_120", &tile, 120);
 }
 
 #[test]

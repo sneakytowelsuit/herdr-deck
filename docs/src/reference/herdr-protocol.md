@@ -38,11 +38,44 @@ The only methods that hold a connection open are `events.subscribe` and `pane.gr
 | `client.window_title.set` | Stamp a marker so the exact terminal window can be found. |
 | `ping` | Liveness. |
 | `notification.show` | Optional toast; its `reason` doubles as "is a TUI attached". |
+| `pane.focus_direction` | Move one pane left/right/up/down. |
+| `pane.zoom` | Fill a tab with its focused pane, or put it back. |
+| `pane.split` | New shell beside or below the focused one. |
+| `pane.close` | Close a pane. The only destructive call the deck makes. |
+
+## Pane commands
+
+Four sharp edges, all found in herdr's source rather than the hard way.
+
+- **Omit `pane_id`.** Both `pane.focus_direction` and `pane.zoom` accept one, and both *navigate
+  to that pane first* when given one — switching workspace and tab on the way. A key labelled
+  "left" that also teleported you would be a surprise, so the deck sends neither. Without an id
+  they act on whatever herdr currently has focused, which is also fresher than anything the deck
+  knows.
+- **`pane.zoom` takes `on`/`off`, never `toggle`.** Zoom is a per-tab boolean; herdr's snapshot
+  carries it, but the deck's copy is always a reconcile behind. Stating the end state is
+  idempotent and self-correcting; `already_zoomed` comes back as a success, not an error.
+- **`pane.focus_direction` at an edge is a success.** It answers `changed: false` with reason
+  `no_neighbor` — note herdr's American spelling — and so are `single_pane` and
+  `already_unzoomed`. None of them are errors and none of them may reach a key as one.
+- **`pane.split` has only `right` and `down`.** There is no split-left or split-up to offer. It
+  also un-zooms the tab as a side effect, and the deck asks for `focus: true` so the new shell is
+  the one you are in.
+
+`pane.close` is worse than it looks and the deck treats it accordingly. It cascades — the last
+pane closes the tab, the last tab closes the workspace — and returns a bare `{"type":"ok"}` for
+all three, so nothing downstream can report what was actually destroyed. Its one guard,
+`confirmation_required`, fires only when herdr's own `confirm_close` is on and a worktree group
+would go, and it has a side effect: herdr opens its `ConfirmClose` modal. The deck surfaces that
+as its own message on the key and leaves the dialog alone. It could dismiss it —
+`agent.focus` settles herdr's mode and would take the modal with it — but answering a question the
+user has not read yet is exactly what this project does not do, and it would drag them to another
+pane on the way.
 
 ## Why herdr-deck doesn't approve prompts
 
-**herdr-deck's entire write surface to herdr is focus.** The table above is not a partial list —
-it is every method the daemon calls. There is no `agent.approve`, no `pane.send_keys`, no
+**herdr-deck's write surface to herdr is focus and structure.** The table above is not a partial
+list — it is every method the daemon calls. There is no `agent.approve`, no `pane.send_keys`, no
 structured yes/no of any kind. A key can turn red the moment `session.snapshot` reports an agent
 `blocked` on approval; it deliberately cannot make that need go away. This is not an
 unimplemented feature. It is a refusal, and the reasoning is worth writing down so it does not
@@ -134,6 +167,10 @@ id* — not a terminal id — so resolve at the moment of use.
   zoom while it does. Sending `workspace.focus` or `tab.focus` around it to "prepare the way"
   makes three round trips of a journey herdr does atomically, and fights its own logic.
 - `workspace.metadata_updated` does not trigger plugin event hooks.
+- Pane ids are **positional if they are numeric**: `parse_workspace_id` falls back to treating a
+  bare `"2"` as "the second one right now". Never send a positional id from a deck — and never
+  keep a pane id anywhere it could go stale, which is why the deck's close-pane key resolves one
+  at the moment it is held.
 
 ## Version compatibility
 

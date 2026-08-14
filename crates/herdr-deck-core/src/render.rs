@@ -478,9 +478,19 @@ impl TileRenderer {
     /// which is the opposite weighting to an agent tile. That is deliberate: an agent tile is read
     /// for *which* agent, so its label dominates, while a pane key is always the same key and is
     /// found by feel and by silhouette. The caption is there for the first week, not the second.
-    fn command_svg(&self, s: f32, glyph: KeyGlyph, label: &str, hold: bool, enabled: bool) -> String {
+    fn command_svg(
+        &self,
+        s: f32,
+        glyph: KeyGlyph,
+        label: &str,
+        hold: bool,
+        enabled: bool,
+    ) -> String {
         let (fg, accent) = if enabled {
-            (self.theme.neutral_foreground(), self.theme.neutral_foreground())
+            (
+                self.theme.neutral_foreground(),
+                self.theme.neutral_foreground(),
+            )
         } else {
             (self.theme.dim_foreground(), self.theme.dim_foreground())
         };
@@ -617,9 +627,7 @@ fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
         r##"<rect x="{x0:.2}" y="{y0:.2}" width="{d:.2}" height="{d:.2}" rx="{r:.2}" fill="none" stroke="{colour}" stroke-width="{stroke:.2}"/>"##,
         r = d * 0.10,
     );
-    let triangle = |points: String| {
-        format!(r##"<polygon points="{points}" fill="{colour}"/>"##)
-    };
+    let triangle = |points: String| format!(r##"<polygon points="{points}" fill="{colour}"/>"##);
     let fill = |x: f32, y: f32, w: f32, h: f32| {
         format!(r##"<rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" fill="{colour}"/>"##)
     };
@@ -669,27 +677,34 @@ fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
             ),
         }),
         // The new pane is the filled half, so the shape says which side of the divider you end up
-        // on as well as where the divider goes.
+        // on as well as where the divider goes. The fill is inset by the stroke on its outer
+        // edges and flush on the divider, which keeps the pane's rounded outline intact — a fill
+        // running past it squares the corners off and the whole thing stops reading as a pane.
         KeyGlyph::SplitRight => format!(
             "{}{}",
-            fill(x0 + d / 2.0, y0, d / 2.0, d),
-            outline
+            outline,
+            fill(
+                x0 + d / 2.0,
+                y0 + stroke,
+                d / 2.0 - stroke,
+                d - stroke * 2.0
+            )
         ),
         KeyGlyph::SplitDown => format!(
             "{}{}",
-            fill(x0, y0 + d / 2.0, d, d / 2.0),
-            outline
+            outline,
+            fill(
+                x0 + stroke,
+                y0 + d / 2.0,
+                d - stroke * 2.0,
+                d / 2.0 - stroke
+            )
         ),
         // One pane swallowing the tab...
         KeyGlyph::ZoomIn => format!(
             "{}{}",
             outline,
-            fill(
-                x0 + d * 0.22,
-                y0 + d * 0.22,
-                d * 0.56,
-                d * 0.56
-            )
+            fill(x0 + d * 0.22, y0 + d * 0.22, d * 0.56, d * 0.56)
         ),
         // ...and the tab handed back to all of them.
         KeyGlyph::ZoomOut => format!(
@@ -701,18 +716,8 @@ fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
         KeyGlyph::Close => format!(
             "{}{}{}",
             outline,
-            line(
-                x0 + d * 0.26,
-                y0 + d * 0.26,
-                x0 + d * 0.74,
-                y0 + d * 0.74
-            ),
-            line(
-                x0 + d * 0.74,
-                y0 + d * 0.26,
-                x0 + d * 0.26,
-                y0 + d * 0.74
-            )
+            line(x0 + d * 0.26, y0 + d * 0.26, x0 + d * 0.74, y0 + d * 0.74),
+            line(x0 + d * 0.74, y0 + d * 0.26, x0 + d * 0.26, y0 + d * 0.74)
         ),
     }
 }

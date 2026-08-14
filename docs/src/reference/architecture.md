@@ -110,6 +110,40 @@ Two things are kept out of that vocabulary on purpose:
   herdr focuses *panes*, so agent focus stays a `SlotAction` until the daemon resolves it against
   live state at the moment the key is released. An unresolved target therefore cannot reach the
   socket, and an agent that vanished between paint and press is reported rather than guessed at.
+  Closing a pane is resolved the same way and for the same reason: pane ids are renumbered when a
+  pane moves workspaces, so the only id safe to close is the one herdr just gave us.
+
+## Not every command is a journey
+
+A focus is two steps — herdr's focus, then the OS window — and is only half done until the window
+comes forward. Pane control is one step. Moving one pane left, zooming, splitting and closing all
+rearrange the terminal you are already sitting at, so they stop after herdr and the key reports a
+plain success.
+
+That line is drawn once, on the command, so a key cannot disagree with it. Getting it wrong in
+either direction costs something real: raising a window on every arrow press would spend a round
+trip nobody asked for and would make every one of those keys alert on a desktop that cannot raise
+windows at all, while *not* raising for an agent focus would leave you looking at the wrong window
+and wondering why the key did nothing.
+
+## Three ways a command can not-happen
+
+herdr distinguishes "I refused" from "I understood, and there was nothing to do", and the deck
+carries that distinction all the way to the key.
+
+| Verdict | On the key | When |
+|---|---|---|
+| `complete` | Ok | It happened, window and all. |
+| `settled` | Ok | herdr did it and there was nothing further — nothing attached to raise, or a command that never wanted the window. |
+| `unchanged` | Ok | herdr understood and found nothing to change: the edge of a layout, a tab with one pane, a zoom already on. |
+| `partial` | Alert | herdr did it; the window should have come forward and did not. |
+| `failed` | Alert | herdr refused, so nothing happened at all. |
+
+Only the last two are alerts. The middle one is why: a thumb run along a row of direction keys
+reaches an edge every single time, and a deck that flashed for it would teach its owner to stop
+reading the flashes — which are the only thing this hardware has to say something is genuinely
+wrong. The log keeps all five apart, so "I pressed left four times and only moved twice" is still
+a question with an answer.
 
 ## Reads are polled, writes are commands
 
@@ -135,8 +169,9 @@ rather than one to read like a log.
 
 A long press already means "I am sure" on this deck: it is how an agent is dismissed from the
 attention queue without focusing it. Anything that could destroy work therefore fires from a hold
-and never from a tap, the key wears `hold:` on its face, and tapping it says so rather than going
-quiet. Guarding is a property of the command, not of the key, so it cannot be bypassed by binding
+and never from a tap, the key wears `hold` on its face, and tapping it says so rather than going
+quiet. Closing a pane is the one command this applies to today, and it is never in a layout the
+deck derived for you — you have to bind it. Guarding is a property of the command, not of the key, so it cannot be bypassed by binding
 one by hand — and it applies the day a new command is added rather than the day someone remembers.
 
 A dial has no hold, since the daemon ignores an encoder's release. A destructive command on a

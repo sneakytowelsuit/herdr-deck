@@ -1437,6 +1437,99 @@ mod tests {
         );
     }
 
+    // --- Pane control, and the gesture that guards the destructive half of it ------------------
+    //
+    // The two halves of the hold are tested apart elsewhere — the guard in `layout.rs`, the tap
+    // and hold timing in the acknowledge tests above. These drive both halves through a real
+    // Session, which is the only place they meet.
+
+    /// A deck laid out by hand: one pane arrow, one close key, and a focused pane to close.
+    fn pane_session() -> (Session, DeckState) {
+        let mut config = Config::default();
+        config.layout = Some(herdr_deck_core::config::LayoutOverride {
+            keys: vec![
+                herdr_deck_core::layout::KeyBinding::Command {
+                    command: DeckCommand::MovePaneFocus {
+                        direction: herdr_deck_herdr::wire::PaneDirection::Left,
+                    },
+                },
+                herdr_deck_core::layout::KeyBinding::ClosePane,
+            ],
+            dials: vec![],
+        });
+        let mut s = state(vec![]);
+        s.focused_pane_id = Some("w1:p3".into());
+        (Session::new(&plus_device(), &config, renderer()), s)
+    }
+
+    #[test]
+    fn a_pane_key_acts_the_instant_it_goes_down_because_nothing_about_it_is_ambiguous() {
+        // Muscle memory is the whole reason these keys exist. A direction key that did nothing
+        // until you let go would feel broken, and would be useless for the one thing it is for —
+        // pressing it four times in a row without looking.
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        let pressed = session.handle(FrontendMessage::KeyDown { index: 0 }, &s, Instant::now());
+        assert_eq!(
+            pressed.action,
+            Some(PendingAction {
+                command: DeckCommand::MovePaneFocus {
+                    direction: herdr_deck_herdr::wire::PaneDirection::Left
+                },
+                key: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn tapping_the_close_key_refuses_on_its_face_and_issues_nothing() {
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        let outcome = tap(&mut session, 1, &s);
+        assert!(
+            outcome.action.is_none(),
+            "a tap must not reach herdr, got {:?}",
+            outcome.action
+        );
+        match outcome.messages.as_slice() {
+            [DaemonMessage::Alert { index, message }] => {
+                assert_eq!(*index, 1);
+                assert!(message.contains("hold"), "got {message}");
+            }
+            other => panic!("expected one alert naming the gesture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn holding_the_close_key_is_what_actually_asks_herdr_to_close_the_pane() {
+        // The other half of the bargain, through the same Session as the tap: guarding a command
+        // is only defensible if holding it still means it.
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        assert_eq!(
+            hold(&mut session, 1, &s).action,
+            Some(PendingAction {
+                command: DeckCommand::ClosePane {
+                    pane_id: "w1:p3".into()
+                },
+                key: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn a_close_key_with_nothing_focused_refuses_both_gestures_rather_than_picking_a_pane() {
+        let (mut session, _) = pane_session();
+        let nothing_focused = state(vec![]);
+        session.greet(&nothing_focused);
+
+        assert!(tap(&mut session, 1, &nothing_focused).action.is_none());
+        assert!(hold(&mut session, 1, &nothing_focused).action.is_none());
+    }
+
     #[test]
     fn pressing_a_pedal_still_focuses_the_top_attention_agent() {
         let pedal = DeviceReport {

@@ -989,7 +989,10 @@ mod tests {
             })
             .await;
 
-        assert!(runner.ran().is_empty(), "no window should have been touched");
+        assert!(
+            runner.ran().is_empty(),
+            "no window should have been touched"
+        );
         assert_eq!(report.raise, RaiseOutcome::NotNeeded);
         assert!(
             !report.verdict().is_error(),

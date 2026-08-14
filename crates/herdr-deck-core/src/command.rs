@@ -64,7 +64,6 @@ pub enum DeckCommand {
     /// for all three. The deck can therefore say what it asked for but never what it did, which is
     /// the whole reason this one waits for a hold.
     ClosePane { pane_id: String },
-
 }
 
 impl DeckCommand {
@@ -208,7 +207,11 @@ impl DeckCommand {
                 .into_iter()
                 .map(|direction| DeckCommand::MovePaneFocus { direction }),
         );
-        all.extend(ZoomMode::ALL.into_iter().map(|zoom| DeckCommand::ZoomPane { zoom }));
+        all.extend(
+            ZoomMode::ALL
+                .into_iter()
+                .map(|zoom| DeckCommand::ZoomPane { zoom }),
+        );
         all.extend(
             SplitDirection::ALL
                 .into_iter()

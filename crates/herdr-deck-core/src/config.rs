@@ -205,6 +205,64 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_control_cluster_can_be_written_by_hand_on_a_deck_too_small_to_be_given_one() {
+        // Small decks keep every key for agents, so this is the only way pane control reaches a
+        // Stream Deck + — which makes it the path most likely to be typed by a person and most
+        // deserving of a test that the spellings are the ones documented.
+        let config = Config::from_toml(
+            r#"
+            [layout]
+            keys = [
+              { kind = "command", command = { verb = "move_pane_focus", direction = "left" } },
+              { kind = "command", command = { verb = "move_pane_focus", direction = "right" } },
+              { kind = "command", command = { verb = "zoom_pane", zoom = "on" } },
+              { kind = "command", command = { verb = "zoom_pane", zoom = "off" } },
+              { kind = "command", command = { verb = "split_pane", direction = "down" } },
+              { kind = "close_pane" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let keys = config.layout.expect("layout parsed").keys;
+        assert_eq!(
+            keys[0],
+            KeyBinding::Command {
+                command: crate::command::DeckCommand::MovePaneFocus {
+                    direction: herdr_deck_herdr::wire::PaneDirection::Left
+                }
+            }
+        );
+        assert_eq!(
+            keys[3],
+            KeyBinding::Command {
+                command: crate::command::DeckCommand::ZoomPane {
+                    zoom: herdr_deck_herdr::wire::ZoomMode::Off
+                }
+            }
+        );
+        assert_eq!(keys[5], KeyBinding::ClosePane);
+    }
+
+    #[test]
+    fn a_field_written_on_the_wrong_kind_of_key_is_an_error_like_any_other_typo() {
+        // The same bargain the rest of the file makes: a key that quietly ignored half of what was
+        // asked of it would leave someone editing their config and wondering why nothing changed.
+        //
+        // Serde can only enforce this on bindings that take arguments — a unit binding such as
+        // `close_pane` swallows stray fields whatever we ask for — so the guarantee is real but
+        // not total, and a stray `pane_id` on a close key is ignored rather than refused. It would
+        // have been ignored anyway: that key closes whatever herdr says is focused, by design.
+        let err = Config::from_toml(
+            r#"
+            [layout]
+            keys = [{ kind = "dynamic", rank = 0, ranks = 1 }]
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ranks"), "got: {err}");
+    }
+
+    #[test]
     fn config_serialises_back_to_toml_so_install_can_write_a_starter_file() {
         let config = Config::default();
         let text = toml::to_string_pretty(&config).unwrap();

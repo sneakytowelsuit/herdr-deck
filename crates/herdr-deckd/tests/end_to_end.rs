@@ -80,7 +80,10 @@ struct Daemon {
 
 impl Daemon {
     async fn start(client: HerdrClient) -> Self {
-        let config = test_config();
+        Self::start_with(client, test_config()).await
+    }
+
+    async fn start_with(client: HerdrClient, config: Config) -> Self {
         let renderer = Arc::new(TileRenderer::new(config.theme));
         let focus = Arc::new(FocusEngine::new(client.clone(), config.focus.clone()));
         let state = Watcher::new(client, &config).spawn();
@@ -706,4 +709,147 @@ async fn when_herdr_is_unreachable_every_key_says_so_and_pressing_one_does_nothi
         frontend.drain_to_pong().await.is_empty(),
         "an offline deck must not act on a press — and must stay connected to say so"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pane control
+// ---------------------------------------------------------------------------------------------
+//
+// These are the keys someone presses without looking, dozens of times a session, while sitting at
+// the terminal they are pressing them about. What matters end to end is not that the right method
+// went down the socket — that is pinned closer to the wire — but what the *key* does afterwards:
+// which presses are worth an alert, which are not, and what the trail says the next morning.
+
+/// A deck laid out for pane work: an arrow, and a key that closes the focused pane.
+fn pane_config() -> Config {
+    let mut config = test_config();
+    config.layout = Some(herdr_deck_core::config::LayoutOverride {
+        keys: vec![
+            herdr_deck_core::layout::KeyBinding::Command {
+                command: herdr_deck_core::command::DeckCommand::MovePaneFocus {
+                    direction: herdr_deck_herdr::wire::PaneDirection::Left,
+                },
+            },
+            herdr_deck_core::layout::KeyBinding::ClosePane,
+        ],
+        dials: vec![],
+    });
+    config
+}
+
+/// A herdr with one idle agent and a pane the user is sitting in.
+fn snapshot_with_a_focused_pane() -> SessionSnapshot {
+    let mut snapshot = snapshot(vec![agent(
+        "term_a",
+        "w1:p9",
+        "refactor-auth",
+        AgentStatus::Idle,
+        100,
+    )]);
+    snapshot.focused_pane_id = Some("w1:p9".to_string());
+    snapshot
+}
+
+/// Press key `index` and read back what the daemon put on its face.
+async fn feedback_from(frontend: &mut Frontend) -> DaemonMessage {
+    let (_before, feedback) = frontend
+        .read_until(|m| matches!(m, DaemonMessage::Ok { .. } | DaemonMessage::Alert { .. }))
+        .await;
+    feedback
+}
+
+#[tokio::test]
+async fn a_direction_key_reads_as_success_even_though_no_window_was_raised() {
+    // Window raising is off in these tests, which is exactly the situation that makes an agent
+    // focus alert. A pane move must not: it never wanted the window, so nothing was left undone
+    // and the key has nothing to complain about.
+    let mock = mock_herdr(snapshot_with_a_focused_pane()).await;
+    let mut daemon = Daemon::start_with(HerdrClient::new(mock.socket_path()), pane_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(0).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 0 }
+    );
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded.len(), 1, "one press, one line: {recorded:?}");
+    assert_eq!(recorded[0]["command"], "move_pane_focus");
+    assert_eq!(
+        recorded[0]["target"], "left",
+        "a command with no id still has to record which one it was"
+    );
+    assert_eq!(recorded[0]["outcome"], "settled");
+}
+
+#[tokio::test]
+async fn running_a_thumb_off_the_edge_of_a_layout_never_flashes_an_alert() {
+    // The press this whole distinction exists for. herdr answers "there is no pane that way" as a
+    // success carrying a reason; if the deck turned that into an alert, every user would meet one
+    // within a minute of finding these keys and would stop reading alerts by the end of the day.
+    let mock = mock_herdr(snapshot_with_a_focused_pane()).await;
+    mock.with_no_pane_that_way().await;
+    let mut daemon = Daemon::start_with(HerdrClient::new(mock.socket_path()), pane_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(0).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 0 }
+    );
+
+    // The key stays quiet; the log does not. "I pressed left four times and only moved twice" is
+    // a question somebody is entitled to an answer to.
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(recorded[0]["outcome"], "unchanged");
+}
+
+#[tokio::test]
+async fn closing_a_pane_takes_a_hold_and_a_tap_only_says_so() {
+    // Both halves of the guard, through a real socket: the tap reaches nothing and explains
+    // itself, the hold reaches herdr and names the pane the user was actually in.
+    let mock = mock_herdr(snapshot_with_a_focused_pane()).await;
+    let mut daemon = Daemon::start_with(HerdrClient::new(mock.socket_path()), pane_config()).await;
+    daemon.wait_until_online().await;
+
+    let mut frontend = Frontend::connect(&daemon).await;
+    frontend.send(hello(0)).await;
+    frontend.read(1 + PLUS_KEYS).await;
+
+    frontend.tap(1).await;
+    match feedback_from(&mut frontend).await {
+        DaemonMessage::Alert { index, message } => {
+            assert_eq!(index, 1);
+            assert!(message.contains("hold"), "got {message}");
+        }
+        other => panic!("a tap must refuse out loud, got {other:?}"),
+    }
+    assert!(
+        daemon.audit_lines().await.is_empty(),
+        "a refused tap never reached herdr, so it must leave no trail"
+    );
+
+    frontend.hold(1).await;
+    assert_eq!(
+        feedback_from(&mut frontend).await,
+        DaemonMessage::Ok { index: 1 }
+    );
+
+    let recorded = daemon.audit_lines().await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only the hold is a command: {recorded:?}"
+    );
+    assert_eq!(recorded[0]["command"], "close_pane");
+    assert_eq!(recorded[0]["target"], "w1:p9");
 }

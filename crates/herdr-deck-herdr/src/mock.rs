@@ -209,8 +209,11 @@ impl MockHerdr {
             json!({"type": "pane_zoom", "zoom": {"changed": true, "zoomed": true}}),
         )
         .await;
-        self.reply("pane.split", json!({"type": "pane_info", "pane": {"pane_id": "w1:p9"}}))
-            .await;
+        self.reply(
+            "pane.split",
+            json!({"type": "pane_info", "pane": {"pane_id": "w1:p9"}}),
+        )
+        .await;
         self.reply("pane.close", json!({ "type": "ok" })).await;
     }
 
