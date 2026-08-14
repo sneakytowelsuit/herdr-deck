@@ -50,15 +50,22 @@ See [Window-raise backends](../focus/backends.md) for ids for other terminals.
 
 ## `[layout]` — pinning keys
 
-By default every key shows an agent chosen dynamically, which is what makes herdr-deck useful
-with no configuration. If you want specific keys pinned, replace the whole layout:
+By default every key shows the Nth entry of whichever
+[page](../getting-started/default-layout.md#pages) the deck is on, which is what makes herdr-deck
+useful with no configuration. If you want specific keys pinned, replace the whole layout:
 
 ```toml
 [layout]
 keys = [
-  # The Nth agent in attention order.
+  # The Nth entry of the current page — the Nth agent when the deck is showing
+  # agents, the Nth workspace when it is showing spaces, and so on.
   { kind = "dynamic", rank = 0 },
   { kind = "dynamic", rank = 1 },
+
+  # The Nth entry of ONE page, whatever page the deck is on. This is how a deck
+  # with keys to spare shows two families at once instead of paging between them.
+  # Pages: agents | spaces | trees | panes | make
+  { kind = "dynamic", rank = 0, page = "panes" },
 
   # Always this agent, whatever it is doing. Use the stable terminal_id
   # (`herdr-deck status --json` prints it).
@@ -83,11 +90,12 @@ keys = [
   { kind = "close_tab" },
   { kind = "remove_worktree" },
 
-  # Fixed controls.
-  { kind = "next_attention" },
-  { kind = "mode_toggle" },
-  { kind = "page_prev" },
-  { kind = "page_next" },
+  # Fixed controls. Bind both of the first two on any deck you can page: they are
+  # the way home and the way anywhere else.
+  { kind = "attention" },      # to the agent that needs you, and back to the agents page
+  { kind = "page_cycle" },     # agents / spaces / trees / panes / make
+  { kind = "screen_prev" },    # within a page longer than the keys showing it
+  { kind = "screen_next" },
 
   # Dial behaviour on a key, for hardware without encoders.
   { kind = "scrub", target = "attention", delta = 1 },
@@ -124,15 +132,56 @@ Command verbs:
 A hand-written layout shorter than the hardware is padded with empty keys, so you cannot
 accidentally leave keys unaddressable.
 
+Four of these were renamed when the mode toggle
+[became a page cycle](../getting-started/default-layout.md#pages). The old spellings still load,
+so an existing config keeps working:
+
+| Old | New |
+|---|---|
+| `next_attention` | `attention` |
+| `mode_toggle` | `page_cycle` |
+| `page_prev` | `screen_prev` |
+| `page_next` | `screen_next` |
+
+The words moved because a *page* now means a family of controls, and the thing `page_prev` moved
+through is a screen within one.
+
+> **Leave yourself a way home.** `attention` is the only key that returns to the agents page, and
+> a hand-written layout without one on a deck that can reach another page is a deck you can walk
+> into a corner of. The derived layout always has one; yours has to say so.
+
 > A command that could destroy work is never issued by a tap. It moves to a hold, the key wears
 > `hold` on its face, and tapping it says so rather than going quiet. The guard applies to the
 > command, not to the key, so a hand-written layout cannot opt out of it.
 
 ## Pane control
 
-Decks with 24 keys or more get [a pane cluster by
-default](../getting-started/default-layout.md#pane-control-on-large-decks). Smaller ones keep
-every key for agents, so this is how you ask for one:
+Every deck reaches pane control on the [panes page](control-families.md#panes--moving-around-the-tab-you-are-in),
+and a deck with [24 keys or more](../getting-started/default-layout.md#what-a-big-deck-buys-you)
+shows that page permanently on keys of its own. What follows is how to put pane keys somewhere
+else — a fixed cluster on a small deck, say, so they are in the same place whichever page you are
+looking at.
+
+The tidy way is to pin the page:
+
+```toml
+[layout]
+keys = [
+  { kind = "dynamic", rank = 0 },
+  { kind = "dynamic", rank = 1 },
+  { kind = "dynamic", rank = 0, page = "panes" },   # left
+  { kind = "dynamic", rank = 1, page = "panes" },   # right
+  { kind = "dynamic", rank = 4, page = "panes" },   # zoom
+  { kind = "dynamic", rank = 5, page = "panes" },   # unzoom
+  { kind = "attention" },
+  { kind = "page_cycle" },
+]
+```
+
+Pinned keys never page, so each one shows exactly the entry you named. A page that is only *partly*
+pinned this way stays in the cycle, so the entries you left out are still reachable.
+
+The explicit way, which does not depend on the order of a page:
 
 ```toml
 [layout]
@@ -158,7 +207,7 @@ about to go. Two keys stating opposite ends are idempotent instead: press `on` t
 still zoomed.
 
 Pressing a direction at the edge of a layout does nothing and says nothing — see
-[the default layout](../getting-started/default-layout.md#pane-control-on-large-decks).
+[control families](control-families.md#panes--moving-around-the-tab-you-are-in).
 
 ### Closing a pane
 
@@ -268,20 +317,24 @@ which case it builds the replacement and then closes the one you named, killing 
 it. herdr-deck has no way to express that, and
 [will not grow one](herdr-protocol.md#structure-layouts-worktrees-workspaces-and-tabs).
 
-Layouts are the one preset that earns keys on its own: a deck with room to spare gets **one key
-per named layout**, alphabetically, without being asked. A layout nobody can press is a layout
-nobody meant to write down. Workspace and tab presets are bound by hand.
+Layouts are the one preset that reaches a key on its own: each named layout becomes an entry on
+the [make page](control-families.md#make--bringing-something-into-being), alphabetically, without
+being asked. A layout nobody can press is a layout nobody meant to write down.
+
+It costs no keys. Ten presets lengthen a page rather than swallowing a deck — a deck with room
+shows as many as it has room for and keeps the make page in the cycle for the rest; a deck without
+room reaches the whole page through the cycle anyway. Workspace and tab presets are bound by hand.
 
 ### Worktrees
 
-If your session is inside a git repository, the mode key grows a third stop — agents, spaces,
-**trees** — listing every worktree of that repository. Pressing one opens it as a workspace and
-takes you there, window and all, exactly as pressing an agent does. A checkout herdr already has
-open is drawn with a filled circle and the word `open`; one it does not have open is drawn hollow.
-Pressing either does the same thing, because `worktree.open` is idempotent.
+If your session is inside a git repository, the page key grows a **trees** stop listing every
+worktree of that repository. Pressing one opens it as a workspace and takes you there, window and
+all, exactly as pressing an agent does. A checkout herdr already has open is drawn with a filled
+circle and the word `open`; one it does not have open is drawn hollow. Pressing either does the
+same thing, because `worktree.open` is idempotent.
 
-Sessions with no worktrees never see the third stop, so nobody pays a press for a page they do not
-use. There is also a dial target:
+Sessions with no worktrees never see the stop, so nobody pays a press for a page they do not use.
+There is also a dial target:
 
 ```toml
 dials = [{ kind = "scrub", target = "worktrees" }]

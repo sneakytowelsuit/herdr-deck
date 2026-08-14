@@ -39,7 +39,9 @@ alarm, not the agent — but it stops counting towards the attention key, drops 
 still asking for you, and its tile goes calm with a `×` in place of its status glyph.
 
 A short press is unchanged: it focuses, exactly as it always did. Only keys that show an agent
-have a second action; holding a page key or the mode toggle does what pressing it does.
+have a second action, and the one other kind of key that does — anything
+[destructive](../reference/control-families.md#destructive-commands-wherever-they-come-from) —
+has it the other way round. Holding a page key or a paging key does what pressing it does.
 
 ### An acknowledgement expires the moment the agent moves
 

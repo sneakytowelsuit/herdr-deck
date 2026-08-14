@@ -10,6 +10,10 @@ herdr-deck puts it on physical hardware. Every agent gets a key. A key turns red
 agent needs a decision, and pressing it switches herdr to that agent **and** brings your terminal
 to the front.
 
+It is also a control surface for herdr itself: the same eight keys drive panes, tabs, workspaces,
+layouts and git worktrees, on **pages** you walk with one key — and the agent that needs you is
+one press away from every one of them.
+
 ![The default Stream Deck + layout](docs/src/images/deck-preview.png)
 
 *Real output from `herdr-deckd --dry-run`, which renders the deck with no hardware and no herdr
@@ -19,9 +23,18 @@ running.*
 
 - **Live status per agent**, in attention order — the agent that needs you most is always first.
 - **One press to focus**: herdr switches pane, and your terminal window comes forward.
+- **One press home**, from any page: to the agent that needs you, and back to the agent list.
+- **Pane control** — move between panes, zoom one to fill its tab, split a new shell.
+- **Structure** — new tabs, workspaces and git worktrees, and named pane layouts from your config.
 - **Dials** on a Stream Deck +: scrub agents, workspaces, tabs, or only the ones that need you.
-- **Workspace navigation** from the deck.
+- **Adapts to the hardware**: a 32-key XL shows whole control families at once; a 6-key Mini
+  reaches all of them by paging. Both keep every key they can for agents.
 - **macOS and Linux**, looking and behaving identically.
+
+What it deliberately does **not** do: interact with the agents inside the panes. No approve, no
+deny, no canned replies, no keystrokes sent into a terminal. It shows you which agent needs you
+and takes you there; the conversation is yours to have. See
+[control families](https://sneakytowelsuit.github.io/herdr-deck/reference/control-families.html).
 
 ## Install
 
@@ -55,6 +68,7 @@ quietly doing half the job.
 
 - [What the default layout does](https://sneakytowelsuit.github.io/herdr-deck/getting-started/default-layout.html)
 - [`blocked` and `done`](https://sneakytowelsuit.github.io/herdr-deck/concepts/attention.html) — the two states this is built around
+- [Control families](https://sneakytowelsuit.github.io/herdr-deck/reference/control-families.html) — everything the deck can ask herdr for, and what it will not
 - [Configuration](https://sneakytowelsuit.github.io/herdr-deck/reference/configuration.html)
 - [Architecture](https://sneakytowelsuit.github.io/herdr-deck/reference/architecture.html)
 - [Troubleshooting](https://sneakytowelsuit.github.io/herdr-deck/help/troubleshooting.html)

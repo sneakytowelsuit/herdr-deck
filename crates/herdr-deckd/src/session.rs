@@ -1213,8 +1213,123 @@ mod tests {
             .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
         let outcome = send(&mut session, FrontendMessage::KeyDown { index: toggle }, &s);
-        assert!(!outcome.messages.is_empty(), "mode change must repaint");
+        assert!(!outcome.messages.is_empty(), "a page change must repaint");
         assert!(matches!(session.tile_at(0, &s), Tile::Workspace { .. }));
+    }
+
+    /// The state the page tests run against: one blocked agent and the workspace it lives in, so
+    /// both list pages have something on them.
+    fn a_session_worth_paging() -> DeckState {
+        let mut s = state(vec![agent("stuck", AgentStatus::Blocked, 1)]);
+        s.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w1".into(),
+            label: Some("api".into()),
+            ..Default::default()
+        }];
+        s
+    }
+
+    fn key_bound_to(session: &Session, binding: herdr_deck_core::layout::KeyBinding) -> usize {
+        session
+            .profile()
+            .keys
+            .iter()
+            .position(|key| *key == binding)
+            .expect("this deck has that key")
+    }
+
+    #[test]
+    fn the_page_key_walks_every_page_and_comes_back_to_the_agents() {
+        // Four presses on a Plus with no worktrees: spaces, panes, make, and home again. The cycle
+        // has to close, or the deck has a page you can walk into and not out of.
+        let mut session = session();
+        let s = a_session_worth_paging();
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+
+        let mut walked = Vec::new();
+        for _ in 0..4 {
+            send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+            match session.tile_at(cycle, &s) {
+                Tile::Page { current, .. } => walked.push(current),
+                other => panic!("expected the page key, got {other:?}"),
+            }
+        }
+        assert_eq!(walked, vec!["spaces", "panes", "make", "agents"]);
+    }
+
+    #[test]
+    fn the_attention_key_brings_the_deck_home_from_a_command_page_and_takes_you_to_the_agent() {
+        // The promise: one press, from anywhere, and you are both looking at the agent that wants
+        // you and back on the page that lists them. Two presses would be a worse deck than the one
+        // that had no pane control at all.
+        let mut session = session();
+        let s = a_session_worth_paging();
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+        let home = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::Attention);
+
+        // Walk to the panes page, two stops away.
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        assert!(matches!(session.tile_at(0, &s), Tile::Command { .. }));
+
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: home }, &s);
+        assert_eq!(
+            outcome.action,
+            Some(focus_pane("w1:pane-stuck", Some(home))),
+            "the press has to reach herdr, not merely change the page"
+        );
+        assert!(!outcome.messages.is_empty(), "coming home must repaint");
+        assert!(
+            matches!(session.tile_at(0, &s), Tile::Agent { .. }),
+            "and the deck must be showing the agents again"
+        );
+    }
+
+    #[test]
+    fn the_attention_key_still_comes_home_when_nothing_is_asking_for_you() {
+        // A calm queue is the case where the key is *only* a way back, and it has to keep working
+        // — otherwise the way home stops existing exactly when the deck is quiet enough to wander.
+        let mut session = session();
+        let s = state(vec![agent("calm", AgentStatus::Idle, 1)]);
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+        let home = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::Attention);
+
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: home }, &s);
+        assert!(outcome.action.is_none(), "there is nothing to focus");
+        assert!(
+            !outcome.messages.is_empty(),
+            "but the deck still comes home"
+        );
+        assert!(matches!(session.tile_at(0, &s), Tile::Agent { .. }));
+    }
+
+    #[test]
+    fn a_page_longer_than_the_keys_grows_a_more_key_rather_than_hiding_the_rest() {
+        // A Plus has six following keys and its dials scrub lists, not command pages — so a page
+        // that overruns has to say so on a key. Showing six of nine and going quiet about the
+        // other three is the one thing this deck is never allowed to do.
+        let mut session = session();
+        let agents: Vec<_> = (0..9)
+            .map(|i| agent(&format!("a{i}"), AgentStatus::Idle, 0))
+            .collect();
+        let s = state(agents);
+        session.greet(&s);
+
+        // The last following key is the one that carries the rest.
+        let more = 5;
+        match session.tile_at(more, &s) {
+            Tile::Label { label, .. } => assert_eq!(label, "more 1/2"),
+            other => panic!("expected a more key, got {other:?}"),
+        }
+        send(&mut session, FrontendMessage::KeyDown { index: more }, &s);
+        match session.tile_at(0, &s) {
+            Tile::Agent { label, .. } => assert_eq!(label, "a5"),
+            other => panic!("expected the sixth agent, got {other:?}"),
+        }
     }
 
     #[test]

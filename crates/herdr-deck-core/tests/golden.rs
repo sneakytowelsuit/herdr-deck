@@ -236,6 +236,52 @@ fn attention_with_nothing_waiting_pins_the_all_clear_palette() {
 }
 
 #[test]
+fn the_attention_key_pins_the_way_home_it_offers_from_another_page() {
+    // The one time a quiet queue has something to say: you are not on the agents page, and this
+    // key is how you get back. A tile that still read "all clear" here would leave the way home
+    // undiscoverable on exactly the pages you need it from.
+    let tile = Tile::Attention {
+        count: 0,
+        away: true,
+    };
+    assert_key_matches_golden("attention_away", &tile, 120);
+}
+
+#[test]
+fn the_page_key_pins_where_you_are_above_where_the_next_press_goes() {
+    // The size difference is the whole design: the page you are on is glanced at constantly, and
+    // the page you are going to is read once. If a regression ever levels them, this catches it.
+    let tile = Tile::Page {
+        current: "panes".into(),
+        next: Some("make".into()),
+        screen: None,
+    };
+    assert_key_matches_golden("page_key", &tile, 120);
+}
+
+#[test]
+fn a_page_with_more_than_one_screen_pins_the_counter_in_the_marker_corner() {
+    // Same corner and size as an agent tile's wait marker and a command tile's hold marker —
+    // one place the eye goes for "there is more to this key than its face".
+    let tile = Tile::Page {
+        current: "agents".into(),
+        next: Some("spaces".into()),
+        screen: Some((2, 3)),
+    };
+    assert_key_matches_golden("page_key_screen_2_of_3", &tile, 120);
+}
+
+#[test]
+fn a_page_key_with_nowhere_to_go_pins_the_face_that_promises_nothing() {
+    let tile = Tile::Page {
+        current: "agents".into(),
+        next: None,
+        screen: None,
+    };
+    assert_key_matches_golden("page_key_alone", &tile, 120);
+}
+
+#[test]
 fn an_active_mode_tile_pins_its_underline_indicator() {
     let tile = Tile::Label {
         label: "agents".into(),

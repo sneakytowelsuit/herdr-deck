@@ -1,10 +1,33 @@
 # herdr protocol notes
 
-What herdr-deck relies on, and the sharp edges found along the way. Written against **herdr
-0.8.0, socket protocol 19**.
+What herdr-deck relies on, and the sharp edges found along the way.
 
 All of this lives in one crate, `herdr-deck-herdr`, so a herdr protocol change is a one-crate
 fix.
+
+## Which herdr this is written against
+
+Two numbers, and they do not currently agree.
+
+- herdr-deck expects **socket protocol 19**, which is what herdr **0.8.0** reports. That is the
+  released version, and it is the number in `EXPECTED_PROTOCOL`.
+- herdr's `main` **after** 0.8.0 declares **protocol 20** (`src/protocol/wire.rs`), while its
+  `Cargo.toml` still says `0.8.0`. So a build from source may report 20 while calling itself
+  0.8.0.
+
+What is known about the bump: it appears alongside direct pane frame streaming, which
+herdr-deck does not use. What is *not* known: whether anything else rode along with it. That was
+read from a shallow clone at one commit, so the history around it could not be seen in full, and
+nothing was executed — herdr was not installed on the machine this was written on.
+
+A mismatch is a **warning, not a refusal** (see `EXPECTED_PROTOCOL`): herdr's changes are usually
+additive, and a status display that refused to start over a version number would be a worse
+failure than one showing a slightly stale field. If you are running herdr from source and see the
+warning, that is this skew and not a bug in your setup.
+
+Everything below was read from herdr's source at that commit and from herdr's own tests. Where
+this page says herdr *does* something, it means the source says so; nothing here was confirmed by
+running it.
 
 ## Transport
 
