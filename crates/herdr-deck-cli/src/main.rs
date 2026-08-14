@@ -184,7 +184,13 @@ fn describe_key(binding: &KeyBinding) -> String {
         KeyBinding::Command { command } if command.is_destructive() => {
             format!("{} {} — hold to confirm", command.label(), command.target())
         }
+        // A pane command names a direction or a state rather than a thing, so the verb is the
+        // whole of it — spelling the parameter out again gives you "split right right".
+        KeyBinding::Command { command } if !command.names_an_object() => {
+            command.label().to_string()
+        }
         KeyBinding::Command { command } => format!("{} {}", command.label(), command.target()),
+        KeyBinding::ClosePane => "close the focused pane — hold to confirm".to_string(),
         KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
         KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
         KeyBinding::PagePrev => "previous page".to_string(),

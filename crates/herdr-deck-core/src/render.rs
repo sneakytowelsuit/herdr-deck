@@ -11,7 +11,7 @@
 //! reason: a CI runner and a laptop must produce byte-identical output, which is what makes the
 //! golden-image tests meaningful.
 
-use herdr_deck_herdr::wire::AgentStatus;
+use herdr_deck_herdr::wire::{AgentStatus, PaneDirection};
 
 use crate::state::WaitBucket;
 use crate::theme::{StatusStyle, Theme};
@@ -60,10 +60,47 @@ pub enum Tile {
     Attention { count: usize },
     /// A mode/page toggle.
     Mode { label: String, active: bool },
+    /// A key bound to one herdr command: a shape, and a word under it.
+    Command {
+        /// What the key does, said as a shape. This is the part meant to be read.
+        glyph: KeyGlyph,
+        /// The caption under the shape, for the times the shape is not quite enough.
+        label: String,
+        /// This command only fires on a hold, and the tile has to say so before anyone presses it
+        /// — a guard nobody can see is a key that appears broken the first time it is tapped.
+        hold: bool,
+        /// Whether the key can act right now. A command with nothing to act on draws dimmed
+        /// rather than disappearing, so the layout does not rearrange itself under the user.
+        enabled: bool,
+    },
     /// A slot with nothing bound to it.
     Empty,
     /// herdr is unreachable.
     Offline { message: String },
+}
+
+/// The shape a command key wears.
+///
+/// Drawn as geometry rather than typeset as a character, for two reasons. The vendored font is
+/// only guaranteed to carry the glyphs already in use, and adding a key would otherwise mean
+/// hoping DejaVu has a square-with-its-bottom-half-filled. And a shape built from rectangles is
+/// still crisp at 72px, where a typeset arrow at the same size is a smudge.
+///
+/// Every one of these has a distinct silhouette, not merely a distinct fill: these keys are meant
+/// to be understood at a glance and from an angle, and a direction key you had to read the caption
+/// of would be a slow key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyGlyph {
+    /// A solid triangle pointing that way.
+    Arrow(PaneDirection),
+    /// A tab with a new pane appearing beside or below the one you are in.
+    SplitRight,
+    SplitDown,
+    /// One pane swallowing its tab, and the panes back in their tiles.
+    ZoomIn,
+    ZoomOut,
+    /// A pane with a line drawn through it.
+    Close,
 }
 
 /// Everything the shared agent/workspace layout draws.
@@ -205,6 +242,12 @@ impl TileRenderer {
             }
             Tile::Attention { count } => self.attention_svg(s, *count),
             Tile::Mode { label, active } => self.mode_svg(s, label, *active),
+            Tile::Command {
+                glyph,
+                label,
+                hold,
+                enabled,
+            } => self.command_svg(s, *glyph, label, *hold, *enabled),
             Tile::Empty => format!(
                 r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}"><rect width="{s}" height="{s}" fill="{bg}"/></svg>"##,
                 bg = self.theme.neutral_background()
@@ -429,6 +472,58 @@ impl TileRenderer {
         )
     }
 
+    /// A shape, a caption, and — when the command is guarded — the word that unlocks it.
+    ///
+    /// The shape gets the top two-thirds of the key and the caption a single line at the bottom,
+    /// which is the opposite weighting to an agent tile. That is deliberate: an agent tile is read
+    /// for *which* agent, so its label dominates, while a pane key is always the same key and is
+    /// found by feel and by silhouette. The caption is there for the first week, not the second.
+    fn command_svg(&self, s: f32, glyph: KeyGlyph, label: &str, hold: bool, enabled: bool) -> String {
+        let (fg, accent) = if enabled {
+            (self.theme.neutral_foreground(), self.theme.neutral_foreground())
+        } else {
+            (self.theme.dim_foreground(), self.theme.dim_foreground())
+        };
+        let pad = s * 0.08;
+        let label_px = s * 0.135;
+        let shape = glyph_svg(glyph, s, fg);
+
+        // The hold marker sits where an agent tile's wait marker sits, in the same size and the
+        // same corner. There is one confirmation idiom on this hardware; there should be one place
+        // the eye goes to find out whether a key has one.
+        let marker = if hold {
+            format!(
+                r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{fs:.2}" font-weight="bold" fill="{c}" text-anchor="start">hold</text>"##,
+                x = pad * 0.75,
+                y = s * 0.175,
+                font = FONT_FAMILY,
+                fs = s * 0.10,
+                c = accent,
+            )
+        } else {
+            String::new()
+        };
+
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
+<rect width="{s}" height="{s}" fill="{bg}"/>
+{marker}
+{shape}
+<text x="{cx:.2}" y="{ly:.2}" font-family="{font}" font-size="{fs:.2}" fill="{fg}" text-anchor="middle">{label}</text>
+</svg>"##,
+            s = s,
+            bg = self.theme.neutral_background(),
+            marker = marker,
+            shape = shape,
+            cx = s / 2.0,
+            ly = s - pad * 0.9,
+            font = FONT_FAMILY,
+            fs = label_px,
+            fg = fg,
+            label = escape(&truncate_to_width(label, s - pad * 2.0, label_px)),
+        )
+    }
+
     fn offline_svg(&self, s: f32, message: &str, style: StatusStyle) -> String {
         let label_px = s * 0.125;
         let lines = wrap_text(message, s * 0.86, label_px, 3);
@@ -502,6 +597,123 @@ impl TileRenderer {
             fg = fg,
             value = escape(&truncate_to_width(value, inner, value_px)),
         )
+    }
+}
+
+/// Draw one [`KeyGlyph`] into the upper part of a key of side `s`.
+///
+/// Everything is expressed as a fraction of `s` so the same shape holds together at 72px and at
+/// 120px. The box is square and centred horizontally, sitting above the caption line: 34% of the
+/// key is as large as the shape can be without crowding a caption underneath it, and as small as
+/// it can be while a triangle still reads as a triangle on the smallest deck we support.
+fn glyph_svg(glyph: KeyGlyph, s: f32, colour: &str) -> String {
+    let d = s * 0.34;
+    let x0 = (s - d) / 2.0;
+    let y0 = s * 0.20;
+    let stroke = (s * 0.035).max(1.5);
+
+    // A pane, as this deck draws one: an outline the fills and cuts below sit inside.
+    let outline = format!(
+        r##"<rect x="{x0:.2}" y="{y0:.2}" width="{d:.2}" height="{d:.2}" rx="{r:.2}" fill="none" stroke="{colour}" stroke-width="{stroke:.2}"/>"##,
+        r = d * 0.10,
+    );
+    let triangle = |points: String| {
+        format!(r##"<polygon points="{points}" fill="{colour}"/>"##)
+    };
+    let fill = |x: f32, y: f32, w: f32, h: f32| {
+        format!(r##"<rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" fill="{colour}"/>"##)
+    };
+    let line = |x1: f32, y1: f32, x2: f32, y2: f32| {
+        format!(
+            r##"<line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{colour}" stroke-width="{stroke:.2}" stroke-linecap="round"/>"##
+        )
+    };
+
+    match glyph {
+        KeyGlyph::Arrow(direction) => triangle(match direction {
+            PaneDirection::Left => format!(
+                "{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}",
+                x0 + d,
+                y0,
+                x0 + d,
+                y0 + d,
+                x0,
+                y0 + d / 2.0
+            ),
+            PaneDirection::Right => format!(
+                "{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}",
+                x0,
+                y0,
+                x0,
+                y0 + d,
+                x0 + d,
+                y0 + d / 2.0
+            ),
+            PaneDirection::Up => format!(
+                "{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}",
+                x0,
+                y0 + d,
+                x0 + d,
+                y0 + d,
+                x0 + d / 2.0,
+                y0
+            ),
+            PaneDirection::Down => format!(
+                "{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}",
+                x0,
+                y0,
+                x0 + d,
+                y0,
+                x0 + d / 2.0,
+                y0 + d
+            ),
+        }),
+        // The new pane is the filled half, so the shape says which side of the divider you end up
+        // on as well as where the divider goes.
+        KeyGlyph::SplitRight => format!(
+            "{}{}",
+            fill(x0 + d / 2.0, y0, d / 2.0, d),
+            outline
+        ),
+        KeyGlyph::SplitDown => format!(
+            "{}{}",
+            fill(x0, y0 + d / 2.0, d, d / 2.0),
+            outline
+        ),
+        // One pane swallowing the tab...
+        KeyGlyph::ZoomIn => format!(
+            "{}{}",
+            outline,
+            fill(
+                x0 + d * 0.22,
+                y0 + d * 0.22,
+                d * 0.56,
+                d * 0.56
+            )
+        ),
+        // ...and the tab handed back to all of them.
+        KeyGlyph::ZoomOut => format!(
+            "{}{}{}",
+            outline,
+            line(x0 + d / 2.0, y0, x0 + d / 2.0, y0 + d),
+            line(x0, y0 + d / 2.0, x0 + d, y0 + d / 2.0)
+        ),
+        KeyGlyph::Close => format!(
+            "{}{}{}",
+            outline,
+            line(
+                x0 + d * 0.26,
+                y0 + d * 0.26,
+                x0 + d * 0.74,
+                y0 + d * 0.74
+            ),
+            line(
+                x0 + d * 0.74,
+                y0 + d * 0.26,
+                x0 + d * 0.26,
+                y0 + d * 0.74
+            )
+        ),
     }
 }
 

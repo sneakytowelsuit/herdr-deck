@@ -238,6 +238,174 @@ pub struct SessionSnapshot {
     pub focused_pane_id: Option<String>,
 }
 
+// ----- panes ---------------------------------------------------------------------------------
+//
+// The four types below are herdr's parameter vocabularies, not the deck's. They live here for
+// the same reason [`AgentStatus`] does: callers above this crate need to *name* a direction, and
+// naming it as a Rust variant rather than a string is what keeps the JSON spelling — and the fact
+// that herdr calls it `no_neighbor` and not `no_neighbour` — inside this crate.
+
+/// Which way to move, in the layout of the tab herdr is currently on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl PaneDirection {
+    pub const ALL: [PaneDirection; 4] = [
+        PaneDirection::Left,
+        PaneDirection::Right,
+        PaneDirection::Up,
+        PaneDirection::Down,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneDirection::Left => "left",
+            PaneDirection::Right => "right",
+            PaneDirection::Up => "up",
+            PaneDirection::Down => "down",
+        }
+    }
+}
+
+/// Where a new pane goes.
+///
+/// Two variants and not four: herdr splits right and down only, so there is no "split left" for a
+/// key to offer and no point pretending otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    Right,
+    Down,
+}
+
+impl SplitDirection {
+    pub const ALL: [SplitDirection; 2] = [SplitDirection::Right, SplitDirection::Down];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SplitDirection::Right => "right",
+            SplitDirection::Down => "down",
+        }
+    }
+}
+
+/// Zoom, stated rather than toggled.
+///
+/// herdr also accepts `toggle`, and this enum deliberately cannot express it. A toggle asks herdr
+/// to flip a boolean the deck cannot see, so the same key press means different things depending
+/// on state that may have moved since the deck last looked. Stating the wanted end state makes the
+/// key idempotent and self-correcting: press it twice and you are still zoomed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoomMode {
+    On,
+    Off,
+}
+
+impl ZoomMode {
+    pub const ALL: [ZoomMode; 2] = [ZoomMode::On, ZoomMode::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ZoomMode::On => "on",
+            ZoomMode::Off => "off",
+        }
+    }
+}
+
+/// Why herdr changed nothing, having understood the request perfectly well.
+///
+/// herdr answers these as *successes* carrying a reason, not as errors, and that distinction is
+/// the whole reason this type exists: pressing "left" at the left-hand edge of a layout is not a
+/// failure, and a key that flashed an alert for it would teach its owner to stop reading alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NothingToDo {
+    /// The edge of the layout: there is no pane that way.
+    NoNeighbour,
+    /// The tab holds one pane, so there is nothing to zoom into or out of.
+    OnlyPane,
+    /// It was already the way it was asked to be.
+    AlreadySo,
+    /// herdr gave a reason this version does not recognise — treated as "nothing happened",
+    /// because that is the one thing `changed: false` definitely tells us.
+    Unrecognised,
+}
+
+impl NothingToDo {
+    fn from_reason(reason: Option<&str>) -> Self {
+        match reason {
+            Some("no_neighbor") => NothingToDo::NoNeighbour,
+            Some("single_pane") => NothingToDo::OnlyPane,
+            Some("already_zoomed") | Some("already_unzoomed") => NothingToDo::AlreadySo,
+            _ => NothingToDo::Unrecognised,
+        }
+    }
+
+    /// A short line for a log or a key's alert text.
+    pub fn describe(self) -> &'static str {
+        match self {
+            NothingToDo::NoNeighbour => "there is no pane that way",
+            NothingToDo::OnlyPane => "this tab has only the one pane",
+            NothingToDo::AlreadySo => "it was already like that",
+            NothingToDo::Unrecognised => "herdr changed nothing and did not say why",
+        }
+    }
+}
+
+/// What came of asking herdr to move or reshape a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneOutcome {
+    /// herdr did it.
+    Changed,
+    /// herdr understood, and there was nothing to do.
+    Unchanged(NothingToDo),
+}
+
+/// The body herdr returns from a pane command: did anything move, and if not, why not.
+///
+/// Both `pane.focus_direction` and `pane.zoom` answer in this shape, nested one level down under
+/// a name of their own. The extra fields they carry — the layout snapshot, the source pane — are
+/// deliberately not modelled: see [`crate::client::HerdrClient::pane_focus_direction`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaneChange {
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub focused_pane_id: Option<String>,
+}
+
+impl PaneChange {
+    pub fn outcome(&self) -> PaneOutcome {
+        if self.changed {
+            PaneOutcome::Changed
+        } else {
+            PaneOutcome::Unchanged(NothingToDo::from_reason(self.reason.as_deref()))
+        }
+    }
+}
+
+/// `pane.focus_direction`'s envelope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaneFocusDirectionResult {
+    #[serde(default)]
+    pub focus: Option<PaneChange>,
+}
+
+/// `pane.zoom`'s envelope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaneZoomResult {
+    #[serde(default)]
+    pub zoom: Option<PaneChange>,
+}
+
 /// A request line on the herdr socket.
 #[derive(Debug, Clone, Serialize)]
 pub struct Request<'a> {
@@ -441,6 +609,91 @@ mod tests {
         };
         assert_eq!(w.explicit_label(), None);
         assert_eq!(w.label(), "w3");
+    }
+
+    // --- Pane commands -----------------------------------------------------------------------
+
+    #[test]
+    fn a_pane_command_that_moved_something_reads_as_changed() {
+        let raw = r#"{"type":"pane_focus_direction","focus":{"changed":true,
+            "source_pane_id":"w1:p1","focused_pane_id":"w1:p2",
+            "layout":{"zoomed":false,"panes":[]}}}"#;
+        let result: PaneFocusDirectionResult = serde_json::from_str(raw).unwrap();
+        let focus = result.focus.expect("herdr reported the move");
+        assert_eq!(focus.outcome(), PaneOutcome::Changed);
+        assert_eq!(focus.focused_pane_id.as_deref(), Some("w1:p2"));
+    }
+
+    #[test]
+    fn reaching_the_edge_of_a_layout_is_a_success_that_says_nothing_moved() {
+        // herdr answers this as a result, not an error, and everything above depends on that
+        // staying true: a key that treated the edge as a failure would flash an alert every time
+        // someone ran their thumb along the arrows.
+        let raw = r#"{"type":"pane_focus_direction","focus":{"changed":false,
+            "reason":"no_neighbor","source_pane_id":"w1:p1"}}"#;
+        let result: PaneFocusDirectionResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            result.focus.unwrap().outcome(),
+            PaneOutcome::Unchanged(NothingToDo::NoNeighbour)
+        );
+    }
+
+    #[test]
+    fn each_reason_herdr_gives_for_doing_nothing_is_recognised_and_distinct() {
+        let outcome = |reason: &str| {
+            PaneChange {
+                changed: false,
+                reason: Some(reason.to_string()),
+                ..Default::default()
+            }
+            .outcome()
+        };
+        assert_eq!(
+            outcome("single_pane"),
+            PaneOutcome::Unchanged(NothingToDo::OnlyPane)
+        );
+        assert_eq!(
+            outcome("already_zoomed"),
+            PaneOutcome::Unchanged(NothingToDo::AlreadySo)
+        );
+        assert_eq!(
+            outcome("already_unzoomed"),
+            PaneOutcome::Unchanged(NothingToDo::AlreadySo)
+        );
+        // A reason a future herdr invents must not be mistaken for one we understand.
+        assert_eq!(
+            outcome("teleported"),
+            PaneOutcome::Unchanged(NothingToDo::Unrecognised)
+        );
+    }
+
+    #[test]
+    fn a_zoom_response_reports_whether_the_zoom_actually_flipped() {
+        let raw = r#"{"type":"pane_zoom","zoom":{"changed":false,"zoom_changed":false,
+            "reason":"already_zoomed","pane_id":"w1:p1","zoomed":true}}"#;
+        let result: PaneZoomResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            result.zoom.unwrap().outcome(),
+            PaneOutcome::Unchanged(NothingToDo::AlreadySo)
+        );
+    }
+
+    #[test]
+    fn the_wire_spelling_of_every_pane_parameter_is_the_one_herdr_documents() {
+        // These strings are the entire contract with herdr for these commands, and they are the
+        // one thing in this file no test above this crate can ever notice going wrong.
+        assert_eq!(
+            serde_json::to_value(PaneDirection::ALL).unwrap(),
+            serde_json::json!(["left", "right", "up", "down"])
+        );
+        assert_eq!(
+            serde_json::to_value(SplitDirection::ALL).unwrap(),
+            serde_json::json!(["right", "down"])
+        );
+        assert_eq!(
+            serde_json::to_value(ZoomMode::ALL).unwrap(),
+            serde_json::json!(["on", "off"]),
+        );
     }
 
     #[test]

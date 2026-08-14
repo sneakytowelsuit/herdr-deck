@@ -14,9 +14,9 @@
 
 use crate::capabilities::DeckCapabilities;
 use crate::command::DeckCommand;
-use crate::render::Tile;
+use crate::render::{KeyGlyph, Tile};
 use crate::state::{Acknowledged, DeckState};
-use herdr_deck_herdr::wire::AgentInfo;
+use herdr_deck_herdr::wire::{AgentInfo, PaneDirection, SplitDirection, ZoomMode};
 use serde::{Deserialize, Serialize};
 
 /// Which list the deck is currently showing.
@@ -95,6 +95,14 @@ pub enum KeyBinding {
     Command {
         command: DeckCommand,
     },
+    /// Close whichever pane herdr says is focused.
+    ///
+    /// Its own binding rather than a [`KeyBinding::Command`] carrying a pane id, because a pane id
+    /// written into a config file is a promise nobody can keep: pane ids are renumbered when a
+    /// pane moves workspaces, so `w1:p2` in a file written last month names whatever is second
+    /// there now. The deck resolves it against live state instead, and refuses when herdr reports
+    /// nothing focused.
+    ClosePane,
     /// Jump straight to the top-ranked agent that wants you.
     NextAttention,
     /// Switch between agents and workspaces.
@@ -276,6 +284,38 @@ impl Profile {
     }
 }
 
+/// How many keys a deck needs before pane control appears without being asked for.
+///
+/// Chosen as the point where the agent slots stop being the scarce thing: below it a key spent on
+/// a pane arrow is a key taken off an agent, and above it the deck already shows more agents at
+/// once than anybody runs.
+const PANE_CLUSTER_MIN_KEYS: usize = 24;
+
+/// Pane control, in the order a hand reaches for it.
+///
+/// Directions first because they are the ones pressed by feel and in sequence; the pair that
+/// changes what is on screen next; the pair that adds a shell last. Every one of them is a single
+/// unambiguous outcome with nothing to type — which is what makes them worth a physical key at all.
+fn pane_cluster() -> Vec<KeyBinding> {
+    let mut keys: Vec<KeyBinding> = PaneDirection::ALL
+        .into_iter()
+        .map(|direction| KeyBinding::Command {
+            command: DeckCommand::MovePaneFocus { direction },
+        })
+        .collect();
+    keys.extend(ZoomMode::ALL.into_iter().map(|zoom| KeyBinding::Command {
+        command: DeckCommand::ZoomPane { zoom },
+    }));
+    keys.extend(
+        SplitDirection::ALL
+            .into_iter()
+            .map(|direction| KeyBinding::Command {
+                command: DeckCommand::SplitPane { direction },
+            }),
+    );
+    keys
+}
+
 /// Dials get the four most useful scrub targets, in the order you reach for them.
 fn default_dials(count: u8) -> Vec<DialBinding> {
     const ORDER: [ScrubTarget; 4] = [
@@ -328,7 +368,20 @@ fn default_keys(caps: &DeckCapabilities, has_dials: bool) -> Vec<KeyBinding> {
         reserved.push(KeyBinding::PagePrev);
         reserved.push(KeyBinding::PageNext);
     }
-    // Never let fixed controls crowd out the agents they are meant to navigate.
+    // Pane control, but only where it is free. On an eight-key deck four arrows would be half the
+    // surface, and the agents are the reason the deck is on the desk at all — so the Plus, the
+    // Mini and the 15-key get none of this by default and bind it by hand if they want it. Past
+    // twenty-four keys there are already more agent slots than anyone has agents, and the cluster
+    // costs nothing anybody was using.
+    //
+    // Nothing destructive is in here. Closing a pane is available, guarded, to anyone who asks for
+    // it in their config; it is not something a deck should offer to someone who never did.
+    if total >= PANE_CLUSTER_MIN_KEYS {
+        reserved.extend(pane_cluster());
+    }
+    // Never let fixed controls crowd out the agents they are meant to navigate. Pane control is
+    // last in the list so that, if anything has to go, it goes before the paging keys that make
+    // the rest of the agents reachable at all.
     let max_reserved = total.saturating_sub(1).min(total / 2);
     reserved.truncate(max_reserved);
 
@@ -457,16 +510,16 @@ impl<'a> ResolvedDeck<'a> {
                 .workspace_by_id(workspace_id)
                 .map(workspace_tile)
                 .unwrap_or(Tile::Empty),
-            // A destructive key wears its gesture, because the guard is no use to someone who
-            // only discovers it by pressing.
-            KeyBinding::Command { command } => Tile::Mode {
-                label: if command.is_destructive() {
-                    format!("hold: {}", command.label())
-                } else {
-                    command.label().to_string()
+            KeyBinding::Command { command } => command_tile(command, true),
+            // Drawn even when herdr has nothing focused, dimmed rather than blank: a key that
+            // vanished would take its neighbours' positions with it, and this deck is meant to be
+            // found by feel.
+            KeyBinding::ClosePane => command_tile(
+                &DeckCommand::ClosePane {
+                    pane_id: String::new(),
                 },
-                active: true,
-            },
+                self.state.focused_pane_id.is_some(),
+            ),
             KeyBinding::NextAttention => Tile::Attention {
                 count: self.attention_count(),
             },
@@ -535,6 +588,18 @@ impl<'a> ResolvedDeck<'a> {
                 })
             }
             KeyBinding::Command { command } => SlotAction::Command(command.clone()),
+            // herdr has no "close whatever is focused" form, so the deck has to name the pane —
+            // and the only pane it may name is the one herdr last told it was focused. Guessing
+            // one when herdr reports none would be the worst possible guess, so the key says so
+            // instead.
+            KeyBinding::ClosePane => match &self.state.focused_pane_id {
+                Some(pane_id) => SlotAction::Command(DeckCommand::ClosePane {
+                    pane_id: pane_id.clone(),
+                }),
+                None => SlotAction::Refuse {
+                    message: "herdr reports no focused pane".to_string(),
+                },
+            },
             KeyBinding::NextAttention => self
                 .needing_attention()
                 .next()
@@ -747,6 +812,53 @@ fn agent_tile(state: &DeckState, agent: &AgentInfo, acked: &Acknowledged) -> Til
         } else {
             state.wait_bucket(agent)
         },
+    }
+}
+
+/// What a key bound to one command draws.
+///
+/// The `hold` flag comes off the command rather than off the key, exactly as the guard does — a
+/// tile that advertised the gesture separately could disagree with the gesture the key actually
+/// has, and the first anyone would know of it is a key that appears broken when tapped.
+fn command_tile(command: &DeckCommand, enabled: bool) -> Tile {
+    let label = command.label().to_string();
+    let hold = command.is_destructive();
+    match command_glyph(command) {
+        Some(glyph) => Tile::Command {
+            glyph,
+            label,
+            hold,
+            enabled,
+        },
+        // A focus takes you to a named thing and no shape can say *which*, so the caption is the
+        // whole message and it gets the plain labelled key. An arrow here would be decoration
+        // pretending to be information.
+        None => Tile::Mode {
+            label: if hold { format!("hold: {label}") } else { label },
+            active: enabled,
+        },
+    }
+}
+
+/// The shape a command wears on a key, where it has one.
+///
+/// Lives here rather than on [`DeckCommand`] so the vocabulary stays about intent and knows
+/// nothing about pixels.
+fn command_glyph(command: &DeckCommand) -> Option<KeyGlyph> {
+    match command {
+        DeckCommand::MovePaneFocus { direction } => Some(KeyGlyph::Arrow(*direction)),
+        DeckCommand::ZoomPane { zoom } => Some(match zoom {
+            ZoomMode::On => KeyGlyph::ZoomIn,
+            ZoomMode::Off => KeyGlyph::ZoomOut,
+        }),
+        DeckCommand::SplitPane { direction } => Some(match direction {
+            SplitDirection::Right => KeyGlyph::SplitRight,
+            SplitDirection::Down => KeyGlyph::SplitDown,
+        }),
+        DeckCommand::ClosePane { .. } => Some(KeyGlyph::Close),
+        DeckCommand::FocusPane { .. }
+        | DeckCommand::FocusWorkspace { .. }
+        | DeckCommand::FocusTab { .. } => None,
     }
 }
 
@@ -994,26 +1106,26 @@ mod tests {
 
     // --- The destructive-action guard --------------------------------------------------------
     //
-    // Nothing this deck can currently do destroys anything, so these run against a stub command
-    // that claims to. That is the point of having them now: the guard is proven before the first
-    // command that could lose someone's work is wired to a key, rather than alongside it.
+    // Closing a pane is the one thing this deck can do that takes work away, so it is what these
+    // run against. They are about the *gesture*, not about the command: whatever destructive
+    // command is added next inherits every one of them without being named here.
 
-    /// A deck whose only key is bound to a command that claims it destroys work.
-    fn destructive_profile() -> Profile {
-        Profile {
-            keys: vec![KeyBinding::Command {
-                command: DeckCommand::DestructiveStub,
-            }],
+    /// A deck whose only key closes the focused pane, with a pane for it to close.
+    fn destructive_deck() -> (Profile, DeckState) {
+        let profile = Profile {
+            keys: vec![KeyBinding::ClosePane],
             dials: vec![DialBinding::Scrub {
                 target: ScrubTarget::Workspaces,
             }],
-        }
+        };
+        let mut state = state_with(vec![]);
+        state.focused_pane_id = Some("w1:p2".into());
+        (profile, state)
     }
 
     #[test]
     fn tapping_a_destructive_key_refuses_out_loud_instead_of_doing_it() {
-        let profile = destructive_profile();
-        let state = state_with(vec![]);
+        let (profile, state) = destructive_deck();
         let acked = Acknowledged::default();
         let deck = plus_deck(&profile, &state, &acked);
 
@@ -1030,28 +1142,252 @@ mod tests {
     fn holding_a_destructive_key_is_what_actually_issues_the_command() {
         // The other half of the same bargain: guarding a command is only defensible if there is
         // still a way to mean it.
-        let profile = destructive_profile();
-        let state = state_with(vec![]);
+        let (profile, state) = destructive_deck();
         let acked = Acknowledged::default();
         let deck = plus_deck(&profile, &state, &acked);
 
         assert_eq!(
             deck.key_long_press_action(0),
-            SlotAction::Command(DeckCommand::DestructiveStub)
+            SlotAction::Command(DeckCommand::ClosePane {
+                pane_id: "w1:p2".into()
+            })
         );
     }
 
     #[test]
     fn a_destructive_key_says_so_before_it_is_ever_pressed() {
         // A guard nobody can see is a key that appears to be broken the first time it is tapped.
-        let profile = destructive_profile();
+        let (profile, state) = destructive_deck();
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        match deck.tile(0) {
+            Tile::Command { hold, enabled, .. } => {
+                assert!(hold, "the tile has to advertise the gesture");
+                assert!(enabled, "and there is a pane to close");
+            }
+            other => panic!("expected a command key, got {other:?}"),
+        }
+    }
+
+    // --- Pane control -------------------------------------------------------------------------
+
+    /// A deck whose keys are the whole pane cluster, in the order the layout engine lays it out.
+    fn pane_deck() -> Profile {
+        Profile {
+            keys: pane_cluster(),
+            dials: vec![],
+        }
+    }
+
+    #[test]
+    fn each_direction_key_asks_herdr_to_move_that_way_and_no_other() {
+        // Four keys that differ only in one enum value is exactly the shape a copy-paste mistake
+        // hides in, and a "left" key that moved right would be indistinguishable from a layout
+        // the user misremembered.
+        let profile = pane_deck();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        for (index, direction) in PaneDirection::ALL.into_iter().enumerate() {
+            assert_eq!(
+                deck.key_action(index),
+                SlotAction::Command(DeckCommand::MovePaneFocus { direction }),
+                "key {index} should move {}",
+                direction.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_direction_key_wears_an_arrow_and_acts_the_instant_it_is_pressed() {
+        // Nothing about stepping one pane sideways is ambiguous, so nothing about it should wait —
+        // and the arrow is the point: these keys are found by silhouette, not by reading them.
+        let profile = pane_deck();
         let state = state_with(vec![]);
         let acked = Acknowledged::default();
         let deck = plus_deck(&profile, &state, &acked);
 
         match deck.tile(0) {
-            Tile::Mode { label, .. } => assert!(label.contains("hold"), "got {label:?}"),
-            other => panic!("expected a labelled key, got {other:?}"),
+            Tile::Command { glyph, hold, .. } => {
+                assert_eq!(glyph, KeyGlyph::Arrow(PaneDirection::Left));
+                assert!(!hold, "a move takes nothing away and must not need a hold");
+            }
+            other => panic!("expected a command key, got {other:?}"),
+        }
+        assert_eq!(deck.key_long_press_action(0), SlotAction::None);
+    }
+
+    #[test]
+    fn the_two_zoom_keys_state_opposite_ends_and_neither_asks_herdr_to_toggle() {
+        // Two keys rather than one, because a toggle would be a claim about which way the zoom is
+        // going to go and the deck cannot see that. `DeckCommand` cannot express a toggle at all,
+        // so this is really a test that the pair are wired the way round they claim to be.
+        let profile = pane_deck();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_action(4),
+            SlotAction::Command(DeckCommand::ZoomPane { zoom: ZoomMode::On })
+        );
+        assert_eq!(
+            deck.key_action(5),
+            SlotAction::Command(DeckCommand::ZoomPane {
+                zoom: ZoomMode::Off
+            })
+        );
+    }
+
+    #[test]
+    fn splitting_right_and_splitting_down_are_two_different_keys_with_two_different_shapes() {
+        let profile = pane_deck();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_action(6),
+            SlotAction::Command(DeckCommand::SplitPane {
+                direction: SplitDirection::Right
+            })
+        );
+        assert_eq!(
+            deck.key_action(7),
+            SlotAction::Command(DeckCommand::SplitPane {
+                direction: SplitDirection::Down
+            })
+        );
+        assert_ne!(
+            deck.tile(6),
+            deck.tile(7),
+            "two keys that do different things must not draw the same face"
+        );
+    }
+
+    #[test]
+    fn every_key_in_the_pane_cluster_draws_a_shape_no_other_one_draws() {
+        // Colour is never the only signal on this deck, and neither is a caption: these keys sit
+        // next to each other in a block and are pressed by feel, so each has to be distinguishable
+        // by silhouette alone.
+        let profile = pane_deck();
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        let mut glyphs: Vec<KeyGlyph> = (0..profile.keys.len())
+            .map(|index| match deck.tile(index) {
+                Tile::Command { glyph, .. } => glyph,
+                other => panic!("key {index} is not a command key: {other:?}"),
+            })
+            .collect();
+        let count = glyphs.len();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), count, "two pane keys share a shape");
+    }
+
+    #[test]
+    fn a_close_key_names_the_pane_herdr_says_is_focused_rather_than_one_from_a_config_file() {
+        // Pane ids are renumbered when a pane moves workspaces, so an id written down last month
+        // names whatever is second there now. The only id safe to close is the one herdr just gave
+        // us for the pane the user is in.
+        let profile = Profile {
+            keys: vec![KeyBinding::ClosePane],
+            dials: vec![],
+        };
+        let mut state = state_with(vec![]);
+        state.focused_pane_id = Some("w3:p7".into());
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert_eq!(
+            deck.key_long_press_action(0),
+            SlotAction::Command(DeckCommand::ClosePane {
+                pane_id: "w3:p7".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_close_key_with_nothing_focused_says_so_instead_of_guessing_a_pane() {
+        // The worst possible guess. It refuses on the tap *and* on the hold, and draws dimmed, so
+        // there is no gesture that quietly closes something the user never pointed at.
+        let profile = Profile {
+            keys: vec![KeyBinding::ClosePane],
+            dials: vec![],
+        };
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = plus_deck(&profile, &state, &acked);
+
+        assert!(matches!(deck.key_action(0), SlotAction::Refuse { .. }));
+        assert_eq!(deck.key_long_press_action(0), SlotAction::None);
+        match deck.tile(0) {
+            Tile::Command { enabled, .. } => assert!(!enabled, "the key must look unusable"),
+            other => panic!("expected a command key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_control_never_costs_an_eight_key_deck_a_single_agent() {
+        // Four arrows would be half a Stream Deck +, and the agents are the reason the deck is on
+        // the desk at all. Anybody who wants them there can say so in their config.
+        for model in [DeckModel::Plus, DeckModel::Mini, DeckModel::Original] {
+            let profile = Profile::for_capabilities(&model.capabilities());
+            assert!(
+                !profile
+                    .keys
+                    .iter()
+                    .any(|k| matches!(k, KeyBinding::Command { .. })),
+                "{model:?} gave keys away to pane control"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deck_with_keys_to_spare_gets_the_whole_pane_cluster_and_still_shows_more_agents() {
+        // Past two dozen keys there are already more agent slots than anyone has agents, so the
+        // cluster costs nothing that was being used.
+        let profile = Profile::for_capabilities(&DeckModel::Xl.capabilities());
+        let commands: Vec<_> = profile
+            .keys
+            .iter()
+            .filter_map(|k| match k {
+                KeyBinding::Command { command } => Some(command.name()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), pane_cluster().len());
+        assert!(
+            profile.dynamic_slots() > commands.len(),
+            "the agents must still have the larger share"
+        );
+    }
+
+    #[test]
+    fn no_deck_is_given_a_key_that_closes_things_without_being_asked_for_one() {
+        // The guard makes closing a pane safe to *offer*; it does not make it something to put in
+        // front of somebody who never went looking for it.
+        for model in [
+            DeckModel::Mini,
+            DeckModel::Original,
+            DeckModel::Plus,
+            DeckModel::Xl,
+            DeckModel::Pedal,
+        ] {
+            let profile = Profile::for_capabilities(&model.capabilities());
+            assert!(
+                !profile.keys.iter().any(|k| matches!(
+                    k,
+                    KeyBinding::ClosePane
+                        | KeyBinding::Command {
+                            command: DeckCommand::ClosePane { .. }
+                        }
+                )),
+                "{model:?} was handed a destructive key nobody asked for"
+            );
         }
     }
 
@@ -1108,7 +1444,9 @@ mod tests {
         );
         // ...and the guard is what a destructive one would meet.
         assert!(matches!(
-            guard_tap(SlotAction::Command(DeckCommand::DestructiveStub)),
+            guard_tap(SlotAction::Command(DeckCommand::ClosePane {
+                pane_id: "w1:p1".into()
+            })),
             SlotAction::Refuse { .. }
         ));
     }

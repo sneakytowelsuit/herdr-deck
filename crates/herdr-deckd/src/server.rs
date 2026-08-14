@@ -218,10 +218,15 @@ async fn perform(context: &ServerContext, action: PendingAction) -> Vec<DaemonMe
     let verdict = report.verdict();
     context.audit.record(&command, verdict);
 
-    if !report.fully_succeeded() {
-        // Anything short of "herdr focused it and the window came forward" is worth saying out
-        // loud, because otherwise the user presses a key and nothing visibly happens.
-        tracing::info!(outcome = %report.describe(), verdict = verdict.as_str(), "focus did not fully succeed");
+    if verdict.is_error() {
+        // Only a real shortfall is worth a line. A command that found nothing to do, or that never
+        // wanted a window, did everything it was asked to — logging those as near-misses would
+        // bury the ones that are.
+        tracing::info!(
+            outcome = %report.describe(),
+            verdict = verdict.as_str(),
+            "a command did not fully succeed"
+        );
     }
 
     match key {
@@ -233,8 +238,9 @@ async fn perform(context: &ServerContext, action: PendingAction) -> Vec<DaemonMe
 /// What the key that asked for a command should show.
 ///
 /// A verdict is not an error merely because something was left undone. With no client attached
-/// there was no window to raise, so nothing was left undone at all — and a key that alerted about
-/// that would teach the user to ignore the alerts that mean something.
+/// there was no window to raise, so nothing was left undone at all — and at the edge of a layout
+/// there was nothing to move to, which is herdr answering the question rather than declining it.
+/// A key that alerted about either would teach the user to ignore the alerts that mean something.
 fn key_feedback(index: usize, report: &FocusReport) -> DaemonMessage {
     if report.verdict().is_error() {
         DaemonMessage::Alert {
@@ -269,9 +275,20 @@ mod tests {
 
     fn report(raise: RaiseOutcome, error: Option<&str>) -> FocusReport {
         FocusReport {
-            herdr_focused: error.is_none(),
+            herdr_acted: error.is_none(),
             raise,
             error: error.map(str::to_string),
+            unchanged: None,
+        }
+    }
+
+    /// What herdr answers when a direction key is pressed at the edge of a layout.
+    fn nothing_to_do() -> FocusReport {
+        FocusReport {
+            herdr_acted: true,
+            raise: RaiseOutcome::NotNeeded,
+            error: None,
+            unchanged: Some(herdr_deck_herdr::wire::NothingToDo::NoNeighbour),
         }
     }
 
@@ -283,6 +300,56 @@ mod tests {
             key_feedback(2, &report(RaiseOutcome::NoClient, None)),
             DaemonMessage::Ok { index: 2 }
         );
+    }
+
+    #[test]
+    fn pressing_a_direction_at_the_edge_of_a_layout_is_not_a_failure() {
+        // A thumb run along a row of direction keys ends at an edge every single time. If that
+        // flashed an alert, the alerts would stop being read within a day — and they are the only
+        // thing this hardware has to tell anyone something is actually wrong.
+        assert_eq!(
+            key_feedback(4, &nothing_to_do()),
+            DaemonMessage::Ok { index: 4 }
+        );
+    }
+
+    #[test]
+    fn a_command_that_never_wanted_the_window_is_not_reported_as_half_done() {
+        // Splitting a pane asks nothing of the window manager, so a machine that cannot raise
+        // windows at all must still see a split as a plain success.
+        assert_eq!(
+            key_feedback(
+                5,
+                &FocusReport {
+                    herdr_acted: true,
+                    raise: RaiseOutcome::NotNeeded,
+                    error: None,
+                    unchanged: None,
+                }
+            ),
+            DaemonMessage::Ok { index: 5 }
+        );
+    }
+
+    #[test]
+    fn a_close_herdr_wants_confirmed_sends_the_user_looking_for_the_dialog() {
+        // herdr has put a modal on screen that the deck cannot answer or dismiss. Saying only
+        // "that failed" would leave the user with a dialog they did not open and no idea why.
+        let refused = report(
+            RaiseOutcome::NotNeeded,
+            Some(
+                &herdr_deck_herdr::HerdrError::ConfirmationRequired {
+                    method: "pane.close".into(),
+                }
+                .to_string(),
+            ),
+        );
+        match key_feedback(6, &refused) {
+            DaemonMessage::Alert { message, .. } => {
+                assert!(message.contains("its own window"), "got {message}")
+            }
+            other => panic!("expected an alert, got {other:?}"),
+        }
     }
 
     #[test]

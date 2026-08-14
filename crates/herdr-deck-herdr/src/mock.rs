@@ -190,6 +190,88 @@ impl MockHerdr {
         self.reply("client.window_title.set", json!({ "type": "ok" }))
             .await;
         self.with_attached_client().await;
+        self.serve_panes().await;
+    }
+
+    /// Accept every pane command, answering as a herdr that carried each one out.
+    ///
+    /// Split out from [`Self::serve_session`] so a test about pane control can stand one up on
+    /// its own, and folded into it so a test about anything else never has to know these commands
+    /// exist.
+    pub async fn serve_panes(&self) {
+        self.reply(
+            "pane.focus_direction",
+            json!({"type": "pane_focus_direction", "focus": {"changed": true}}),
+        )
+        .await;
+        self.reply(
+            "pane.zoom",
+            json!({"type": "pane_zoom", "zoom": {"changed": true, "zoomed": true}}),
+        )
+        .await;
+        self.reply("pane.split", json!({"type": "pane_info", "pane": {"pane_id": "w1:p9"}}))
+            .await;
+        self.reply("pane.close", json!({ "type": "ok" })).await;
+    }
+
+    /// Answer pane moves as ones that find nothing there — the edge of a layout.
+    ///
+    /// Named for what the user experiences rather than for herdr's reason string, because that
+    /// string is this crate's business and a test above it should not have to spell `no_neighbor`
+    /// (nor discover the hard way that herdr spells it without the `u`).
+    pub async fn with_no_pane_that_way(&self) {
+        self.reply(
+            "pane.focus_direction",
+            json!({
+                "type": "pane_focus_direction",
+                "focus": {"changed": false, "reason": "no_neighbor", "source_pane_id": "w1:p1"}
+            }),
+        )
+        .await;
+    }
+
+    /// Answer zooms as ones that find the tab already in the state asked for.
+    pub async fn with_zoom_already_as_asked(&self) {
+        self.reply(
+            "pane.zoom",
+            json!({
+                "type": "pane_zoom",
+                "zoom": {"changed": false, "reason": "already_zoomed", "zoomed": true}
+            }),
+        )
+        .await;
+    }
+
+    /// Answer pane closes the way herdr does when it wants the user to confirm in its own window
+    /// — which also leaves that dialog on their screen.
+    pub async fn with_a_close_herdr_wants_confirmed(&self) {
+        self.reply_error(
+            "pane.close",
+            "confirmation_required",
+            "this would close the whole worktree group",
+        )
+        .await;
+    }
+
+    /// The direction of each pane move asked for, in order.
+    pub async fn pane_move_directions(&self) -> Vec<String> {
+        self.observed_string_params("pane.focus_direction", "direction")
+            .await
+    }
+
+    /// The zoom state asked for by each zoom command, in order.
+    pub async fn pane_zoom_modes(&self) -> Vec<String> {
+        self.observed_string_params("pane.zoom", "mode").await
+    }
+
+    /// The direction of each split asked for, in order.
+    pub async fn pane_split_directions(&self) -> Vec<String> {
+        self.observed_string_params("pane.split", "direction").await
+    }
+
+    /// The pane id of each close asked for, in order.
+    pub async fn pane_close_ids(&self) -> Vec<String> {
+        self.observed_string_params("pane.close", "pane_id").await
     }
 
     /// Answer as a herdr with a terminal attached to it.

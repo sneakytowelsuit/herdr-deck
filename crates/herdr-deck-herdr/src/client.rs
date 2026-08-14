@@ -13,7 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::socket::SocketPath;
-use crate::wire::{Request, Response, SessionSnapshot};
+use crate::wire::{
+    PaneDirection, PaneFocusDirectionResult, PaneOutcome, PaneZoomResult, Request, Response,
+    SessionSnapshot, SplitDirection, ZoomMode,
+};
 use crate::{HerdrError, Result};
 
 /// A client for herdr's API socket.
@@ -111,6 +114,14 @@ impl HerdrClient {
             })?;
 
         if let Some(err) = response.error {
+            // One code is worth pulling out of the crowd: it is the only refusal that leaves
+            // something on the user's screen, so it is the only one whose message has to send
+            // them looking for it.
+            if err.code == "confirmation_required" {
+                return Err(HerdrError::ConfirmationRequired {
+                    method: method.to_string(),
+                });
+            }
             return Err(HerdrError::Rpc {
                 method: method.to_string(),
                 code: err.code,
@@ -153,6 +164,65 @@ impl HerdrClient {
 
     pub async fn tab_focus(&self, tab_id: &str) -> Result<()> {
         self.call_raw("tab.focus", json!({ "tab_id": tab_id }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Move the focus one pane in `direction`, within the tab herdr is already on.
+    ///
+    /// Sent **without** a pane id, which is what makes the key stateless: with one, herdr
+    /// navigates to that pane first, so a key labelled "left" would also teleport whoever pressed
+    /// it. Omitted, it means "from wherever I am", and herdr resolves that against its own current
+    /// focus rather than against a snapshot the deck took some seconds ago.
+    ///
+    /// At the edge of a layout this returns `Unchanged`, not an error — herdr reports it as a
+    /// success carrying a reason, and so do we.
+    ///
+    /// herdr also hands back the whole layout snapshot here. We drop it: the deck's view of herdr
+    /// is rebuilt wholesale by the watcher, and letting a key press inject one tab's geometry into
+    /// it would make what the deck believes depend on which key you last pressed.
+    pub async fn pane_focus_direction(&self, direction: PaneDirection) -> Result<PaneOutcome> {
+        let result: PaneFocusDirectionResult = self
+            .call("pane.focus_direction", json!({ "direction": direction }))
+            .await?;
+        // herdr said yes; a body we could not read is not evidence that nothing happened.
+        Ok(result.focus.map_or(PaneOutcome::Changed, |f| f.outcome()))
+    }
+
+    /// Zoom the focused pane to fill its tab, or restore it.
+    ///
+    /// Always an explicit end state, never a toggle — see [`ZoomMode`]. No pane id, for the same
+    /// reason as [`Self::pane_focus_direction`]: with one, `pane.zoom` navigates first.
+    pub async fn pane_zoom(&self, mode: ZoomMode) -> Result<PaneOutcome> {
+        let result: PaneZoomResult = self.call("pane.zoom", json!({ "mode": mode })).await?;
+        Ok(result.zoom.map_or(PaneOutcome::Changed, |z| z.outcome()))
+    }
+
+    /// Split the focused pane, putting a new shell to its right or below it.
+    ///
+    /// `focus: true` because a split you then have to navigate to is half a command, and the deck
+    /// has no second key to finish it with. It cannot take the user anywhere unexpected: the new
+    /// pane is in the tab they were already looking at.
+    pub async fn pane_split(&self, direction: SplitDirection) -> Result<()> {
+        self.call_raw(
+            "pane.split",
+            json!({ "direction": direction, "focus": true }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Close one pane, by id.
+    ///
+    /// Destructive, and more so than it looks: the last pane of a tab takes the tab with it, and
+    /// the last tab takes the workspace. herdr answers a bare `ok` either way, so the caller
+    /// cannot report which of the three happened — only that it was asked for.
+    ///
+    /// Unlike the commands above, this one takes an explicit id: herdr has no "the focused one"
+    /// form, and inventing one by reading the focus first would put a round trip between the press
+    /// and the close in which the focus could move.
+    pub async fn pane_close(&self, pane_id: &str) -> Result<()> {
+        self.call_raw("pane.close", json!({ "pane_id": pane_id }))
             .await
             .map(|_| ())
     }
@@ -299,6 +369,81 @@ mod tests {
         client.agent_focus("w1:p1").await.unwrap();
         let params = mock.observed_params("agent.focus").await.unwrap();
         assert_eq!(params["target"], "w1:p1");
+    }
+
+    // --- Pane control ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_direction_key_names_only_a_direction_and_never_a_pane() {
+        // With a pane id herdr navigates to that pane before moving, so a key labelled "left"
+        // would first teleport its owner somewhere they did not ask to be.
+        let mock = MockHerdr::start().await;
+        mock.serve_panes().await;
+        let client = HerdrClient::new(mock.socket_path());
+
+        client
+            .pane_focus_direction(crate::wire::PaneDirection::Left)
+            .await
+            .unwrap();
+
+        let params = mock.observed_params("pane.focus_direction").await.unwrap();
+        assert_eq!(params["direction"], "left");
+        assert!(
+            params.get("pane_id").is_none(),
+            "naming a pane turns a direction key into a navigation key: {params}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zoom_states_the_end_it_wants_and_never_asks_herdr_to_toggle() {
+        // A toggle flips a boolean the deck cannot see, so the same press means different things
+        // depending on state that may have moved since the deck last looked.
+        let mock = MockHerdr::start().await;
+        mock.serve_panes().await;
+        let client = HerdrClient::new(mock.socket_path());
+
+        client.pane_zoom(crate::wire::ZoomMode::On).await.unwrap();
+        let params = mock.observed_params("pane.zoom").await.unwrap();
+        assert_eq!(params["mode"], "on");
+        assert!(params.get("pane_id").is_none());
+        assert_ne!(params["mode"], "toggle");
+    }
+
+    #[tokio::test]
+    async fn a_split_asks_for_the_new_pane_to_be_focused_because_nothing_else_will() {
+        let mock = MockHerdr::start().await;
+        mock.serve_panes().await;
+        let client = HerdrClient::new(mock.socket_path());
+
+        client
+            .pane_split(crate::wire::SplitDirection::Down)
+            .await
+            .unwrap();
+        let params = mock.observed_params("pane.split").await.unwrap();
+        assert_eq!(params["direction"], "down");
+        assert_eq!(params["focus"], true);
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_herdr_wants_is_told_apart_from_an_ordinary_refusal() {
+        // This is the only refusal that leaves a dialog on the user's screen. It has to arrive as
+        // something a key can word differently, or the user is told "that failed" while herdr sits
+        // waiting for an answer they never learn it wants.
+        let mock = MockHerdr::start().await;
+        mock.reply_error(
+            "pane.close",
+            "confirmation_required",
+            "closing this would close the worktree group",
+        )
+        .await;
+        let client = HerdrClient::new(mock.socket_path());
+
+        let err = client.pane_close("w1:p1").await.unwrap_err();
+        assert!(
+            matches!(err, HerdrError::ConfirmationRequired { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("its own window"), "got {err}");
     }
 
     #[tokio::test]
