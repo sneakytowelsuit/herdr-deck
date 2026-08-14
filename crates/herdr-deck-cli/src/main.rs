@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use herdr_deck_core::capabilities::DeckModel;
+use herdr_deck_core::config::Presets;
 use herdr_deck_core::layout::{KeyBinding, Profile};
 use herdr_deck_core::Config;
 use herdr_deck_herdr::HerdrClient;
@@ -90,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(report.exit_code());
         }
         Command::Status { json } => status(&config, args.session.as_deref(), json).await,
-        Command::Layout { model } => layout(&model),
+        Command::Layout { model } => layout(&config, &model),
         Command::Install { force, write_udev } => {
             install(&config_path, force, write_udev).map(|_| ())
         }
@@ -153,14 +154,19 @@ async fn status(config: &Config, session: Option<&str>, json: bool) -> anyhow::R
     Ok(())
 }
 
-fn layout(model: &str) -> anyhow::Result<()> {
+fn layout(config: &Config, model: &str) -> anyhow::Result<()> {
     let model = parse_model(model)?;
     let capabilities = model.capabilities();
-    let profile = Profile::for_capabilities(&capabilities);
+    // The layout this deck would actually get, hand-written or derived. Printing the derived one
+    // regardless would be printing a deck nobody has the moment somebody writes a `[layout]`.
+    let profile = Profile::for_config(&capabilities, config);
 
     println!("{}\n", capabilities.describe());
     for (index, binding) in profile.keys.iter().enumerate() {
-        println!("  key {index:>2}  {}", describe_key(binding));
+        println!(
+            "  key {index:>2}  {}",
+            describe_key(binding, &profile.presets)
+        );
     }
     for (dial, binding) in profile.dials.iter().enumerate() {
         let text = match binding {
@@ -174,27 +180,79 @@ fn layout(model: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn describe_key(binding: &KeyBinding) -> String {
+/// One key, said the way a person reads it.
+///
+/// Takes the presets because a key pinned to a command page means one *command*, and which one
+/// depends on how many layouts the config named. "entry #5 of the make page" is a true sentence
+/// that helps nobody; "new worktree" is what the key does.
+fn describe_key(binding: &KeyBinding, presets: &Presets) -> String {
     match binding {
-        KeyBinding::Dynamic { rank } => format!("agent #{rank} in attention order"),
+        // A following key's meaning depends on the page, so naming the default one and saying it
+        // moves is more honest than naming the page it happens to show first.
+        KeyBinding::Dynamic { rank, page: None } => {
+            format!("entry #{rank} of the current page (agent #{rank} on the agents page)")
+        }
+        KeyBinding::Dynamic {
+            rank,
+            page: Some(page),
+        } => match page.commands(presets).get(*rank) {
+            Some(command) => format!(
+                "{} — always, from the {} page",
+                describe_command(command),
+                page.label()
+            ),
+            None => format!("entry #{rank} of the {} page, always", page.label()),
+        },
         KeyBinding::PinnedAgent { terminal_id } => format!("pinned agent {terminal_id}"),
         KeyBinding::PinnedWorkspace { workspace_id } => format!("pinned workspace {workspace_id}"),
         // Naming the gesture matters more than naming the command: a key that only works when
         // held is the one thing about a layout you cannot discover by looking at the deck.
         KeyBinding::Command { command } if command.is_destructive() => {
-            format!("{} {} — hold to confirm", command.label(), command.target())
+            format!("{} — hold to confirm", describe_command(command))
         }
-        KeyBinding::Command { command } => format!("{} {}", command.label(), command.target()),
-        KeyBinding::NextAttention => "jump to the agent that needs you most".to_string(),
-        KeyBinding::ModeToggle => "toggle agents / workspaces".to_string(),
-        KeyBinding::PagePrev => "previous page".to_string(),
-        KeyBinding::PageNext => "next page".to_string(),
+        KeyBinding::Command { command } => describe_command(command),
+        KeyBinding::Layout { preset } => format!("apply the `{preset}` layout as a new tab"),
+        KeyBinding::NewWorkspace { preset } => describe_new("workspace", preset),
+        KeyBinding::NewTab { preset } => describe_new("tab", preset),
+        KeyBinding::NewWorktree => "new git worktree, opened and focused".to_string(),
+        KeyBinding::ClosePane => "close the focused pane — hold to confirm".to_string(),
+        KeyBinding::CloseTab => "close the focused tab — hold to confirm".to_string(),
+        KeyBinding::RemoveWorktree => {
+            "give the focused worktree back to git — hold to confirm".to_string()
+        }
+        KeyBinding::Attention => {
+            "back to the agents page, and to the agent that needs you most".to_string()
+        }
+        // Which stops the cycle actually makes depends on the session and on this deck, so the
+        // key names the whole ring rather than claiming the one it happens to be pointing at.
+        KeyBinding::PageCycle => "next page — agents / spaces / trees / panes / make".to_string(),
+        KeyBinding::ScreenPrev => "previous screen of this page".to_string(),
+        KeyBinding::ScreenNext => "next screen of this page".to_string(),
         KeyBinding::Scrub { target, delta } => format!(
             "{} {}",
             if *delta < 0 { "previous" } else { "next" },
             target.label()
         ),
         KeyBinding::Empty => "—".to_string(),
+    }
+}
+
+/// One command, said the way a person reads it.
+///
+/// A command that names a direction or a state rather than a thing is complete as its verb —
+/// spelling the parameter out again gives you "split right right" — and a command that names
+/// nothing it may write down has nothing to add either.
+fn describe_command(command: &herdr_deck_core::command::DeckCommand) -> String {
+    match command.target().filter(|_| command.names_an_object()) {
+        Some(target) => format!("{} {target}", command.label()),
+        None => command.label().to_string(),
+    }
+}
+
+fn describe_new(kind: &str, preset: &Option<String>) -> String {
+    match preset {
+        Some(preset) => format!("new {kind} from the `{preset}` preset"),
+        None => format!("new {kind}"),
     }
 }
 
@@ -308,23 +366,27 @@ fn parse_model(name: &str) -> anyhow::Result<DeckModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use herdr_deck_core::layout::Page;
 
     #[test]
     fn every_key_binding_has_a_human_description() {
         // `herdr-deck layout` is how people learn what their deck does; a binding rendered as
         // debug output would be a poor answer.
         let bindings = [
-            KeyBinding::Dynamic { rank: 0 },
+            KeyBinding::Dynamic {
+                rank: 0,
+                page: None,
+            },
             KeyBinding::PinnedAgent {
                 terminal_id: "t".into(),
             },
             KeyBinding::PinnedWorkspace {
                 workspace_id: "w".into(),
             },
-            KeyBinding::NextAttention,
-            KeyBinding::ModeToggle,
-            KeyBinding::PagePrev,
-            KeyBinding::PageNext,
+            KeyBinding::Attention,
+            KeyBinding::PageCycle,
+            KeyBinding::ScreenPrev,
+            KeyBinding::ScreenNext,
             KeyBinding::Scrub {
                 target: herdr_deck_core::layout::ScrubTarget::Agents,
                 delta: 1,
@@ -332,7 +394,7 @@ mod tests {
             KeyBinding::Empty,
         ];
         for binding in bindings {
-            let text = describe_key(&binding);
+            let text = describe_key(&binding, &Presets::default());
             assert!(!text.is_empty());
             assert!(!text.contains('{'), "{text} looks like debug output");
         }
@@ -341,8 +403,59 @@ mod tests {
     #[test]
     fn layout_renders_for_every_supported_model() {
         for model in ["plus", "original", "mini", "xl", "neo", "pedal"] {
-            layout(model).unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
+            layout(&Config::default(), model)
+                .unwrap_or_else(|e| panic!("layout failed for {model}: {e}"));
         }
+    }
+
+    #[test]
+    fn a_hand_written_layout_is_what_gets_printed_rather_than_the_one_it_replaced() {
+        // `herdr-deck layout` is the answer to "what will my deck do", asked before plugging it
+        // in. Printing the derived layout to somebody who has replaced it would answer a question
+        // they did not ask.
+        let config = Config::from_toml(
+            r#"
+            [layout]
+            keys = [{ kind = "new_worktree" }]
+            "#,
+        )
+        .unwrap();
+        let profile = Profile::for_config(&DeckModel::Plus.capabilities(), &config);
+        assert_eq!(profile.keys[0], KeyBinding::NewWorktree);
+        assert_eq!(
+            profile.keys.len(),
+            8,
+            "a short layout is padded, never left with keys that address nothing"
+        );
+        assert_eq!(profile.keys[1], KeyBinding::Empty);
+    }
+
+    #[test]
+    fn a_named_layout_lengthens_the_make_page_and_a_big_deck_shows_it_without_paging() {
+        // `herdr-deck layout` is how somebody checks what their config did before plugging the
+        // deck in. A preset that reaches a key and does not appear here is a preset they will only
+        // find by pressing things — and on a deck with room, the make page is on the keys, so the
+        // preset is on a key too.
+        let mut config = Config::default();
+        config.layouts.insert(
+            "dev".into(),
+            herdr_deck_herdr::wire::LayoutPreset::default(),
+        );
+        let bare = Profile::derive(&DeckModel::Xl.capabilities(), &config);
+        assert_eq!(
+            bare.pinned_slots(Page::Make),
+            Profile::for_capabilities(&DeckModel::Xl.capabilities()).pinned_slots(Page::Make) + 1,
+            "the preset should have taken the dark key the make page left over"
+        );
+        let described: Vec<_> = bare
+            .keys
+            .iter()
+            .map(|key| describe_key(key, &bare.presets))
+            .collect();
+        assert!(
+            described.iter().any(|line| line.contains("make page")),
+            "the make page keys are missing from {described:?}"
+        );
     }
 
     #[test]

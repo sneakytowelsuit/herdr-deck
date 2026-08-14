@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use herdr_deck_core::capabilities::{DeckCapabilities, DeckModel};
-use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, Selection};
+use herdr_deck_core::layout::{Page, Profile, ResolvedDeck, Selection};
 use herdr_deck_core::render::TileRenderer;
 use herdr_deck_core::state::{Acknowledged, DeckState};
 use herdr_deck_core::Config;
@@ -212,7 +212,9 @@ async fn shutdown_signal() {
 fn dry_run(config: &Config, dir: &std::path::Path, model_name: &str) -> anyhow::Result<()> {
     let model = parse_model(model_name)?;
     let capabilities: DeckCapabilities = model.capabilities();
-    let profile = Profile::for_capabilities(&capabilities);
+    // The layout this config would actually produce, so a dry run renders this machine's deck
+    // rather than the one it would have had with an empty config file.
+    let profile = Profile::for_config(&capabilities, config);
     let renderer = TileRenderer::new(config.theme);
     let state = sample_state();
 
@@ -223,7 +225,7 @@ fn dry_run(config: &Config, dir: &std::path::Path, model_name: &str) -> anyhow::
     let deck = ResolvedDeck::new(
         &profile,
         &state,
-        Mode::Agents,
+        Page::Agents,
         0,
         Selection::default(),
         &nothing_acknowledged,

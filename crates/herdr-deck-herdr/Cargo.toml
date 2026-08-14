@@ -24,3 +24,6 @@ tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The layout and preset shapes are read from a TOML config before they are written as JSON, so
+# their tests here pin both spellings of the same struct.
+toml.workspace = true
