@@ -134,6 +134,9 @@ pub async fn run(config_path: &Path, config: &Config, session: Option<&str>) -> 
     if let Some(check) = check_herdr_protocol(&client).await {
         report.checks.push(check);
     }
+    if let Some(check) = check_herdr_events(&client).await {
+        report.checks.push(check);
+    }
     report
         .checks
         .push(check_daemon_socket(&daemon_socket_path()).await);
@@ -220,6 +223,36 @@ async fn check_herdr_protocol(client: &HerdrClient) -> Option<Check> {
             "herdr protocol",
             format!("could not read session.snapshot: {e}"),
             "Confirm herdr is healthy with `herdr status`.",
+        )),
+    }
+}
+
+/// Can we actually open the event subscription the daemon lives on?
+///
+/// This check exists because its absence cost a user a working deck. `events.subscribe` was being
+/// rejected outright — herdr validates the batch as a whole and one entry named an event that
+/// only exists in a filtered form — so the watcher fell to its offline path and every key read
+/// `herdr error: invalid_request`. `doctor` reported nothing wrong with herdr, because it only
+/// ever asked for a snapshot. A diagnostic that does not exercise the thing that broke is not a
+/// diagnostic. This opens a real subscription and throws it away.
+async fn check_herdr_events(client: &HerdrClient) -> Option<Check> {
+    if !client.socket().exists() {
+        return None;
+    }
+    match herdr_deck_herdr::events::EventStream::subscribe(client).await {
+        Ok(_) => Some(Check::ok(
+            "herdr events",
+            format!(
+                "subscribed to {} event types",
+                herdr_deck_herdr::events::DEFAULT_SUBSCRIPTIONS.len()
+            ),
+        )),
+        Err(e) => Some(Check::fail(
+            "herdr events",
+            format!("could not subscribe to herdr's events: {e}"),
+            "The deck will show `herdr error: …` on every key. This usually means herdr-deck \
+             and herdr disagree about the event list; update herdr-deck, or report the error \
+             above.",
         )),
     }
 }
@@ -437,10 +470,13 @@ mod tests {
         let mock = MockHerdr::start().await;
         mock.reply(
             "session.snapshot",
-            json!({"protocol": 19, "agents": [
+            // Wrapped as herdr answers: `{"type": ..., "snapshot": {...}}`. Building the bare
+            // form here is what let the real bug through — the snapshot read a level too high,
+            // defaulted every field, and this check reported no protocol version.
+            json!({"type": "session_snapshot", "snapshot": {"protocol": 19, "agents": [
                 {"terminal_id":"t","agent_status":"idle","workspace_id":"w1",
                  "tab_id":"w1:t1","pane_id":"w1:p1","focused":false,"revision":1}
-            ]}),
+            ]}}),
         )
         .await;
         let client = HerdrClient::new(mock.socket_path());
@@ -455,8 +491,11 @@ mod tests {
         use serde_json::json;
 
         let mock = MockHerdr::start().await;
-        mock.reply("session.snapshot", json!({"protocol": 99, "agents": []}))
-            .await;
+        mock.reply(
+            "session.snapshot",
+            json!({"type": "session_snapshot", "snapshot": {"protocol": 99, "agents": []}}),
+        )
+        .await;
         let client = HerdrClient::new(mock.socket_path());
         let check = check_herdr_protocol(&client).await.unwrap();
         assert_eq!(

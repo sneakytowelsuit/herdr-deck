@@ -162,14 +162,20 @@ mod tests {
     use herdr_deck_herdr::wire::AgentStatus;
     use serde_json::json;
 
+    /// Shaped the way herdr answers: the snapshot is nested under `snapshot`. Building the bare
+    /// form here agreed with a client that read one level too high, so these tests passed while
+    /// a real herdr produced an empty deck.
     fn snapshot_with(status: &str) -> serde_json::Value {
         json!({
             "type": "session_snapshot",
-            "protocol": 19,
-            "agents": [{
-                "terminal_id": "term_a", "agent_status": status, "workspace_id": "w1",
-                "tab_id": "w1:t1", "pane_id": "w1:p1", "focused": false, "revision": 1
-            }]
+            "snapshot": {
+                "version": "0.8.0",
+                "protocol": 19,
+                "agents": [{
+                    "terminal_id": "term_a", "agent_status": status, "workspace_id": "w1",
+                    "tab_id": "w1:t1", "pane_id": "w1:p1", "focused": false, "revision": 1
+                }]
+            }
         })
     }
 

@@ -10,10 +10,22 @@
 //!
 //! # Subscribing
 //!
-//! herdr has two event families with overlapping names. `pane.agent_status_changed` exists both
-//! as a per-pane *filtered* subscription (which requires a `pane_id` we do not have up front)
-//! and as an unfiltered *broadcast*. We want the broadcast form: `{"type": "..."}` with no
-//! filter, so we see every pane without enumerating them first.
+//! Most events can be subscribed to as a bare `{"type": "..."}`, which is what we want: every
+//! pane without enumerating them first.
+//!
+//! **`pane.agent_status_changed` is not one of them.** It was believed to have an unfiltered
+//! broadcast form alongside the per-pane filtered one. It does not — in herdr 0.8.0 it is only
+//! ever `{"type": "pane.agent_status_changed", "pane_id": "..."}`, and a subscription missing
+//! that field is rejected. herdr validates the whole batch as one, so that single bad entry
+//! failed the entire `events.subscribe` with `invalid_request`, the watcher went to its offline
+//! path, and every key on the deck read `herdr error: invalid_request`. It could not have been
+//! caught by a mock that accepts whatever it is sent, and it was not.
+//!
+//! Dropping it costs latency, not correctness: `session.snapshot` is the source of truth and the
+//! reconcile timer re-reads it regardless, so a status change is seen within one interval instead
+//! of instantly. `pane.updated` and `pane.agent_detected` still ring the doorbell for most of
+//! what matters. Subscribing per pane, and re-subscribing as panes come and go, would buy back
+//! the latency and is the obvious next step.
 
 use serde::Deserialize;
 use serde_json::json;
@@ -29,8 +41,11 @@ use crate::{HerdrError, Result};
 /// Anything that can change what the deck renders belongs here. Unrecognised events are still
 /// delivered as [`HerdrEvent::Other`] and still trigger a reconcile, so this list being
 /// incomplete costs latency, never correctness.
+///
+/// Every entry must be subscribable with `{"type": ...}` alone. herdr rejects the whole batch if
+/// any one entry is missing a field it requires, so adding a filtered event here does not
+/// degrade that event — it takes down the entire subscription. See [`SUBSCRIPTIONS_NEEDING_A_FILTER`].
 pub const DEFAULT_SUBSCRIPTIONS: &[&str] = &[
-    "pane.agent_status_changed",
     "pane.agent_detected",
     "pane.created",
     "pane.closed",
@@ -47,6 +62,17 @@ pub const DEFAULT_SUBSCRIPTIONS: &[&str] = &[
     "workspace.renamed",
     "workspace.focused",
     "workspace.updated",
+];
+
+/// Events that exist only in a filtered form, and the field each one demands.
+///
+/// Putting any of these in [`DEFAULT_SUBSCRIPTIONS`] fails the whole `events.subscribe`, so this
+/// list is not documentation — it is the thing the test below checks the defaults against, and
+/// the reason that check can fail.
+pub const SUBSCRIPTIONS_NEEDING_A_FILTER: &[(&str, &str)] = &[
+    ("pane.agent_status_changed", "pane_id"),
+    ("pane.scroll_changed", "pane_id"),
+    ("pane.output_matched", "pane_id"),
 ];
 
 /// An event pushed by herdr.
@@ -204,8 +230,12 @@ mod tests {
     use crate::mock::MockHerdr;
 
     #[tokio::test]
-    async fn subscribes_to_the_unfiltered_broadcast_form() {
-        // A `pane_id` filter here would silently limit us to one pane. Guard against it.
+    async fn every_default_subscription_is_one_herdr_accepts_unfiltered() {
+        // The bug this replaces: `pane.agent_status_changed` was subscribed to as a bare type,
+        // believing an unfiltered broadcast form existed. It does not. herdr validates the batch
+        // as a whole, so that one entry failed the entire subscription with `invalid_request` and
+        // every key on the deck showed the error. A mock that accepts anything cannot catch that,
+        // so this asserts against herdr's actual rule instead of against the mock's tolerance.
         let mock = MockHerdr::start().await;
         mock.queue_events(vec![]).await;
         let client = HerdrClient::new(mock.socket_path());
@@ -215,14 +245,35 @@ mod tests {
         let subs = params["subscriptions"].as_array().unwrap();
         assert!(!subs.is_empty());
         for sub in subs {
-            assert!(sub.get("type").is_some(), "each subscription names a type");
+            let kind = sub["type"]
+                .as_str()
+                .expect("each subscription names a type");
             assert!(
                 sub.get("pane_id").is_none(),
                 "must not filter by pane_id, or we only see one pane"
             );
+            if let Some((_, field)) = SUBSCRIPTIONS_NEEDING_A_FILTER
+                .iter()
+                .find(|(name, _)| *name == kind)
+            {
+                panic!(
+                    "`{kind}` only exists filtered — herdr requires `{field}` and rejects the \
+                     whole batch without it, which blanks the deck"
+                );
+            }
         }
-        let types: Vec<_> = subs.iter().map(|s| s["type"].as_str().unwrap()).collect();
-        assert!(types.contains(&"pane.agent_status_changed"));
+    }
+
+    #[test]
+    fn the_defaults_and_the_filtered_list_never_overlap() {
+        // Guards the list above at its source, so a new subscription is checked even by someone
+        // who never runs the async test.
+        for (filtered, field) in SUBSCRIPTIONS_NEEDING_A_FILTER {
+            assert!(
+                !DEFAULT_SUBSCRIPTIONS.contains(filtered),
+                "`{filtered}` needs `{field}` and cannot be a default subscription"
+            );
+        }
     }
 
     #[tokio::test]

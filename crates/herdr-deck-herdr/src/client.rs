@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::socket::SocketPath;
-use crate::wire::{Request, Response, SessionSnapshot};
+use crate::wire::{Request, Response, SessionSnapshot, SessionSnapshotResult};
 use crate::{HerdrError, Result};
 
 /// A client for herdr's API socket.
@@ -128,8 +128,16 @@ impl HerdrClient {
     }
 
     /// The bootstrap snapshot: every workspace, tab, pane and agent, plus what is focused.
+    ///
+    /// herdr wraps this one: the result is `{"type": "session_snapshot", "snapshot": {...}}`, and
+    /// the snapshot's own fields are a level down. Reading the result as the snapshot directly
+    /// does not fail — every field of [`SessionSnapshot`] has a default, so it yields a perfectly
+    /// valid empty one, and the deck shows no agents while `doctor` reports that herdr never sent
+    /// a protocol version. That shipped. The wrapper below is deliberately strict so the same
+    /// mistake is an error rather than an empty screen.
     pub async fn session_snapshot(&self) -> Result<SessionSnapshot> {
-        self.call("session.snapshot", json!({})).await
+        let wrapper: SessionSnapshotResult = self.call("session.snapshot", json!({})).await?;
+        Ok(wrapper.snapshot)
     }
 
     /// Focus an agent by name or pane id.
@@ -236,16 +244,23 @@ mod tests {
     #[tokio::test]
     async fn snapshot_decodes_into_typed_state() {
         let mock = MockHerdr::start().await;
+        // Shaped as herdr 0.8.0 actually answers — captured from a running herdr, not composed
+        // from the docs. The snapshot is nested under `snapshot`; reading the result directly
+        // yields an all-default snapshot instead of an error, which is how this shipped.
         mock.reply(
             "session.snapshot",
             json!({
                 "type": "session_snapshot",
-                "protocol": 19,
-                "workspaces": [{"workspace_id":"w1","label":"api","agent_status":"blocked"}],
-                "agents": [{
-                    "terminal_id":"term_a","agent_status":"blocked","workspace_id":"w1",
-                    "tab_id":"w1:t1","pane_id":"w1:p1","focused":false,"revision":1
-                }]
+                "snapshot": {
+                    "version": "0.8.0",
+                    "protocol": 19,
+                    "focused_workspace_id": "w1",
+                    "workspaces": [{"workspace_id":"w1","label":"api","agent_status":"blocked"}],
+                    "agents": [{
+                        "terminal_id":"term_a","agent_status":"blocked","workspace_id":"w1",
+                        "tab_id":"w1:t1","pane_id":"w1:p1","focused":false,"revision":1
+                    }]
+                }
             }),
         )
         .await;
@@ -253,6 +268,25 @@ mod tests {
         let snap = client.session_snapshot().await.unwrap();
         assert_eq!(snap.protocol, Some(19));
         assert_eq!(snap.agents[0].terminal_id, "term_a");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_is_not_wrapped_is_an_error_and_not_an_empty_session() {
+        // The failure that shipped: read one level too high, every field defaults, and the deck
+        // shows a herdr with nothing running while `doctor` says herdr sent no protocol version.
+        // Silence is the worst possible outcome here, so it must be loud.
+        let mock = MockHerdr::start().await;
+        mock.reply(
+            "session.snapshot",
+            json!({ "type": "session_snapshot", "protocol": 19, "agents": [] }),
+        )
+        .await;
+        let client = HerdrClient::new(mock.socket_path());
+        let err = client
+            .session_snapshot()
+            .await
+            .expect_err("an unwrapped snapshot must not decode as an empty session");
+        assert!(matches!(err, crate::HerdrError::Decode { .. }));
     }
 
     #[tokio::test]

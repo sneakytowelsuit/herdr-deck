@@ -182,7 +182,14 @@ impl MockHerdr {
     /// crate is supposed to hold no protocol knowledge, and a test that hand-writes
     /// `"agent.focus"` quietly breaks that rule in the place people are least likely to look.
     pub async fn serve_session(&self, snapshot: &crate::wire::SessionSnapshot) {
-        let value = serde_json::to_value(snapshot).expect("snapshot serialises");
+        // Wrapped exactly as herdr wraps it. This mock previously answered with the bare
+        // snapshot, which is the same mistake the client made, so the two agreed with each other
+        // and disagreed with herdr — every test passed against a client that read an empty
+        // snapshot from a real session. A mock is only worth what it copies faithfully.
+        let value = json!({
+            "type": "session_snapshot",
+            "snapshot": serde_json::to_value(snapshot).expect("snapshot serialises"),
+        });
         self.reply("session.snapshot", value).await;
         self.reply("agent.focus", json!({ "type": "ok" })).await;
         self.reply("workspace.focus", json!({ "type": "ok" })).await;
