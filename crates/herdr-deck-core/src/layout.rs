@@ -715,6 +715,10 @@ impl<'a> ResolvedDeck<'a> {
     /// answer and keeps all its slots; a deck without one — the Stream Deck +, whose dials scrub
     /// the *lists* but know nothing about a page of commands — spends a slot, and only on the page
     /// that needs it.
+    ///
+    /// A deck down to its last following key is the one case where this does not apply: spending
+    /// that key would leave a deck showing nothing at all but a way to see nothing else. Only a
+    /// hand-written layout can get there, and it is a layout that had already made its choice.
     fn needs_more_key(&self) -> bool {
         !self.profile.has_paging()
             && self.profile.dynamic_slots() > 1

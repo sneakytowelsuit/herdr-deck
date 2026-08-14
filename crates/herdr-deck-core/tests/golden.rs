@@ -282,21 +282,21 @@ fn a_page_key_with_nowhere_to_go_pins_the_face_that_promises_nothing() {
 }
 
 #[test]
-fn an_active_mode_tile_pins_its_underline_indicator() {
+fn an_active_label_key_pins_its_underline_indicator() {
     let tile = Tile::Label {
         label: "agents".into(),
         active: true,
     };
-    assert_key_matches_golden("mode_active", &tile, 120);
+    assert_key_matches_golden("label_active", &tile, 120);
 }
 
 #[test]
-fn an_inactive_mode_tile_pins_the_dimmed_look_with_no_indicator() {
+fn an_inactive_label_key_pins_the_dimmed_look_with_no_indicator() {
     let tile = Tile::Label {
         label: "agents".into(),
         active: false,
     };
-    assert_key_matches_golden("mode_inactive", &tile, 120);
+    assert_key_matches_golden("label_inactive", &tile, 120);
 }
 
 // --- Pane control -----------------------------------------------------------------------------
