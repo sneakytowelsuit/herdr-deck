@@ -1,10 +1,33 @@
 # herdr protocol notes
 
-What herdr-deck relies on, and the sharp edges found along the way. Written against **herdr
-0.8.0, socket protocol 19**.
+What herdr-deck relies on, and the sharp edges found along the way.
 
 All of this lives in one crate, `herdr-deck-herdr`, so a herdr protocol change is a one-crate
 fix.
+
+## Which herdr this is written against
+
+Two numbers, and they do not currently agree.
+
+- herdr-deck expects **socket protocol 19**, which is what herdr **0.8.0** reports. That is the
+  released version, and it is the number in `EXPECTED_PROTOCOL`.
+- herdr's `main` **after** 0.8.0 declares **protocol 20** (`src/protocol/wire.rs`), while its
+  `Cargo.toml` still says `0.8.0`. So a build from source may report 20 while calling itself
+  0.8.0.
+
+What is known about the bump: it appears alongside direct pane frame streaming, which
+herdr-deck does not use. What is *not* known: whether anything else rode along with it. That was
+read from a shallow clone at one commit, so the history around it could not be seen in full, and
+nothing was executed — herdr was not installed on the machine this was written on.
+
+A mismatch is a **warning, not a refusal** (see `EXPECTED_PROTOCOL`): herdr's changes are usually
+additive, and a status display that refused to start over a version number would be a worse
+failure than one showing a slightly stale field. If you are running herdr from source and see the
+warning, that is this skew and not a bug in your setup.
+
+Everything below was read from herdr's source at that commit and from herdr's own tests. Where
+this page says herdr *does* something, it means the source says so; nothing here was confirmed by
+running it.
 
 ## Transport
 
@@ -38,11 +61,119 @@ The only methods that hold a connection open are `events.subscribe` and `pane.gr
 | `client.window_title.set` | Stamp a marker so the exact terminal window can be found. |
 | `ping` | Liveness. |
 | `notification.show` | Optional toast; its `reason` doubles as "is a TUI attached". |
+| `pane.focus_direction` | Move one pane left/right/up/down. |
+| `pane.zoom` | Fill a tab with its focused pane, or put it back. |
+| `pane.split` | New shell beside or below the focused one. |
+| `pane.close` | Close a pane. |
+| `worktree.list` | The checkouts of the repository you are in, for the worktree page. |
+| `worktree.open` | Open a checkout as a workspace and go there. |
+| `worktree.create` | Make a new worktree. herdr invents the branch name. |
+| `worktree.remove` | Give a checkout back to git. Never forced. |
+| `workspace.create` | New workspace, from a named preset. |
+| `tab.create` | New tab in the workspace you are in, from a named preset. |
+| `tab.close` | Close a tab. |
+| `layout.apply` | Build a new tab from a named arrangement of panes. Never with a `tab_id`. |
+
+## Pane commands
+
+Four sharp edges, all found in herdr's source rather than the hard way.
+
+- **Omit `pane_id`.** Both `pane.focus_direction` and `pane.zoom` accept one, and both *navigate
+  to that pane first* when given one — switching workspace and tab on the way. A key labelled
+  "left" that also teleported you would be a surprise, so the deck sends neither. Without an id
+  they act on whatever herdr currently has focused, which is also fresher than anything the deck
+  knows.
+- **`pane.zoom` takes `on`/`off`, never `toggle`.** Zoom is a per-tab boolean; herdr's snapshot
+  carries it, but the deck's copy is always a reconcile behind. Stating the end state is
+  idempotent and self-correcting; `already_zoomed` comes back as a success, not an error.
+- **`pane.focus_direction` at an edge is a success.** It answers `changed: false` with reason
+  `no_neighbor` — note herdr's American spelling — and so are `single_pane` and
+  `already_unzoomed`. None of them are errors and none of them may reach a key as one.
+- **`pane.split` has only `right` and `down`.** There is no split-left or split-up to offer. It
+  also un-zooms the tab as a side effect, and the deck asks for `focus: true` so the new shell is
+  the one you are in.
+
+`pane.close` is worse than it looks and the deck treats it accordingly. It cascades — the last
+pane closes the tab, the last tab closes the workspace — and returns a bare `{"type":"ok"}` for
+all three, so nothing downstream can report what was actually destroyed. Its one guard,
+`confirmation_required`, fires only when herdr's own `confirm_close` is on and a worktree group
+would go, and it has a side effect: herdr opens its `ConfirmClose` modal. The deck surfaces that
+as its own message on the key and leaves the dialog alone. It could dismiss it —
+`agent.focus` settles herdr's mode and would take the modal with it — but answering a question the
+user has not read yet is exactly what this project does not do, and it would drag them to another
+pane on the way.
+
+## Structure: layouts, worktrees, workspaces and tabs
+
+Two of these methods are traps rather than features, and the deck's shape here is mostly about
+not falling into them.
+
+**`layout.apply` with a `tab_id` is destructive, and nothing in its name says so.** It builds the
+replacement tab first and then *closes* the tab you named, killing every terminal in it — no
+confirmation, no worktree-group guard, no dry run. herdr's own docs put it plainly: it "does not
+preserve live PTYs, scrollback, or running processes." Without a `tab_id` the same call is purely
+additive: a new tab in the workspace you are in. The deck's client offers no way to supply one, so
+a layout preset can only ever add.
+
+**`worktree.remove` is the only call the deck makes that could delete a file.** With `force: true`
+it does two destructive things in order: it kills every terminal in the workspace *before* git
+runs — so a git failure loses your agents for nothing — and then deletes uncommitted and untracked
+files. The deck's client takes no `force` argument and always sends `false`. Unforced, git refuses
+to remove a checkout with changes in it, herdr passes that refusal straight back, and the key
+shows it. That refusal *is* the confirmation dialog, and it is a better one than a deck could
+draw. Committed work is never at risk either way: herdr does not delete the branch.
+
+`worktree.open` is the best-behaved method in the whole API and the deck leans on it: idempotent,
+synchronous, non-destructive, and it reports `already_open` rather than making a second workspace.
+Its parameters come straight out of `worktree.list`, so nothing has to be typed. The deck opens by
+`path` rather than `branch` because a detached checkout has no branch, and a list where some rows
+worked and others did not would be worse than a shorter list.
+
+`worktree.create` and `worktree.remove` are the **only two methods in herdr's API that do not
+answer at once** — they are deferred until git finishes, which on a large repository is seconds.
+The daemon carries them out alongside its event loop rather than inside it, so the key reports
+late and the rest of the deck keeps working. Everything else here answers immediately.
+
+`tab.close` cascades the way `pane.close` does, one level up: the last tab of a workspace takes
+the workspace with it, and herdr answers the same bare `ok` for both. Like `pane.close` it is
+guarded by a hold, never appears in a derived layout, and surfaces `confirmation_required` as a
+message pointing at herdr's own window.
+
+`worktree.list` shells out to `git worktree list --porcelain`, so the deck reads it on a slow timer
+rather than with every reconcile — and immediately whenever the set of workspaces changes, which is
+what opening, creating or removing a worktree always does. Bare and prunable entries are dropped
+before they reach a key: herdr answers `worktree_not_found` for both, and a key that cannot work is
+worse than a key that is not there.
+
+### Why there is no key that closes a workspace
+
+`workspace.close` is absent from the deck's vocabulary, and there is a test asserting it stays
+absent. It is the worst-behaved method in this part of the API:
+
+- **No confirmation of any kind.** `tab.close` and `pane.close` both refuse with
+  `confirmation_required` when closing would take a worktree group with it. `workspace.close` has
+  no such guard — the TUI's own path honours `confirm_close`, and the API bypasses it entirely.
+- **It does not necessarily close one workspace.** When the target is the source-repo member of a
+  worktree group with two or more members, it closes *every* workspace in that group: the repo and
+  all its worktree children, in one call.
+- **It cannot report what it did.** The response is a bare `{"type":"ok"}`, so a key could not tell
+  you afterwards whether it had closed one workspace or five.
+
+A daemon could in principle establish that a target is not worktree-grouped before sending — the
+`worktree.list` response carries `open_workspace_id` for every checkout. It would rest on inferring
+herdr's grouping rule rather than reading it, and it would race: the check and the close are two
+calls, and a worktree opened in between makes the answer stale. A wrong inference costs somebody
+several workspaces of running agents, so this stays out until herdr offers either a guard of its
+own or a response that says what went.
+
+`workspace.rename` and `tab.rename` are out for a duller reason: both require a `label` with no
+clear or reset form, and a deck has no keyboard. See
+[configuration](configuration.md#presets-are-how-text-reaches-herdr).
 
 ## Why herdr-deck doesn't approve prompts
 
-**herdr-deck's entire write surface to herdr is focus.** The table above is not a partial list —
-it is every method the daemon calls. There is no `agent.approve`, no `pane.send_keys`, no
+**herdr-deck's write surface to herdr is focus and structure.** The table above is not a partial
+list — it is every method the daemon calls. There is no `agent.approve`, no `pane.send_keys`, no
 structured yes/no of any kind. A key can turn red the moment `session.snapshot` reports an agent
 `blocked` on approval; it deliberately cannot make that need go away. This is not an
 unimplemented feature. It is a refusal, and the reasoning is worth writing down so it does not
@@ -159,6 +290,10 @@ id* — not a terminal id — so resolve at the moment of use.
   zoom while it does. Sending `workspace.focus` or `tab.focus` around it to "prepare the way"
   makes three round trips of a journey herdr does atomically, and fights its own logic.
 - `workspace.metadata_updated` does not trigger plugin event hooks.
+- Pane ids are **positional if they are numeric**: `parse_workspace_id` falls back to treating a
+  bare `"2"` as "the second one right now". Never send a positional id from a deck — and never
+  keep a pane id anywhere it could go stale, which is why the deck's close-pane key resolves one
+  at the moment it is held.
 
 ## Version compatibility
 

@@ -29,6 +29,17 @@ is usually one of:
 
 Either way herdr itself still switched panes, so the agent is waiting for you when you get there.
 
+## Then try the rest of it
+
+The bottom-right key is the **page key**. Press it a few times: the deck walks from agents to
+workspaces, to pane control, to the keys that make a tab or a worktree. The key says which page you
+are on, so you never have to count.
+
+Then press the **attention key** next to it. Wherever you have got to, it brings the deck home —
+and if anything is asking for you, it takes you there in the same press. That is worth doing once
+deliberately, because it is the thing that makes the rest of the control surface safe to wander
+around in. [What each page can do.](../reference/control-families.md)
+
 ## Running it in the foreground
 
 While you are getting set up, it is often easier to watch the daemon directly than to read

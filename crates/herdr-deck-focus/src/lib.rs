@@ -14,6 +14,13 @@
 //! Step 1 works everywhere. Step 2 does not — notably GNOME on Wayland blocks programmatic
 //! activation. When step 2 is unavailable the focus still half-succeeds, and we say so loudly
 //! rather than silently doing less than the user asked for.
+//!
+//! # Not every command is a journey
+//!
+//! This crate performs the deck's whole write surface, and only part of it is a focus. Moving one
+//! pane left, zooming, splitting and closing all rearrange the terminal the user is already
+//! sitting at, so they do step 1 and stop there. See [`DeckCommand::raises_the_window`], which is
+//! where that line is drawn, and [`in_place`], which is where it is honoured.
 
 pub mod backend;
 pub mod detect;
@@ -25,6 +32,7 @@ pub use detect::{detect, detect_or_override, FocusEnv, TargetOs};
 
 use herdr_deck_core::command::DeckCommand;
 use herdr_deck_core::config::FocusConfig;
+use herdr_deck_herdr::wire::{NothingToDo, PaneOutcome};
 use herdr_deck_herdr::HerdrClient;
 
 /// How long a window-raise command gets before we give up on it.
@@ -51,6 +59,13 @@ pub enum RaiseOutcome {
     /// terminal to attach opens on that pane. Reporting this as an error would teach people to
     /// ignore the deck's alerts, which is the one thing this hardware cannot afford.
     NoClient,
+    /// The command never wanted a window.
+    ///
+    /// Splitting, zooming, closing and stepping between panes rearrange the terminal the user is
+    /// already sitting at. Fetching that terminal would spend a round trip nobody asked for, and
+    /// on a desktop that cannot raise windows it would turn every one of those presses into an
+    /// alert about a failure that never happened.
+    NotNeeded,
     /// This environment has no usable mechanism.
     Unsupported { reason: String },
     /// The backend's tools are missing.
@@ -74,6 +89,7 @@ impl RaiseOutcome {
             RaiseOutcome::NoClient => {
                 "herdr focused it; nothing is attached, so it waits for the next one".to_string()
             }
+            RaiseOutcome::NotNeeded => "herdr did it where you already were".to_string(),
             RaiseOutcome::Unsupported { reason } => reason.clone(),
             RaiseOutcome::ToolMissing { program } => {
                 format!("herdr focused, but `{program}` is not installed to raise the window")
@@ -85,9 +101,10 @@ impl RaiseOutcome {
 
 /// How much of what the user asked for actually happened.
 ///
-/// Three outcomes rather than two, because "not everything happened" and "something went wrong"
-/// are different things and a key that conflates them is a key whose alerts stop meaning
-/// anything.
+/// More outcomes than the two a key can show, because "not everything happened", "there was
+/// nothing to happen" and "something went wrong" are three different things and a key that
+/// conflated them is a key whose alerts stop meaning anything. Only [`FocusVerdict::is_error`]
+/// reaches the deck; the rest of the distinction is for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusVerdict {
     /// herdr focused it and the window came forward.
@@ -98,9 +115,19 @@ pub enum FocusVerdict {
     /// persists, and the next client to attach opens there. Everything that *could* happen did,
     /// which is why this must not read as a failure.
     Settled,
+    /// herdr understood, and there was nothing to change.
+    ///
+    /// The edge of a layout, a tab with one pane in it, a zoom that was already on. herdr reports
+    /// all three as successes carrying a reason, and so does the deck: a key that flashed an alert
+    /// every time a thumb ran off the end of a row would teach its owner to stop reading alerts,
+    /// and the alerts are the only thing this hardware has to say something is wrong.
+    ///
+    /// Kept apart from [`FocusVerdict::Complete`] for the log's sake, not the key's — "I pressed
+    /// left four times and only moved twice" is a question the trail should be able to answer.
+    Unchanged,
     /// herdr focused it, but the window did not come forward and could have.
     Partial,
-    /// herdr did not focus it, so nothing happened at all.
+    /// herdr did not do it, so nothing happened at all.
     Failed,
 }
 
@@ -115,31 +142,40 @@ impl FocusVerdict {
         match self {
             FocusVerdict::Complete => "complete",
             FocusVerdict::Settled => "settled",
+            FocusVerdict::Unchanged => "unchanged",
             FocusVerdict::Partial => "partial",
             FocusVerdict::Failed => "failed",
         }
     }
 }
 
-/// The result of a focus request.
+/// The result of one command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusReport {
-    /// Did herdr switch its active pane?
-    pub herdr_focused: bool,
+    /// Did herdr carry the command out?
+    pub herdr_acted: bool,
     pub raise: RaiseOutcome,
-    /// Set when step 1 failed.
+    /// Set when herdr refused.
     pub error: Option<String>,
+    /// Set when herdr understood and there was nothing to change.
+    ///
+    /// Distinct from `error`, and the distinction is load-bearing: this is herdr answering the
+    /// question rather than declining it, so it must never reach the key as an alert.
+    pub unchanged: Option<NothingToDo>,
 }
 
 impl FocusReport {
-    /// How much of the two-step focus happened.
+    /// How much of what the user asked for actually happened.
     pub fn verdict(&self) -> FocusVerdict {
-        if !self.herdr_focused || self.error.is_some() {
+        if !self.herdr_acted || self.error.is_some() {
             return FocusVerdict::Failed;
+        }
+        if self.unchanged.is_some() {
+            return FocusVerdict::Unchanged;
         }
         match self.raise {
             RaiseOutcome::Raised { .. } => FocusVerdict::Complete,
-            RaiseOutcome::NoClient => FocusVerdict::Settled,
+            RaiseOutcome::NoClient | RaiseOutcome::NotNeeded => FocusVerdict::Settled,
             _ => FocusVerdict::Partial,
         }
     }
@@ -155,9 +191,10 @@ impl FocusReport {
     }
 
     pub fn describe(&self) -> String {
-        match &self.error {
-            Some(err) => format!("could not focus in herdr: {err}"),
-            None => self.raise.describe(),
+        match (&self.error, self.unchanged) {
+            (Some(err), _) => format!("herdr refused: {err}"),
+            (None, Some(why)) => why.describe().to_string(),
+            (None, None) => self.raise.describe(),
         }
     }
 }
@@ -331,6 +368,49 @@ impl<R: CommandRunner> FocusEngine<R> {
                 self.focus_workspace(workspace_id).await
             }
             DeckCommand::FocusTab { tab_id } => self.focus_tab(tab_id).await,
+
+            // Everything below rearranges the terminal the user is already at, so none of it
+            // raises a window — see [`DeckCommand::raises_the_window`], and the test that holds
+            // the two halves of that decision together.
+            DeckCommand::MovePaneFocus { direction } => {
+                in_place(self.client.pane_focus_direction(*direction).await)
+            }
+            DeckCommand::ZoomPane { zoom } => in_place(self.client.pane_zoom(*zoom).await),
+            DeckCommand::SplitPane { direction } => in_place(
+                self.client
+                    .pane_split(*direction)
+                    .await
+                    .map(|()| PaneOutcome::Changed),
+            ),
+            DeckCommand::ClosePane { pane_id } => in_place(
+                self.client
+                    .pane_close(pane_id)
+                    .await
+                    .map(|()| PaneOutcome::Changed),
+            ),
+
+            // Opening a worktree is the one structural command that is a journey, so it is the one
+            // that also fetches the window — see [`DeckCommand::raises_the_window`].
+            DeckCommand::OpenWorktree { path } => {
+                self.report(self.client.worktree_open(path).await).await
+            }
+
+            // Everything below makes or unmakes part of herdr's structure around the terminal the
+            // user is already at.
+            DeckCommand::ApplyLayout { layout, .. } => {
+                in_place(done(self.client.layout_apply(layout).await))
+            }
+            DeckCommand::CreateWorkspace { spec, .. } => {
+                in_place(done(self.client.workspace_create(spec).await))
+            }
+            DeckCommand::CreateTab { spec, .. } => {
+                in_place(done(self.client.tab_create(spec).await))
+            }
+            DeckCommand::CreateWorktree => in_place(done(self.client.worktree_create().await)),
+            DeckCommand::RemoveWorktree { workspace_id } => {
+                in_place(done(self.client.worktree_remove(workspace_id).await))
+            }
+            DeckCommand::CloseTab { tab_id } => in_place(done(self.client.tab_close(tab_id).await)),
         }
     }
 
@@ -359,15 +439,17 @@ impl<R: CommandRunner> FocusEngine<R> {
     async fn report(&self, focused: herdr_deck_herdr::Result<()>) -> FocusReport {
         match focused {
             Ok(()) => FocusReport {
-                herdr_focused: true,
+                herdr_acted: true,
                 raise: self.raise_or_explain().await,
                 error: None,
+                unchanged: None,
             },
             // Raising a window for a focus that did not happen would show the user the wrong pane.
             Err(e) => FocusReport {
-                herdr_focused: false,
+                herdr_acted: false,
                 raise: RaiseOutcome::Disabled,
                 error: Some(e.to_string()),
+                unchanged: None,
             },
         }
     }
@@ -437,6 +519,45 @@ impl<R: CommandRunner> FocusEngine<R> {
             Some(program) => RaiseOutcome::ToolMissing { program },
             None => RaiseOutcome::NotFound,
         }
+    }
+}
+
+/// Turn "herdr did it, or did not, or found nothing to do" into a report, with no window involved.
+///
+/// The three outcomes stay apart all the way to the key. `Changed` is a plain success; `Unchanged`
+/// is herdr answering the question rather than declining it, and must not alert; only an error is
+/// a failure. Collapsing the middle one into either of the others is the mistake that would make
+/// this deck's alerts worthless — a thumb run along a row of direction keys ends at an edge every
+/// single time.
+/// herdr answered a bare `ok`, so there was nothing for it to report but success.
+///
+/// Most of herdr's structural commands are like this: they make a thing, and the only two answers
+/// are "made it" and an error. Naming the conversion rather than writing the same `map` at every
+/// call site is what keeps the arms above readable as a list of one-line commands.
+fn done(result: herdr_deck_herdr::Result<()>) -> herdr_deck_herdr::Result<PaneOutcome> {
+    result.map(|()| PaneOutcome::Changed)
+}
+
+fn in_place(result: herdr_deck_herdr::Result<PaneOutcome>) -> FocusReport {
+    match result {
+        Ok(PaneOutcome::Changed) => FocusReport {
+            herdr_acted: true,
+            raise: RaiseOutcome::NotNeeded,
+            error: None,
+            unchanged: None,
+        },
+        Ok(PaneOutcome::Unchanged(why)) => FocusReport {
+            herdr_acted: true,
+            raise: RaiseOutcome::NotNeeded,
+            error: None,
+            unchanged: Some(why),
+        },
+        Err(e) => FocusReport {
+            herdr_acted: false,
+            raise: RaiseOutcome::NotNeeded,
+            error: Some(e.to_string()),
+            unchanged: None,
+        },
     }
 }
 
@@ -567,7 +688,7 @@ mod tests {
         let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
 
         let report = engine.focus_agent("w1:p1").await;
-        assert!(report.herdr_focused);
+        assert!(report.herdr_acted);
         assert!(report.fully_succeeded());
         assert_eq!(mock.call_count("agent.focus").await, 1);
         assert_eq!(runner.ran().len(), 1);
@@ -583,7 +704,7 @@ mod tests {
         let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
 
         let report = engine.focus_agent("w9:p9").await;
-        assert!(!report.herdr_focused);
+        assert!(!report.herdr_acted);
         assert!(!report.fully_succeeded());
         assert!(report.error.as_deref().unwrap().contains("pane not found"));
         assert!(
@@ -662,7 +783,7 @@ mod tests {
         let engine = engine_with(&mock, Backend::Unsupported, runner.clone()).await;
 
         let report = engine.focus_agent("w1:p1").await;
-        assert!(report.herdr_focused, "herdr focus must still work");
+        assert!(report.herdr_acted, "herdr focus must still work");
         assert!(
             !report.fully_succeeded(),
             "and we must not claim full success"
@@ -687,7 +808,7 @@ mod tests {
         );
 
         let report = engine.focus_agent("w1:p1").await;
-        assert!(report.herdr_focused);
+        assert!(report.herdr_acted);
         assert_eq!(report.raise, RaiseOutcome::Disabled);
         assert!(runner.ran().is_empty());
     }
@@ -779,7 +900,7 @@ mod tests {
         let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
 
         let report = engine.focus_agent("w1:p1").await;
-        assert!(report.herdr_focused);
+        assert!(report.herdr_acted);
         assert_eq!(report.raise, RaiseOutcome::NoClient);
         assert_eq!(
             report.verdict(),
@@ -851,24 +972,349 @@ mod tests {
         let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
         let engine = engine_with(&mock, Backend::Hyprland, runner).await;
 
-        for command in [
-            DeckCommand::FocusPane {
-                pane_id: "w1:p1".into(),
-            },
-            DeckCommand::FocusWorkspace {
-                workspace_id: "w2".into(),
-            },
-            DeckCommand::FocusTab {
-                tab_id: "w1:t2".into(),
-            },
-        ] {
+        for command in DeckCommand::every() {
             let report = engine.perform(&command).await;
             assert!(
-                report.herdr_focused,
+                report.herdr_acted,
                 "{} did not reach herdr: {report:?}",
                 command.name()
             );
         }
+    }
+
+    // --- Pane control ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn each_direction_key_sends_its_own_direction_and_nothing_else() {
+        // Four commands that differ only in one enum value: exactly where a copy-paste mistake
+        // hides, and exactly the mistake nobody would report as a bug — they would assume they had
+        // misremembered their own layout.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        for direction in herdr_deck_herdr::wire::PaneDirection::ALL {
+            engine
+                .perform(&DeckCommand::MovePaneFocus { direction })
+                .await;
+        }
+
+        assert_eq!(
+            mock.pane_move_directions().await,
+            vec!["left", "right", "up", "down"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stepping_between_panes_never_fetches_the_window() {
+        // These are pressed while sitting at the terminal doing the thing. Raising the window on
+        // every press would spend a round trip nobody asked for — and, on a desktop that cannot
+        // raise windows at all, would turn a working key into one that alerts every time.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        let report = engine
+            .perform(&DeckCommand::MovePaneFocus {
+                direction: herdr_deck_herdr::wire::PaneDirection::Left,
+            })
+            .await;
+
+        assert!(
+            runner.ran().is_empty(),
+            "no window should have been touched"
+        );
+        assert_eq!(report.raise, RaiseOutcome::NotNeeded);
+        assert!(
+            !report.verdict().is_error(),
+            "and not raising must not read as a shortfall"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaching_the_edge_of_a_layout_is_not_reported_as_a_failure() {
+        // herdr answers this as a success carrying a reason, and so must the deck. A thumb run
+        // along a row of direction keys ends at an edge every time; a key that alerted for it
+        // would teach its owner to stop reading alerts within a day.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.with_no_pane_that_way().await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::MovePaneFocus {
+                direction: herdr_deck_herdr::wire::PaneDirection::Up,
+            })
+            .await;
+
+        assert!(report.herdr_acted, "herdr answered; it did not refuse");
+        assert!(report.error.is_none());
+        assert_eq!(report.verdict(), FocusVerdict::Unchanged);
+        assert!(!report.verdict().is_error());
+        assert!(
+            report.describe().contains("no pane that way"),
+            "the log still deserves to know why nothing moved: {}",
+            report.describe()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zoom_that_was_already_as_asked_is_a_success_and_not_a_wasted_press() {
+        // The whole reason for stating the end state instead of toggling: press it twice and the
+        // second press is a no-op that says so, rather than an unzoom nobody wanted.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.with_zoom_already_as_asked().await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::ZoomPane {
+                zoom: herdr_deck_herdr::wire::ZoomMode::On,
+            })
+            .await;
+        assert_eq!(report.verdict(), FocusVerdict::Unchanged);
+        assert!(!report.verdict().is_error());
+        assert_eq!(mock.pane_zoom_modes().await, vec!["on"]);
+    }
+
+    #[tokio::test]
+    async fn splitting_right_and_splitting_down_arrive_at_herdr_as_different_things() {
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        for direction in herdr_deck_herdr::wire::SplitDirection::ALL {
+            engine.perform(&DeckCommand::SplitPane { direction }).await;
+        }
+        assert_eq!(mock.pane_split_directions().await, vec!["right", "down"]);
+    }
+
+    #[tokio::test]
+    async fn closing_a_pane_names_exactly_the_pane_it_was_given() {
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::ClosePane {
+                pane_id: "w2:p4".into(),
+            })
+            .await;
+        assert!(report.herdr_acted);
+        assert_eq!(mock.pane_close_ids().await, vec!["w2:p4".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_close_herdr_wants_confirmed_is_a_failure_that_says_where_the_question_went() {
+        // herdr has opened a modal the deck can neither answer nor dismiss. Reporting a bare
+        // failure would leave the user with a dialog they did not open and nothing connecting it
+        // to the key they pressed.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.with_a_close_herdr_wants_confirmed().await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::ClosePane {
+                pane_id: "w1:p1".into(),
+            })
+            .await;
+        assert!(!report.herdr_acted);
+        assert_eq!(report.verdict(), FocusVerdict::Failed);
+        assert!(
+            report.describe().contains("its own window"),
+            "got {}",
+            report.describe()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pane_command_reaches_herdr_as_exactly_one_call_and_drags_no_focus_along_with_it() {
+        // The same discipline as the focus path: herdr resolves "wherever I am" itself, and a
+        // helpful workspace or pane focus sent first would both cost a round trip and hand herdr
+        // a target the deck read some seconds ago.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::ZoomPane {
+                zoom: herdr_deck_herdr::wire::ZoomMode::Off,
+            })
+            .await;
+
+        assert_eq!(mock.pane_zoom_modes().await.len(), 1);
+        assert!(mock.agent_focus_targets().await.is_empty());
+        assert!(mock.workspace_focus_ids().await.is_empty());
+        assert!(mock.tab_focus_ids().await.is_empty());
+    }
+
+    // --- Structure ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opening_a_worktree_focuses_and_raises_exactly_as_focusing_an_agent_does() {
+        // This is the promise the worktree list is for: it is the same "get me there" motion, and
+        // half of getting there is the window. A worktree key that switched herdr and left the
+        // user staring at a browser would be the half-done outcome the whole crate exists to
+        // report loudly.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        let report = engine
+            .perform(&DeckCommand::OpenWorktree {
+                path: "/src/.worktrees/api/fix".into(),
+            })
+            .await;
+
+        assert!(report.fully_succeeded(), "{report:?}");
+        assert_eq!(
+            mock.worktree_open_paths().await,
+            vec!["/src/.worktrees/api/fix"]
+        );
+        assert_eq!(runner.ran().len(), 1, "the window has to come forward too");
+    }
+
+    #[tokio::test]
+    async fn making_something_never_fetches_the_window() {
+        // You are already at the terminal — you just asked it for a new tab. Raising would spend a
+        // round trip nobody asked for and, on a desktop that cannot raise windows at all, would
+        // turn every one of these into an alert about a failure that never happened.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let runner = FakeRunner::with(&[("hyprctl", RunResult::Success)]);
+        let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
+
+        for command in DeckCommand::every()
+            .into_iter()
+            .filter(|c| !c.raises_the_window())
+        {
+            let report = engine.perform(&command).await;
+            assert_eq!(
+                report.raise,
+                RaiseOutcome::NotNeeded,
+                "{} went looking for a window",
+                command.name()
+            );
+        }
+        assert!(runner.ran().is_empty());
+    }
+
+    #[tokio::test]
+    async fn applying_a_named_layout_makes_a_tab_and_never_touches_an_existing_one() {
+        // The single most dangerous thing in this step. With a tab id, `layout.apply` builds the
+        // replacement and then closes the tab it was given, killing every process in it — with no
+        // confirmation and nothing in its name to warn you. The client cannot express that; this
+        // is the test standing behind that decision from above.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::ApplyLayout {
+                preset: "dev".into(),
+                layout: herdr_deck_herdr::wire::LayoutPreset {
+                    label: Some("dev".into()),
+                    root: herdr_deck_herdr::wire::LayoutNode::default(),
+                },
+            })
+            .await;
+
+        let params = mock.observed_params("layout.apply").await.unwrap();
+        assert!(
+            params.get("tab_id").is_none(),
+            "a preset key must never target an existing tab: {params}"
+        );
+        assert_eq!(mock.tab_close_ids().await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn removing_a_worktree_is_never_forced_however_it_is_asked_for() {
+        // Forcing kills the workspace's agents *before* git runs, and then deletes uncommitted and
+        // untracked files. Unforced, git refuses a dirty checkout — and that refusal is the only
+        // confirmation prompt a device with no screen can offer.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::RemoveWorktree {
+                workspace_id: "w3".into(),
+            })
+            .await;
+
+        assert_eq!(mock.worktree_remove_ids().await, vec!["w3"]);
+        let params = mock.observed_params("worktree.remove").await.unwrap();
+        assert_eq!(params["force"], false, "got {params}");
+    }
+
+    #[tokio::test]
+    async fn git_refusing_to_remove_a_dirty_worktree_lands_on_the_key_and_is_not_swallowed() {
+        // The refusal *is* the safety mechanism. Reporting it as a success would leave somebody
+        // believing their worktree was gone when it is still there — and, worse, teach them that
+        // this key does not really work so they should force it somehow.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        mock.reply_error(
+            "worktree.remove",
+            "worktree_remove_failed",
+            "contains modified or untracked files, use --force to delete it",
+        )
+        .await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        let report = engine
+            .perform(&DeckCommand::RemoveWorktree {
+                workspace_id: "w3".into(),
+            })
+            .await;
+
+        assert!(report.verdict().is_error(), "{report:?}");
+        assert!(report.describe().contains("untracked"), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_preset_reaches_herdr_as_the_working_directory_and_label_it_names() {
+        // Presets are the only way any of this reaches herdr from a deck, so a preset that arrived
+        // stripped of its settings would look exactly like a key that works and quietly does the
+        // wrong thing.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine
+            .perform(&DeckCommand::CreateWorkspace {
+                preset: Some("notes".into()),
+                spec: herdr_deck_herdr::wire::CreateSpec {
+                    label: Some("notes".into()),
+                    cwd: Some("/home/dev/notes".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let params = mock.observed_params("workspace.create").await.unwrap();
+        assert_eq!(params["label"], "notes");
+        assert_eq!(params["cwd"], "/home/dev/notes");
+    }
+
+    #[tokio::test]
+    async fn a_structural_command_reaches_herdr_as_one_call_and_drags_no_focus_with_it() {
+        // Same discipline as everywhere else: herdr resolves "where I am" itself, and a helpful
+        // workspace focus sent first would cost a round trip and hand herdr a target the deck read
+        // seconds ago.
+        let mock = MockHerdr::start().await;
+        mock.serve_session(&SessionSnapshot::default()).await;
+        let engine = engine_with(&mock, Backend::Hyprland, FakeRunner::default()).await;
+
+        engine.perform(&DeckCommand::CreateWorktree).await;
+
+        assert_eq!(mock.call_count("worktree.create").await, 1);
+        assert!(mock.agent_focus_targets().await.is_empty());
+        assert!(mock.workspace_focus_ids().await.is_empty());
+        assert!(mock.tab_focus_ids().await.is_empty());
     }
 
     #[tokio::test]
@@ -881,7 +1327,7 @@ mod tests {
         let engine = engine_with(&mock, Backend::Hyprland, runner.clone()).await;
 
         let report = engine.focus_tab("w1:t2").await;
-        assert!(report.herdr_focused);
+        assert!(report.herdr_acted);
         assert!(report.fully_succeeded());
         assert_eq!(mock.tab_focus_ids().await, vec!["w1:t2".to_string()]);
         assert_eq!(runner.ran().len(), 1, "the window must still be raised");

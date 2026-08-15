@@ -14,20 +14,24 @@ written still gets a working layout.
 
 | Situation | What happens |
 |---|---|
-| Dials present | Scrubbing lives on the dials; every key shows an agent. |
-| No dials, many keys | No scrubbing needed — more agents are visible at once. |
-| No dials, few keys | Paging keys appear so every agent stays reachable. |
+| Dials present | Scrubbing lives on the dials; every other key shows the current page. |
+| No dials, many keys | Paging keys appear so a page longer than the deck stays reachable. |
+| No dials, few keys | The same, and the deck keeps as many keys for the page as it can. |
+| 24 keys or more | Whole [control families](../reference/control-families.md) get keys of their own instead of being reached by paging. |
+| No paging keys, a page that overruns | The last key becomes `more 1/2`, but only on the page that needs it. |
 | No displays at all (Pedal) | Nothing is drawn; the keys still act. |
 
-Fixed controls are also never allowed to crowd out the agents they navigate: on a small deck,
-herdr-deck drops paging before it drops agent slots.
+Two things are never allowed to be crowded out. Fixed controls never take more than half the deck,
+so the agents they navigate keep the larger share. And every deck that can leave the agents page
+keeps the key that comes back to it — see
+[pages](../getting-started/default-layout.md#the-two-keys-that-are-on-every-page).
 
 ## Supported models
 
 | Model | Keys | Dials | Notes |
 |---|---|---|---|
 | Stream Deck + | 8 (4×2) | 4 | Touchstrip, 120px keys. The best fit. |
-| Stream Deck XL | 32 (8×4) | — | 96px keys. |
+| Stream Deck XL | 32 (8×4) | — | 96px keys. Two rows of agents, two rows of controls. |
 | Stream Deck / MK.2 | 15 (5×3) | — | 72px keys. |
 | Stream Deck Neo | 8 (4×2) | — | 96px keys. |
 | Stream Deck Mini | 6 (3×2) | — | 80px keys. |

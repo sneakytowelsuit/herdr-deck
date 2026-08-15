@@ -26,10 +26,10 @@
 //! viewer, not just `git diff --stat` — before committing; `UPDATE_GOLDEN` will happily "fix" a
 //! genuine regression by baking it in as the new expectation.
 
-use herdr_deck_core::render::{Tile, TileRenderer};
+use herdr_deck_core::render::{KeyGlyph, Tile, TileRenderer};
 use herdr_deck_core::state::WaitBucket;
 use herdr_deck_core::theme::Theme;
-use herdr_deck_herdr::wire::AgentStatus;
+use herdr_deck_herdr::wire::{AgentStatus, PaneDirection};
 use std::path::PathBuf;
 
 fn renderer() -> TileRenderer {
@@ -219,32 +219,160 @@ fn a_focused_workspace_tile_pins_its_layout_without_a_sublabel_or_footer() {
 
 #[test]
 fn attention_with_agents_waiting_pins_the_alert_palette() {
-    let tile = Tile::Attention { count: 3 };
+    let tile = Tile::Attention {
+        count: 3,
+        away: false,
+    };
     assert_key_matches_golden("attention_waiting", &tile, 120);
 }
 
 #[test]
 fn attention_with_nothing_waiting_pins_the_all_clear_palette() {
-    let tile = Tile::Attention { count: 0 };
+    let tile = Tile::Attention {
+        count: 0,
+        away: false,
+    };
     assert_key_matches_golden("attention_all_clear", &tile, 120);
 }
 
 #[test]
-fn an_active_mode_tile_pins_its_underline_indicator() {
-    let tile = Tile::Mode {
-        label: "agents".into(),
-        active: true,
+fn the_attention_key_pins_the_way_home_it_offers_from_another_page() {
+    // The one time a quiet queue has something to say: you are not on the agents page, and this
+    // key is how you get back. A tile that still read "all clear" here would leave the way home
+    // undiscoverable on exactly the pages you need it from.
+    let tile = Tile::Attention {
+        count: 0,
+        away: true,
     };
-    assert_key_matches_golden("mode_active", &tile, 120);
+    assert_key_matches_golden("attention_away", &tile, 120);
 }
 
 #[test]
-fn an_inactive_mode_tile_pins_the_dimmed_look_with_no_indicator() {
-    let tile = Tile::Mode {
+fn the_page_key_pins_where_you_are_above_where_the_next_press_goes() {
+    // The size difference is the whole design: the page you are on is glanced at constantly, and
+    // the page you are going to is read once. If a regression ever levels them, this catches it.
+    let tile = Tile::Page {
+        current: "panes".into(),
+        next: Some("make".into()),
+        screen: None,
+    };
+    assert_key_matches_golden("page_key", &tile, 120);
+}
+
+#[test]
+fn a_page_with_more_than_one_screen_pins_the_counter_in_the_marker_corner() {
+    // Same corner and size as an agent tile's wait marker and a command tile's hold marker —
+    // one place the eye goes for "there is more to this key than its face".
+    let tile = Tile::Page {
+        current: "agents".into(),
+        next: Some("spaces".into()),
+        screen: Some((2, 3)),
+    };
+    assert_key_matches_golden("page_key_screen_2_of_3", &tile, 120);
+}
+
+#[test]
+fn a_page_key_with_nowhere_to_go_pins_the_face_that_promises_nothing() {
+    let tile = Tile::Page {
+        current: "agents".into(),
+        next: None,
+        screen: None,
+    };
+    assert_key_matches_golden("page_key_alone", &tile, 120);
+}
+
+#[test]
+fn an_active_label_key_pins_its_underline_indicator() {
+    let tile = Tile::Label {
+        label: "agents".into(),
+        active: true,
+    };
+    assert_key_matches_golden("label_active", &tile, 120);
+}
+
+#[test]
+fn an_inactive_label_key_pins_the_dimmed_look_with_no_indicator() {
+    let tile = Tile::Label {
         label: "agents".into(),
         active: false,
     };
-    assert_key_matches_golden("mode_inactive", &tile, 120);
+    assert_key_matches_golden("label_inactive", &tile, 120);
+}
+
+// --- Pane control -----------------------------------------------------------------------------
+//
+// These keys are pressed by feel, in a block, without being read — so what the fixtures are
+// guarding is the *silhouette*: an arrow that reads as an arrow, a filled half that says which
+// side the new pane lands on, a cross that could not be mistaken for a grid. They are drawn from
+// geometry rather than typeset, so nothing here depends on the font having a square with its
+// bottom half filled; what it does depend on is a set of fractions that were chosen by looking at
+// the result, which is exactly what a fixture is for. Rendered at 72px, the smallest deck we
+// support and the size where a shape one notch too large turns into a smudge.
+
+#[test]
+fn a_direction_key_pins_the_arrow_it_is_meant_to_be_read_by() {
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Arrow(PaneDirection::Left),
+        label: "left".into(),
+        hold: false,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_arrow_left_72", &tile, 72);
+}
+
+#[test]
+fn a_split_key_pins_which_half_of_the_tab_the_new_pane_takes() {
+    let tile = Tile::Command {
+        glyph: KeyGlyph::SplitDown,
+        label: "split down".into(),
+        hold: false,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_split_down_120", &tile, 120);
+}
+
+#[test]
+fn the_two_zoom_keys_pin_shapes_that_could_not_be_confused_for_each_other() {
+    // They sit side by side and mean opposite things, so "one is filled and one is not" has to be
+    // legible from an angle, at arm's length, without reading either caption.
+    for (glyph, label, name) in [
+        (KeyGlyph::ZoomIn, "zoom", "command_zoom_in_120"),
+        (KeyGlyph::ZoomOut, "unzoom", "command_zoom_out_120"),
+    ] {
+        let tile = Tile::Command {
+            glyph,
+            label: label.into(),
+            hold: false,
+            enabled: true,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn a_guarded_key_pins_the_word_that_says_a_tap_will_not_do_it() {
+    // The whole point of the guard being visible. This fixture is the only place anyone can check
+    // that "hold" is legible without crowding the shape it sits above.
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Close,
+        label: "close".into(),
+        hold: true,
+        enabled: true,
+    };
+    assert_key_matches_golden("command_close_hold_120", &tile, 120);
+}
+
+#[test]
+fn a_command_key_with_nothing_to_act_on_pins_the_dimmed_look_it_degrades_to() {
+    // herdr reports no focused pane, so the key cannot do its job — and says so by going dim
+    // rather than by disappearing and taking its neighbours' positions with it.
+    let tile = Tile::Command {
+        glyph: KeyGlyph::Close,
+        label: "close".into(),
+        hold: true,
+        enabled: false,
+    };
+    assert_key_matches_golden("command_close_disabled_120", &tile, 120);
 }
 
 #[test]
@@ -400,4 +528,72 @@ fn an_agent_name_with_xml_metacharacters_pins_correctly_escaped_output() {
         waiting: None,
     };
     assert_key_matches_golden("agent_xml_metacharacters", &tile, 120);
+}
+
+// --- Structure ---------------------------------------------------------------------------------
+
+#[test]
+fn every_structural_key_pins_a_silhouette_that_says_what_it_makes_or_unmakes() {
+    // Six keys that could sit in one block on a large deck. Each pairs a base shape — a tab, a
+    // stack of tabs, a divided pane, a git fork — with either a plus or a cross, so "one more of
+    // these" and "this one goes away" read the same way wherever they appear. These fixtures are
+    // where a change that makes two of them look alike gets caught.
+    for (glyph, label, name) in [
+        (KeyGlyph::NewTab, "new tab", "command_new_tab_120"),
+        (KeyGlyph::CloseTab, "close tab", "command_close_tab_120"),
+        (
+            KeyGlyph::NewWorkspace,
+            "new space",
+            "command_new_workspace_120",
+        ),
+        (KeyGlyph::Layout, "dev", "command_layout_120"),
+        (
+            KeyGlyph::NewWorktree,
+            "new tree",
+            "command_new_worktree_120",
+        ),
+        (
+            KeyGlyph::RemoveWorktree,
+            "remove",
+            "command_remove_worktree_120",
+        ),
+    ] {
+        let tile = Tile::Command {
+            glyph,
+            label: label.into(),
+            // The two destructive ones wear the guard, exactly as they do on a real deck.
+            hold: matches!(glyph, KeyGlyph::CloseTab | KeyGlyph::RemoveWorktree),
+            enabled: true,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn a_worktree_tile_pins_the_difference_between_one_herdr_holds_and_one_it_does_not() {
+    // Filled circle against hollow, and two different greys behind them. The shape is the signal
+    // that survives a washed-out LCD seen off-axis; the colour is only the second one. This is the
+    // fixture that proves the two are actually distinguishable rather than merely different.
+    for (open, name) in [
+        (true, "worktree_open_120"),
+        (false, "worktree_not_open_120"),
+    ] {
+        let tile = Tile::Worktree {
+            label: "fix-auth".into(),
+            open,
+            focused: false,
+        };
+        assert_key_matches_golden(name, &tile, 120);
+    }
+}
+
+#[test]
+fn the_worktree_you_are_actually_in_pins_the_same_ring_a_focused_agent_wears() {
+    // One ring, one meaning, wherever it appears: herdr is on this thing right now.
+    let tile = Tile::Worktree {
+        label: "fix-auth".into(),
+        open: true,
+        focused: true,
+    };
+    assert_key_matches_golden("worktree_focused_120", &tile, 120);
 }

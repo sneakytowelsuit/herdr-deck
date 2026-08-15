@@ -90,6 +90,31 @@ impl Theme {
         }
     }
 
+    /// A git worktree, drawn by whether herdr already has it open.
+    ///
+    /// Filled circle for open, hollow for not — a difference in *shape*, so the two are told apart
+    /// on a washed-out LCD seen off-axis and by someone who cannot tell the two greys apart. The
+    /// colours differ as well, but only as the second signal.
+    pub fn worktree(self, open: bool) -> StatusStyle {
+        if open {
+            StatusStyle {
+                background: "#16181D",
+                foreground: "#E6E8EC",
+                accent: "#7FBF7F",
+                glyph: "●",
+                emphatic: false,
+            }
+        } else {
+            StatusStyle {
+                background: "#131418",
+                foreground: "#8A8F99",
+                accent: "#5A6A5A",
+                glyph: "○",
+                emphatic: false,
+            }
+        }
+    }
+
     /// Background for tiles that are not showing an agent.
     pub fn neutral_background(self) -> &'static str {
         "#0E0F12"
