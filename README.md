@@ -27,7 +27,7 @@ running.*
 
 ```sh
 herdr plugin install sneakytowelsuit/herdr-deck --yes
-herdr plugin action sneakytowelsuit.herdr-deck install
+herdr plugin action invoke install --plugin sneakytowelsuit.herdr-deck
 herdr-deck doctor
 ```
 

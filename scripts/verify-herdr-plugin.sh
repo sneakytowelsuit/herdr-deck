@@ -78,6 +78,45 @@ for action in plugin["actions"]:
 print(f"  {len(registered)} actions: {' '.join(sorted(registered))}")
 PY
 
+echo "==> the commands we tell people to run are commands herdr understands"
+# The install guide shipped `herdr plugin action <plugin-id> install`. herdr's dispatcher only
+# knows `list` and `invoke`, so anything else prints the help text and exits — doing nothing,
+# quietly enough to look like it worked. A user hit this during a real install. Prose is not
+# checked by anything, so it is checked here.
+python3 - "$repo_root" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+docs = list((root / "docs" / "src").rglob("*.md")) + [root / "README.md"]
+
+ids = set(re.findall(r'^id = "([^"]+)"', (root / "herdr-plugin.toml").read_text(), re.M))
+ids.discard("sneakytowelsuit.herdr-deck")
+
+problems = []
+for path in docs:
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.strip()
+        if not stripped.startswith("herdr plugin action"):
+            continue
+        words = stripped.split()
+        verb = words[3] if len(words) > 3 else ""
+        where = f"{path.relative_to(root)}:{n}"
+        if verb not in ("list", "invoke"):
+            problems.append(f"{where}: `{verb or '(nothing)'}` — herdr only knows `list` and `invoke`")
+        elif verb == "invoke":
+            action = words[4] if len(words) > 4 else ""
+            bare = action.rsplit(".", 1)[-1]
+            if bare not in ids:
+                problems.append(f"{where}: invokes `{action}`, which herdr-plugin.toml does not define")
+
+if problems:
+    print("documented commands herdr would reject:")
+    for p in problems:
+        print("  " + p)
+    raise SystemExit(1)
+print("  every documented `herdr plugin action` command is well formed")
+PY
+
 echo "==> the check can actually fail (negative control)"
 # A gate that passes unconditionally is worse than no gate, because it reads as coverage. Feed
 # herdr the exact bug that shipped and require it to reject it.
