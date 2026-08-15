@@ -14,11 +14,25 @@ The easiest route, since herdr builds and registers it for you:
 
 ```sh
 herdr plugin install sneakytowelsuit/herdr-deck --yes
-herdr plugin action sneakytowelsuit.herdr-deck install
+herdr plugin action invoke install --plugin sneakytowelsuit.herdr-deck
 ```
 
 The second command writes the service unit and starts the daemon. Then follow the
 platform-specific step below.
+
+`invoke` is not optional: `herdr plugin action <something>` only understands `list` and `invoke`,
+and anything else prints the help text and exits without doing a thing — quietly enough to look
+like it worked. The other actions are reached the same way, and `herdr plugin action list` shows
+them all:
+
+```sh
+herdr plugin action invoke status  --plugin sneakytowelsuit.herdr-deck
+herdr plugin action invoke restart --plugin sneakytowelsuit.herdr-deck
+herdr plugin action invoke doctor  --plugin sneakytowelsuit.herdr-deck
+```
+
+`--plugin` can be dropped when no other installed plugin defines an action of the same name, but
+`install` and `status` are common words; naming the plugin costs nothing and never surprises you.
 
 ## From source
 
