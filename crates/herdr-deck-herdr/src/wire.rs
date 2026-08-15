@@ -215,6 +215,17 @@ pub struct PaneInfo {
 /// herdr's documented pattern is: read this once, then subscribe to events and keep a local
 /// cache. We additionally re-read it on a slow timer and after every reconnect — see
 /// [`crate::client`] for why.
+/// The envelope `session.snapshot` actually returns.
+///
+/// Note the absence of `#[serde(default)]`: a missing `snapshot` key must be a hard error. This
+/// type exists because the tolerance that is right for *fields* is wrong for *shape* — a snapshot
+/// parsed one level too high silently became an empty one, and an empty snapshot is
+/// indistinguishable from a herdr with nothing running.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSnapshotResult {
+    pub snapshot: SessionSnapshot,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     #[serde(default)]
