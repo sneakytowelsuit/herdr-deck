@@ -16,11 +16,22 @@ is replaced, the agent goes with it.
 ## What lands on a key
 
 By default, keys show **agents**, because an agent is the thing that can need you. Pressing the
-mode toggle switches the deck to **workspaces**, which is the level you navigate at.
+page key switches the deck to **workspaces**, which is the level you navigate at.
 
-herdr-deck does not model tabs or panes as key targets — dial 3 scrubs tabs and pressing it
-focuses the tab you landed on, and that has been enough. Sessions are not modelled either: the
-daemon talks to one herdr session, chosen with `--session` or `herdr_session` in config.
+There is a third list that is not in that tree at all: **worktrees**. A git worktree is a checkout
+on disk, and herdr opens one as a workspace — so it sits *outside* the nesting above, and the only
+way to see the ones you have not opened yet is to ask git. The page key reaches them as another
+stop, but only for sessions that have any; see
+[the default layout](../getting-started/default-layout.md#worktrees-when-you-have-them).
+
+Two further pages hold *commands* rather than a list — pane control, and the things that make a
+pane, tab, workspace or worktree. Those are the level below and the level around, and neither is
+a list of anything herdr could hand you: see
+[control families](../reference/control-families.md).
+
+herdr-deck does not model tabs as key targets — dial 3 scrubs tabs and pressing it focuses the tab
+you landed on, and that has been enough. Sessions are not modelled either: the daemon talks to one
+herdr session, chosen with `--session` or `herdr_session` in config.
 
 ## Why keys bind to `terminal_id`
 

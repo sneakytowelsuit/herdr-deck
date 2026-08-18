@@ -27,7 +27,9 @@ pub mod mock;
 pub use client::HerdrClient;
 pub use events::{EventStream, HerdrEvent};
 pub use socket::SocketPath;
-pub use wire::{AgentInfo, AgentStatus, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo};
+pub use wire::{
+    AgentInfo, AgentStatus, PaneInfo, SessionSnapshot, TabInfo, WorkspaceInfo, WorktreeInfo,
+};
 
 /// The herdr socket protocol version this crate was written against.
 ///
@@ -58,6 +60,17 @@ pub enum HerdrError {
         code: String,
         message: String,
     },
+
+    /// herdr wants the user to confirm, and has opened its own dialog to ask them.
+    ///
+    /// Told apart from a plain [`HerdrError::Rpc`] because the two need different words on a key.
+    /// An ordinary refusal means nothing happened and nothing is waiting; this one means herdr is
+    /// now sitting in a modal the user did not open and the deck has no way to answer or dismiss.
+    /// The only honest thing a key can do is say where the question went.
+    #[error(
+        "herdr is asking you to confirm this in its own window — the deck cannot answer for you"
+    )]
+    ConfirmationRequired { method: String },
 
     #[error("could not parse herdr's response to `{method}`: {source}")]
     Decode {

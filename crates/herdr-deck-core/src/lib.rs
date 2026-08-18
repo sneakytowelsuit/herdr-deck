@@ -19,7 +19,7 @@ pub use capabilities::{DeckCapabilities, DeckModel, TouchStrip};
 pub use command::DeckCommand;
 pub use config::Config;
 pub use layout::{
-    DialBinding, KeyBinding, Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction,
+    DialBinding, KeyBinding, Page, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction,
 };
 pub use protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 pub use render::{Tile, TileRenderer};

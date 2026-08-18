@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use herdr_deck_core::capabilities::DeckCapabilities;
 use herdr_deck_core::command::DeckCommand;
-use herdr_deck_core::layout::{Mode, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
+use herdr_deck_core::layout::{Page, Profile, ResolvedDeck, ScrubTarget, Selection, SlotAction};
 use herdr_deck_core::protocol::{DaemonMessage, DeviceReport, FrontendMessage, FRONTEND_PROTOCOL};
 use herdr_deck_core::render::{Tile, TileRenderer};
 use herdr_deck_core::state::{Acknowledged, DeckState};
@@ -76,8 +76,8 @@ pub struct Session {
     capabilities: DeckCapabilities,
     profile: Profile,
     renderer: Arc<TileRenderer>,
-    mode: Mode,
-    page: usize,
+    page: Page,
+    screen: usize,
     selection: Selection,
     /// Hash of what we last sent for each key, so a reconcile that changes nothing sends
     /// nothing. Without this the deck would be repainted on every timer tick.
@@ -100,32 +100,15 @@ impl Session {
     /// Build a session from a frontend's `hello`.
     pub fn new(device: &DeviceReport, config: &Config, renderer: Arc<TileRenderer>) -> Self {
         let capabilities = device.to_capabilities();
-        let profile = match &config.layout {
-            // A hand-written layout is used verbatim, but never allowed to be shorter than the
-            // hardware — unbound trailing keys are explicitly empty rather than out of range.
-            Some(override_layout) if !override_layout.keys.is_empty() => {
-                let mut keys = override_layout.keys.clone();
-                keys.resize(
-                    capabilities.key_count(),
-                    herdr_deck_core::layout::KeyBinding::Empty,
-                );
-                let mut dials = override_layout.dials.clone();
-                dials.resize(
-                    capabilities.dials as usize,
-                    herdr_deck_core::layout::DialBinding::Unused,
-                );
-                Profile { keys, dials }
-            }
-            _ => Profile::for_capabilities(&capabilities),
-        };
+        let profile = Profile::for_config(&capabilities, config);
         let key_count = profile.keys.len();
         let dial_count = profile.dials.len();
         Self {
             capabilities,
             profile,
             renderer,
-            mode: Mode::default(),
-            page: 0,
+            page: Page::default(),
+            screen: 0,
             selection: Selection::default(),
             sent_keys: vec![None; key_count],
             sent_dials: vec![None; dial_count],
@@ -231,8 +214,8 @@ impl Session {
         ResolvedDeck::new(
             &self.profile,
             state,
-            self.mode,
             self.page,
+            self.screen,
             self.selection,
             &self.acked,
         )
@@ -315,16 +298,47 @@ impl Session {
                 }
             }
 
-            SlotAction::ToggleMode => {
-                self.mode = self.mode.toggled();
-                self.page = 0;
+            // One press, one intention: come home, and bring the agent that wants you with it.
+            //
+            // Both halves happen here rather than in two actions because they are two halves of
+            // one promise — that wherever you have wandered on this deck, the thing asking for
+            // you is one press away. Splitting it would make that promise cost two.
+            SlotAction::Attention { terminal_id } => {
+                let messages = self.go_home(state);
+                let Some(terminal_id) = terminal_id else {
+                    // Nothing is asking. The press was purely a way back, and on the agents page
+                    // with a clear queue it was not even that.
+                    return Outcome::just(messages);
+                };
+                match state.agent_by_terminal_id(&terminal_id) {
+                    Some(agent) => Outcome {
+                        messages,
+                        action: Some(PendingAction {
+                            command: DeckCommand::FocusPane {
+                                pane_id: agent.pane_id.clone(),
+                            },
+                            key,
+                        }),
+                    },
+                    None => Outcome::just([messages, alert(key, "that agent is gone")].concat()),
+                }
+            }
+
+            SlotAction::NextPage => {
+                // Asked of the resolved deck rather than of the page, because where the cycle
+                // goes next depends on what herdr currently holds and on what this hardware is
+                // already showing: a session with no worktrees has no worktree page, and a deck
+                // wide enough to show pane control permanently has no reason to stop at it.
+                let next = self.resolved(state).next_page();
+                self.page = next;
+                self.screen = 0;
                 Outcome::just(self.repaint(state))
             }
 
-            SlotAction::ChangePage { delta } => {
-                let pages = self.resolved(state).page_count();
-                let next = (self.page as i64 + delta as i64).rem_euclid(pages as i64) as usize;
-                self.page = next;
+            SlotAction::ChangeScreen { delta } => {
+                let screens = self.resolved(state).screen_count();
+                let next = (self.screen as i64 + delta as i64).rem_euclid(screens as i64) as usize;
+                self.screen = next;
                 Outcome::just(self.repaint(state))
             }
 
@@ -340,6 +354,16 @@ impl Session {
         self.resolved(state).scrub_len(target)
     }
 
+    /// Put the deck back on the top of the agents page, repainting only if that moved it.
+    fn go_home(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
+        if self.page == Page::Agents && self.screen == 0 {
+            return vec![];
+        }
+        self.page = Page::Agents;
+        self.screen = 0;
+        self.repaint(state)
+    }
+
     /// Repaint, sending only what changed.
     pub fn repaint(&mut self, state: &DeckState) -> Vec<DaemonMessage> {
         // An acknowledgement whose agent moved on can never match again, so drop it here rather
@@ -347,11 +371,11 @@ impl Session {
         self.acked.forget_stale(state);
 
         // Keep cursors valid: agents come and go underneath us constantly.
-        let (agents, workspaces, tabs, attention) = self.resolved(state).list_lengths();
-        self.selection.clamp(agents, workspaces, tabs, attention);
-        let pages = self.resolved(state).page_count();
-        if self.page >= pages {
-            self.page = pages - 1;
+        let lengths = self.resolved(state).list_lengths();
+        self.selection.clamp(lengths);
+        let screens = self.resolved(state).screen_count();
+        if self.screen >= screens {
+            self.screen = screens - 1;
         }
 
         let mut messages = Vec::new();
@@ -716,10 +740,10 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::NextAttention)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::Attention)
             .expect("this profile has an attention key");
         match session.tile_at(index, state) {
-            Tile::Attention { count } => count,
+            Tile::Attention { count, .. } => count,
             other => panic!("expected the attention tile, got {other:?}"),
         }
     }
@@ -1073,7 +1097,7 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
 
         let outcome = session.handle(
@@ -1099,7 +1123,7 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
 
         let now = Instant::now();
@@ -1186,11 +1210,126 @@ mod tests {
             .profile()
             .keys
             .iter()
-            .position(|k| *k == herdr_deck_core::layout::KeyBinding::ModeToggle)
+            .position(|k| *k == herdr_deck_core::layout::KeyBinding::PageCycle)
             .unwrap();
         let outcome = send(&mut session, FrontendMessage::KeyDown { index: toggle }, &s);
-        assert!(!outcome.messages.is_empty(), "mode change must repaint");
+        assert!(!outcome.messages.is_empty(), "a page change must repaint");
         assert!(matches!(session.tile_at(0, &s), Tile::Workspace { .. }));
+    }
+
+    /// The state the page tests run against: one blocked agent and the workspace it lives in, so
+    /// both list pages have something on them.
+    fn a_session_worth_paging() -> DeckState {
+        let mut s = state(vec![agent("stuck", AgentStatus::Blocked, 1)]);
+        s.workspaces = vec![WorkspaceInfo {
+            workspace_id: "w1".into(),
+            label: Some("api".into()),
+            ..Default::default()
+        }];
+        s
+    }
+
+    fn key_bound_to(session: &Session, binding: herdr_deck_core::layout::KeyBinding) -> usize {
+        session
+            .profile()
+            .keys
+            .iter()
+            .position(|key| *key == binding)
+            .expect("this deck has that key")
+    }
+
+    #[test]
+    fn the_page_key_walks_every_page_and_comes_back_to_the_agents() {
+        // Four presses on a Plus with no worktrees: spaces, panes, make, and home again. The cycle
+        // has to close, or the deck has a page you can walk into and not out of.
+        let mut session = session();
+        let s = a_session_worth_paging();
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+
+        let mut walked = Vec::new();
+        for _ in 0..4 {
+            send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+            match session.tile_at(cycle, &s) {
+                Tile::Page { current, .. } => walked.push(current),
+                other => panic!("expected the page key, got {other:?}"),
+            }
+        }
+        assert_eq!(walked, vec!["spaces", "panes", "make", "agents"]);
+    }
+
+    #[test]
+    fn the_attention_key_brings_the_deck_home_from_a_command_page_and_takes_you_to_the_agent() {
+        // The promise: one press, from anywhere, and you are both looking at the agent that wants
+        // you and back on the page that lists them. Two presses would be a worse deck than the one
+        // that had no pane control at all.
+        let mut session = session();
+        let s = a_session_worth_paging();
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+        let home = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::Attention);
+
+        // Walk to the panes page, two stops away.
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        assert!(matches!(session.tile_at(0, &s), Tile::Command { .. }));
+
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: home }, &s);
+        assert_eq!(
+            outcome.action,
+            Some(focus_pane("w1:pane-stuck", Some(home))),
+            "the press has to reach herdr, not merely change the page"
+        );
+        assert!(!outcome.messages.is_empty(), "coming home must repaint");
+        assert!(
+            matches!(session.tile_at(0, &s), Tile::Agent { .. }),
+            "and the deck must be showing the agents again"
+        );
+    }
+
+    #[test]
+    fn the_attention_key_still_comes_home_when_nothing_is_asking_for_you() {
+        // A calm queue is the case where the key is *only* a way back, and it has to keep working
+        // — otherwise the way home stops existing exactly when the deck is quiet enough to wander.
+        let mut session = session();
+        let s = state(vec![agent("calm", AgentStatus::Idle, 1)]);
+        session.greet(&s);
+        let cycle = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::PageCycle);
+        let home = key_bound_to(&session, herdr_deck_core::layout::KeyBinding::Attention);
+
+        send(&mut session, FrontendMessage::KeyDown { index: cycle }, &s);
+        let outcome = send(&mut session, FrontendMessage::KeyDown { index: home }, &s);
+        assert!(outcome.action.is_none(), "there is nothing to focus");
+        assert!(
+            !outcome.messages.is_empty(),
+            "but the deck still comes home"
+        );
+        assert!(matches!(session.tile_at(0, &s), Tile::Agent { .. }));
+    }
+
+    #[test]
+    fn a_page_longer_than_the_keys_grows_a_more_key_rather_than_hiding_the_rest() {
+        // A Plus has six following keys and its dials scrub lists, not command pages — so a page
+        // that overruns has to say so on a key. Showing six of nine and going quiet about the
+        // other three is the one thing this deck is never allowed to do.
+        let mut session = session();
+        let agents: Vec<_> = (0..9)
+            .map(|i| agent(&format!("a{i}"), AgentStatus::Idle, 0))
+            .collect();
+        let s = state(agents);
+        session.greet(&s);
+
+        // The last following key is the one that carries the rest.
+        let more = 5;
+        match session.tile_at(more, &s) {
+            Tile::Label { label, .. } => assert_eq!(label, "more 1/2"),
+            other => panic!("expected a more key, got {other:?}"),
+        }
+        send(&mut session, FrontendMessage::KeyDown { index: more }, &s);
+        match session.tile_at(0, &s) {
+            Tile::Agent { label, .. } => assert_eq!(label, "a5"),
+            other => panic!("expected the sixth agent, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1377,7 +1516,7 @@ mod tests {
     fn a_hand_written_layout_is_padded_to_the_hardware_rather_than_leaving_keys_out_of_range() {
         let mut config = Config::default();
         config.layout = Some(herdr_deck_core::config::LayoutOverride {
-            keys: vec![herdr_deck_core::layout::KeyBinding::NextAttention],
+            keys: vec![herdr_deck_core::layout::KeyBinding::Attention],
             dials: vec![],
         });
         let session = Session::new(&plus_device(), &config, renderer());
@@ -1435,6 +1574,99 @@ mod tests {
                 key: Some(0)
             })
         );
+    }
+
+    // --- Pane control, and the gesture that guards the destructive half of it ------------------
+    //
+    // The two halves of the hold are tested apart elsewhere — the guard in `layout.rs`, the tap
+    // and hold timing in the acknowledge tests above. These drive both halves through a real
+    // Session, which is the only place they meet.
+
+    /// A deck laid out by hand: one pane arrow, one close key, and a focused pane to close.
+    fn pane_session() -> (Session, DeckState) {
+        let mut config = Config::default();
+        config.layout = Some(herdr_deck_core::config::LayoutOverride {
+            keys: vec![
+                herdr_deck_core::layout::KeyBinding::Command {
+                    command: DeckCommand::MovePaneFocus {
+                        direction: herdr_deck_herdr::wire::PaneDirection::Left,
+                    },
+                },
+                herdr_deck_core::layout::KeyBinding::ClosePane,
+            ],
+            dials: vec![],
+        });
+        let mut s = state(vec![]);
+        s.focused_pane_id = Some("w1:p3".into());
+        (Session::new(&plus_device(), &config, renderer()), s)
+    }
+
+    #[test]
+    fn a_pane_key_acts_the_instant_it_goes_down_because_nothing_about_it_is_ambiguous() {
+        // Muscle memory is the whole reason these keys exist. A direction key that did nothing
+        // until you let go would feel broken, and would be useless for the one thing it is for —
+        // pressing it four times in a row without looking.
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        let pressed = session.handle(FrontendMessage::KeyDown { index: 0 }, &s, Instant::now());
+        assert_eq!(
+            pressed.action,
+            Some(PendingAction {
+                command: DeckCommand::MovePaneFocus {
+                    direction: herdr_deck_herdr::wire::PaneDirection::Left
+                },
+                key: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn tapping_the_close_key_refuses_on_its_face_and_issues_nothing() {
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        let outcome = tap(&mut session, 1, &s);
+        assert!(
+            outcome.action.is_none(),
+            "a tap must not reach herdr, got {:?}",
+            outcome.action
+        );
+        match outcome.messages.as_slice() {
+            [DaemonMessage::Alert { index, message }] => {
+                assert_eq!(*index, 1);
+                assert!(message.contains("hold"), "got {message}");
+            }
+            other => panic!("expected one alert naming the gesture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn holding_the_close_key_is_what_actually_asks_herdr_to_close_the_pane() {
+        // The other half of the bargain, through the same Session as the tap: guarding a command
+        // is only defensible if holding it still means it.
+        let (mut session, s) = pane_session();
+        session.greet(&s);
+
+        assert_eq!(
+            hold(&mut session, 1, &s).action,
+            Some(PendingAction {
+                command: DeckCommand::ClosePane {
+                    pane_id: "w1:p3".into()
+                },
+                key: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn a_close_key_with_nothing_focused_refuses_both_gestures_rather_than_picking_a_pane() {
+        let (mut session, _) = pane_session();
+        let nothing_focused = state(vec![]);
+        session.greet(&nothing_focused);
+
+        assert!(tap(&mut session, 1, &nothing_focused).action.is_none());
+        assert!(hold(&mut session, 1, &nothing_focused).action.is_none());
     }
 
     #[test]

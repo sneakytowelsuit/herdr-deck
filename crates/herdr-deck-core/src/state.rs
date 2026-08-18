@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use herdr_deck_herdr::wire::{AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo};
+use herdr_deck_herdr::wire::{
+    AgentInfo, AgentStatus, SessionSnapshot, TabInfo, WorkspaceInfo, WorktreeInfo,
+};
 
 /// A point-in-time view of every agent and workspace herdr knows about.
 #[derive(Debug, Clone, Default)]
@@ -15,7 +17,14 @@ pub struct DeckState {
     pub agents: Vec<AgentInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub tabs: Vec<TabInfo>,
+    /// The git worktrees of the repository the focused workspace belongs to.
+    ///
+    /// Not part of the snapshot: herdr answers this from a separate call that shells out to git,
+    /// so it arrives on its own schedule and is stitched on by whoever is doing the watching. Empty
+    /// is the honest answer for a session that is not in a repository at all.
+    pub worktrees: Vec<WorktreeInfo>,
     pub focused_workspace_id: Option<String>,
+    pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
     /// `None` until we have successfully talked to herdr at least once.
     pub protocol: Option<u32>,
@@ -39,7 +48,9 @@ impl DeckState {
             agents: snapshot.agents,
             workspaces: snapshot.workspaces,
             tabs: snapshot.tabs,
+            worktrees: Vec::new(),
             focused_workspace_id: snapshot.focused_workspace_id,
+            focused_tab_id: snapshot.focused_tab_id,
             focused_pane_id: snapshot.focused_pane_id,
             protocol: snapshot.protocol,
             offline_reason: None,
@@ -47,6 +58,29 @@ impl DeckState {
         };
         state.agents.sort_by(attention_order);
         state
+    }
+
+    /// Attach the worktree listing, keeping only the checkouts a key could actually open.
+    ///
+    /// herdr refuses bare and prunable entries, so showing them would put keys on the deck that
+    /// cannot work. Filtering here rather than at the tile means every count, cursor and key
+    /// agrees about how many worktrees there are.
+    pub fn with_worktrees(mut self, worktrees: Vec<WorktreeInfo>) -> Self {
+        self.worktrees = worktrees
+            .into_iter()
+            .filter(WorktreeInfo::openable)
+            .collect();
+        self
+    }
+
+    /// The linked worktree a workspace is open as, if it is one.
+    ///
+    /// The source checkout of a repository is deliberately excluded: herdr will not remove it, and
+    /// a key that offered to is a key that has to be pressed to be understood.
+    pub fn linked_worktree_of(&self, workspace_id: &str) -> Option<&WorktreeInfo> {
+        self.worktrees.iter().find(|tree| {
+            tree.is_linked_worktree && tree.open_workspace_id.as_deref() == Some(workspace_id)
+        })
     }
 
     /// Mark herdr unreachable, preserving nothing — a stale tile is worse than an honest one.

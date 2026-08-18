@@ -2,10 +2,10 @@
 //!
 //! # Why a physical control surface needs one
 //!
-//! A key is pressed by a hand, often the wrong hand, sometimes by an elbow. Everything the deck
-//! can currently do is a focus and takes nothing away, but the write surface is growing towards
-//! commands that close things, and "did I do that, or did herdr?" is a question the user is
-//! entitled to an answer to. One line per command, in the order they were issued.
+//! A key is pressed by a hand, often the wrong hand, sometimes by an elbow. Most of what the deck
+//! can do takes nothing away, but it can now close a pane — and the last pane of a tab takes the
+//! tab, and the last tab takes the workspace. "Did I do that, or did herdr?" is a question the
+//! user is entitled to an answer to. One line per command, in the order they were issued.
 //!
 //! # What is deliberately not in here
 //!
@@ -15,8 +15,11 @@
 //! deck asked herdr to *change*.
 //!
 //! Nothing the user or their agents wrote, either. A command names its target by id — `w1:p2`,
-//! `w2` — never by label, title or working directory. An audit trail that quoted those would be
-//! a file that had to be guarded like a secret instead of read like a log.
+//! `w2` — by a word from a closed set, such as `left`, or by the name of a config preset, which is
+//! a word the user chose for a *key*. Never by label, title or working directory: an audit trail
+//! that quoted those would be a file that had to be guarded like a secret instead of read like a
+//! log. A command whose only identifier is a path or a branch name records no target at all rather
+//! than bending that rule, and its own name still says what was done.
 //!
 //! # Never in the way
 //!
@@ -259,6 +262,60 @@ mod tests {
         text.lines()
             .map(|line| serde_json::from_str(line).expect("every audit line is valid JSON"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn every_command_leaves_a_line_naming_whatever_it_is_allowed_to_name() {
+        // Four direction keys share a name in the log and differ only by target, so a target left
+        // blank there would turn every arrow press into an indistinguishable line — and the trail
+        // exists precisely to answer "which key did I hit". The exceptions are the commands whose
+        // only identifier is a path or a branch out of the user's own repository: those record
+        // `null` deliberately rather than copying it to disk, and the command's own name is then
+        // the whole of the record.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.jsonl");
+        let log = AuditLog::open(path.clone());
+
+        for command in DeckCommand::every() {
+            log.record(&command, FocusVerdict::Complete);
+        }
+        log.flush().await;
+
+        let recorded = lines(&read(&path).await);
+        assert_eq!(recorded.len(), DeckCommand::every().len());
+        let anonymous: Vec<&str> = recorded
+            .iter()
+            .filter(|line| line["target"].is_null())
+            .map(|line| line["command"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(anonymous, vec!["open_worktree", "create_worktree"]);
+        for line in &recorded {
+            assert!(
+                line["target"].is_null() || line["target"].as_str().is_some_and(|t| !t.is_empty()),
+                "{line} recorded an empty target, which says less than recording none"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_press_that_found_nothing_to_do_is_told_apart_from_one_that_did_something() {
+        // Both are successes and both look identical on the key. The log is the only place the
+        // difference survives, and "I pressed left four times and only moved twice" is a question
+        // somebody is entitled to an answer to.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.jsonl");
+        let log = AuditLog::open(path.clone());
+
+        let left = DeckCommand::MovePaneFocus {
+            direction: herdr_deck_herdr::wire::PaneDirection::Left,
+        };
+        log.record(&left, FocusVerdict::Settled);
+        log.record(&left, FocusVerdict::Unchanged);
+        log.flush().await;
+
+        let recorded = lines(&read(&path).await);
+        assert_eq!(recorded[0]["outcome"], "settled");
+        assert_eq!(recorded[1]["outcome"], "unchanged");
     }
 
     #[tokio::test]

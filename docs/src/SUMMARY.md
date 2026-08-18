@@ -22,6 +22,7 @@
 
 # Reference
 
+- [Control families](./reference/control-families.md)
 - [Configuration](./reference/configuration.md)
 - [CLI](./reference/cli.md)
 - [Architecture](./reference/architecture.md)
