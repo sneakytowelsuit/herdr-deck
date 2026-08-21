@@ -121,10 +121,18 @@ function applyDaemonMessage(message: DaemonMessage): void {
 		}
 
 		case "set_dial_feedback": {
-			void dials.get(message.dial)?.setFeedback({
-				title: message.title,
-				value: message.value,
-			});
+			// Draw the daemon's own tile, exactly as keys do. Setting only title and value
+			// leaves the touchstrip on the stock layout — which is why it showed four red dots
+			// (our encoder icon) and nothing about herdr, on real hardware. The daemon renders
+			// a 200x100 segment per dial; `layouts/dial.json` is a single full-bleed pixmap so
+			// what arrives is what appears, and macOS and Linux stay identical by construction.
+			const dial = dials.get(message.dial);
+			if (message.png) {
+				void dial?.setFeedback({ canvas: `data:image/png;base64,${message.png}` });
+			} else {
+				// No strip to draw on — encoders without a touchstrip still get their words.
+				void dial?.setFeedback({ title: message.title, value: message.value });
+			}
 			break;
 		}
 

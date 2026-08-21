@@ -1,71 +1,76 @@
 {
-	"$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
-	"UUID": "com.sneakytowelsuit.herdr-deck",
-	"Name": "herdr-deck",
-	"Version": "0.1.0.0",
-	"Author": "SneakyTowelSuit",
-	"Description": "Shows the status of your herdr coding agents on the deck, and focuses a session when it needs input. Requires the herdr-deck daemon.",
-	"Category": "herdr-deck",
-	"CategoryIcon": "imgs/category",
-	"Icon": "imgs/plugin",
-	"URL": "https://sneakytowelsuit.github.io/herdr-deck/",
-	"CodePath": "bin/plugin.js",
-	"SDKVersion": 2,
-	"Software": {
-		"MinimumVersion": "6.5"
-	},
-	"Nodejs": {
-		"Version": "20",
-		"Debug": "enabled"
-	},
-	"OS": [
-		{
-			"Platform": "mac",
-			"MinimumVersion": "12"
-		}
-	],
-	"Actions": [
-		{
-			"UUID": "com.sneakytowelsuit.herdr-deck.key",
-			"Name": "herdr Agent",
-			"Icon": "imgs/actions/key",
-			"Tooltip": "Shows an agent's status. Press to focus that session. Place it on every key — the daemon decides what each one shows.",
-			"Controllers": ["Keypad"],
-			"UserTitleEnabled": false,
-			"DisableAutomaticStates": true,
-			"SupportedInMultiActions": false,
-			"States": [
-				{
-					"Image": "imgs/actions/key-state",
-					"TitleAlignment": "middle",
-					"ShowTitle": false
-				}
-			]
-		},
-		{
-			"UUID": "com.sneakytowelsuit.herdr-deck.dial",
-			"Name": "herdr Dial",
-			"Icon": "imgs/actions/dial",
-			"Tooltip": "Rotate to scrub a list of agents or workspaces; press to focus the selection.",
-			"Controllers": ["Encoder"],
-			"UserTitleEnabled": false,
-			"DisableAutomaticStates": true,
-			"SupportedInMultiActions": false,
-			"Encoder": {
-				"Icon": "imgs/actions/dial-encoder",
-				"StackColor": "#B4242A",
-				"TriggerDescription": {
-					"Rotate": "Scrub agents",
-					"Push": "Focus selection",
-					"Touch": "Focus selection"
-				}
-			},
-			"States": [
-				{
-					"Image": "imgs/actions/key-state",
-					"ShowTitle": false
-				}
-			]
-		}
-	]
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.sneakytowelsuit.herdr-deck",
+  "Name": "herdr-deck",
+  "Version": "0.1.0.0",
+  "Author": "SneakyTowelSuit",
+  "Description": "Shows the status of your herdr coding agents on the deck, and focuses a session when it needs input. Requires the herdr-deck daemon.",
+  "Category": "herdr-deck",
+  "CategoryIcon": "imgs/category",
+  "Icon": "imgs/plugin",
+  "URL": "https://sneakytowelsuit.github.io/herdr-deck/",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.5"
+  },
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "enabled"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12"
+    }
+  ],
+  "Actions": [
+    {
+      "UUID": "com.sneakytowelsuit.herdr-deck.key",
+      "Name": "herdr Agent",
+      "Icon": "imgs/actions/key",
+      "Tooltip": "Shows an agent's status. Press to focus that session. Place it on every key \u2014 the daemon decides what each one shows.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "SupportedInMultiActions": false,
+      "States": [
+        {
+          "Image": "imgs/actions/key-state",
+          "TitleAlignment": "middle",
+          "ShowTitle": false
+        }
+      ]
+    },
+    {
+      "UUID": "com.sneakytowelsuit.herdr-deck.dial",
+      "Name": "herdr Dial",
+      "Icon": "imgs/actions/dial",
+      "Tooltip": "Rotate to scrub a list of agents or workspaces; press to focus the selection.",
+      "Controllers": [
+        "Encoder"
+      ],
+      "UserTitleEnabled": false,
+      "DisableAutomaticStates": true,
+      "SupportedInMultiActions": false,
+      "Encoder": {
+        "Icon": "imgs/actions/dial-encoder",
+        "StackColor": "#B4242A",
+        "TriggerDescription": {
+          "Rotate": "Scrub agents",
+          "Push": "Focus selection",
+          "Touch": "Focus selection"
+        },
+        "layout": "layouts/dial.json"
+      },
+      "States": [
+        {
+          "Image": "imgs/actions/key-state",
+          "ShowTitle": false
+        }
+      ]
+    }
+  ]
 }
