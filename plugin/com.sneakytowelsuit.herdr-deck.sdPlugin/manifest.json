@@ -58,7 +58,8 @@
 					"Rotate": "Scrub agents",
 					"Push": "Focus selection",
 					"Touch": "Focus selection"
-				}
+				},
+				"layout": "layouts/dial.json"
 			},
 			"States": [
 				{
