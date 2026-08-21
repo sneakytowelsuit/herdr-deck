@@ -1300,7 +1300,7 @@ impl<'a> ResolvedDeck<'a> {
             ScrubTarget::Agents => self
                 .agent_at(cursor)
                 .map(|a| (a.label().to_string(), Some(a.agent_status)))
-                .unwrap_or_else(|| ("—".to_string(), None)),
+                .unwrap_or_else(|| ("no agents".to_string(), None)),
             ScrubTarget::Attention => self
                 .needing_attention()
                 .nth(cursor)
@@ -1311,7 +1311,7 @@ impl<'a> ResolvedDeck<'a> {
                 .workspaces
                 .get(cursor)
                 .map(|w| (w.label().to_string(), Some(w.agent_status)))
-                .unwrap_or_else(|| ("—".to_string(), None)),
+                .unwrap_or_else(|| ("no spaces".to_string(), None)),
             ScrubTarget::Tabs => self
                 .state
                 .tabs
@@ -1322,7 +1322,7 @@ impl<'a> ResolvedDeck<'a> {
                         Some(t.agent_status),
                     )
                 })
-                .unwrap_or_else(|| ("—".to_string(), None)),
+                .unwrap_or_else(|| ("no tabs".to_string(), None)),
             // No status: a worktree is a checkout, not something that can be blocked. Handing the
             // strip a colour here would be inventing a state herdr never reported.
             ScrubTarget::Worktrees => self
@@ -1330,7 +1330,7 @@ impl<'a> ResolvedDeck<'a> {
                 .worktrees
                 .get(cursor)
                 .map(|tree| (tree.label().to_string(), None))
-                .unwrap_or_else(|| ("—".to_string(), None)),
+                .unwrap_or_else(|| ("no worktrees".to_string(), None)),
         };
         (target.label().to_string(), value, status)
     }
@@ -3300,5 +3300,40 @@ mod tests {
             Some("payments-api"),
             "a naive split on `/` would hand back an empty name and fall through to the id"
         );
+    }
+
+    /// A dial whose list is empty used to read `—`, which is indistinguishable from a dial that
+    /// is broken, still loading, or bound to nothing. On real hardware that made the dials hard
+    /// to trust: you could turn one and not know whether it had done nothing or was dead. Every
+    /// scrub target must say what is empty — the attention dial already said "all clear", and the
+    /// others now match it.
+    #[test]
+    fn an_empty_dial_says_what_is_empty_rather_than_drawing_a_dash() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let state = state_with(vec![]);
+        let acked = Acknowledged::default();
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Page::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
+        for dial in 0..profile.dials.len() {
+            let (title, value, _) = deck.dial_feedback(dial);
+            if title.is_empty() {
+                continue; // not a scrub dial
+            }
+            assert!(
+                !value.contains('\u{2014}'),
+                "dial `{title}` renders a bare dash for an empty list, which reads as broken"
+            );
+            assert!(
+                !value.trim().is_empty(),
+                "dial `{title}` renders nothing at all for an empty list"
+            );
+        }
     }
 }
