@@ -26,7 +26,7 @@
 //! viewer, not just `git diff --stat` — before committing; `UPDATE_GOLDEN` will happily "fix" a
 //! genuine regression by baking it in as the new expectation.
 
-use herdr_deck_core::render::{KeyGlyph, Tile, TileRenderer};
+use herdr_deck_core::render::{KeyGlyph, SummaryMood, Tile, TileRenderer};
 use herdr_deck_core::state::WaitBucket;
 use herdr_deck_core::theme::Theme;
 use herdr_deck_herdr::wire::{AgentStatus, PaneDirection};
@@ -222,6 +222,7 @@ fn attention_with_agents_waiting_pins_the_alert_palette() {
     let tile = Tile::Attention {
         count: 3,
         away: false,
+        mood: SummaryMood::Blocked,
     };
     assert_key_matches_golden("attention_waiting", &tile, 120);
 }
@@ -231,6 +232,7 @@ fn attention_with_nothing_waiting_pins_the_all_clear_palette() {
     let tile = Tile::Attention {
         count: 0,
         away: false,
+        mood: SummaryMood::Clear,
     };
     assert_key_matches_golden("attention_all_clear", &tile, 120);
 }
@@ -243,6 +245,7 @@ fn the_attention_key_pins_the_way_home_it_offers_from_another_page() {
     let tile = Tile::Attention {
         count: 0,
         away: true,
+        mood: SummaryMood::Clear,
     };
     assert_key_matches_golden("attention_away", &tile, 120);
 }
@@ -596,4 +599,27 @@ fn the_worktree_you_are_actually_in_pins_the_same_ring_a_focused_agent_wears() {
         focused: true,
     };
     assert_key_matches_golden("worktree_focused_120", &tile, 120);
+}
+
+#[test]
+fn the_summary_key_is_green_and_counts_the_session_when_everything_is_running() {
+    // Nothing wants you and work is happening: the key stops reading "all clear" — which said
+    // nothing about whether anything was alive — and says how many agents are running.
+    let tile = Tile::Attention {
+        count: 4,
+        away: false,
+        mood: SummaryMood::Working,
+    };
+    assert_key_matches_golden("attention_working", &tile, 120);
+}
+
+#[test]
+fn the_summary_key_wears_the_done_palette_when_work_is_finished_and_unseen() {
+    // Done is still an attention state, so it counts what is waiting rather than the session.
+    let tile = Tile::Attention {
+        count: 2,
+        away: false,
+        mood: SummaryMood::Done,
+    };
+    assert_key_matches_golden("attention_done", &tile, 120);
 }

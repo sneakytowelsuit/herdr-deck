@@ -742,8 +742,15 @@ mod tests {
             .iter()
             .position(|k| *k == herdr_deck_core::layout::KeyBinding::Attention)
             .expect("this profile has an attention key");
+        // The key reports the session when nothing is waiting — "3 working" rather than a bare
+        // zero — so the raw number is no longer the size of the attention queue. These tests mean
+        // the queue, and only the two attention moods carry it.
         match session.tile_at(index, state) {
-            Tile::Attention { count, .. } => count,
+            Tile::Attention { count, mood, .. } => match mood {
+                herdr_deck_core::render::SummaryMood::Blocked
+                | herdr_deck_core::render::SummaryMood::Done => count,
+                _ => 0,
+            },
             other => panic!("expected the attention tile, got {other:?}"),
         }
     }

@@ -34,6 +34,32 @@ press.
 It also means the count is visible from every page. Wander off to the panes page and something
 blocks, and the key goes red and says so where you can see it.
 
+### What its number means
+
+The key answers the most urgent question it can, and its colour, number and caption always agree:
+
+| When | Colour | The number is | Caption |
+|---|---|---|---|
+| Anything is blocked | red | how many are blocked | `need you` |
+| Nothing blocked, something finished unseen | amber | how many are waiting | `done` |
+| Nothing waiting, something running | green | how many agents there are | `working` |
+| Nothing waiting, nothing running | dim | how many agents there are | `agents` |
+
+Blocked outranks everything else, always. The rest exists because a key that only ever read `0`
+was ambiguous between "nothing needs you" and "nothing is happening" — two very different things
+to learn at a glance.
+
+### Spare keys carry the rest
+
+When you have fewer agents than the deck has room for, the leftover keys stop being blank and
+each name a state with a count: `2 working`, `1 idle`. They never repeat what the summary key is
+already saying, they skip any state nobody is in, and pressing one takes you to the first agent in
+that state.
+
+Start more agents and those keys go back to being agents, one at a time, until the summary key is
+carrying the whole story again. Agents always keep the same slots, so nothing you were reaching
+for moves.
+
 **The page key** says which page you are on, in the size it is meant to be read at, with the page
 the next press goes to underneath it in smaller type. You never have to count presses to work out
 where you are. When a page is longer than the keys showing it, this key also carries `2/3` in its
@@ -69,7 +95,7 @@ glyph:
 |---|---|---|---|
 | `blocked` | red | `!` | Needs input, approval, or a decision — **now**. |
 | `done` | amber | `✓` | Finished, and you have not looked at it yet. |
-| `working` | dark, blue accent | `▶` | Running. |
+| `working` | green | `▶` | Running. |
 | `idle` | dim | `·` | Finished or waiting, and already seen. |
 | `unknown` | dim | `?` | herdr could not classify it. |
 | *acknowledged* | dim | `×` | You dismissed it with a long press; see [attention](../concepts/attention.md). |
