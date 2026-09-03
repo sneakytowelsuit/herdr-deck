@@ -51,10 +51,15 @@ impl Theme {
                 glyph: "✓",
                 emphatic: true,
             },
+            // Working used to sit on #16181D, three points away from idle's #131418 — a
+            // difference that survives a screenshot and does not survive a glance at a deck on a
+            // desk. It now carries a green of its own, so "running" and "sitting there" are told
+            // apart across the room. Still not emphatic: six green keys must never shout louder
+            // than one red one, and green is deliberately the calmest of the three lit states.
             AgentStatus::Working => StatusStyle {
-                background: "#16181D",
-                foreground: "#E6E8EC",
-                accent: "#4C9AFF",
+                background: "#123322",
+                foreground: "#E6F5EC",
+                accent: "#4ADE80",
                 glyph: "▶",
                 emphatic: false,
             },

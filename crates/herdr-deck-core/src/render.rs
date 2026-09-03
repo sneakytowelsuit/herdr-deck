@@ -66,13 +66,22 @@ pub enum Tile {
         open: bool,
         focused: bool,
     },
-    /// "N agents want you" — dark when nothing does.
+    /// What the session is doing, in one key.
+    ///
+    /// Blocked wins whenever anything is blocked — that is the sentence this deck exists to say,
+    /// and nothing may bury it. With nothing blocked the key stops being dead space and reports
+    /// the next thing worth knowing: work finished and unseen, then work in progress, then the
+    /// plain agent count. [`SummaryMood`] carries which of those it is, so the colour, the number
+    /// and the caption cannot disagree with each other.
     ///
     /// `away` says the deck is showing something other than the top of the agents page, which is
-    /// the only time this key's second job — bringing you back — is worth spelling out. On the
-    /// agents page with nothing waiting, "all clear" is the whole truth and an offer to go
-    /// somewhere you already are would be noise.
-    Attention { count: usize, away: bool },
+    /// the only time this key's second job — bringing you back — is worth spelling out. Standing
+    /// on the agents page, an offer to go somewhere you already are would be noise.
+    Attention {
+        count: usize,
+        away: bool,
+        mood: SummaryMood,
+    },
     /// Which page the deck is showing, and which one the next press goes to.
     ///
     /// `next` is `None` when there is nowhere else to go — a session with one workspace, no
@@ -100,10 +109,34 @@ pub enum Tile {
         /// rather than disappearing, so the layout does not rearrange itself under the user.
         enabled: bool,
     },
+    /// "4 working" — a whole state of the session on a key the agents are not using.
+    ///
+    /// These exist only in the space left over on the agents page. With few agents there are keys
+    /// doing nothing, and a blank key is worth less than one telling you what the session is
+    /// doing; as agents are started they take those keys back, one at a time, until the summary
+    /// key is carrying the whole story again. Nothing moves that a user was relying on: the
+    /// agents always occupy the same slots, and the chips only ever fill from the end.
+    StateChip { status: AgentStatus, count: usize },
     /// A slot with nothing bound to it.
     Empty,
     /// herdr is unreachable.
     Offline { message: String },
+}
+
+/// What the summary key is reporting, which decides its colour, its number and its words.
+///
+/// Separated from the count so the three can never disagree: a red key reading "working" would be
+/// worse than no key at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SummaryMood {
+    /// At least one agent needs a decision. Always wins.
+    Blocked,
+    /// Nothing is blocked, but something finished and has not been looked at.
+    Done,
+    /// Everything that exists is running. Nothing to do, and worth saying so plainly.
+    Working,
+    /// Nothing is waiting and nothing is running: the number is simply how many agents there are.
+    Clear,
 }
 
 /// The shape a command key wears.
@@ -295,7 +328,8 @@ impl TileRenderer {
                     waiting: None,
                 },
             ),
-            Tile::Attention { count, away } => self.attention_svg(s, *count, *away),
+            Tile::Attention { count, away, mood } => self.attention_svg(s, *count, *away, *mood),
+            Tile::StateChip { status, count } => self.state_chip_svg(s, *status, *count),
             Tile::Page {
                 current,
                 next,
@@ -454,24 +488,40 @@ impl TileRenderer {
         )
     }
 
-    fn attention_svg(&self, s: f32, count: usize, away: bool) -> String {
-        let (bg, fg, accent) = if count == 0 {
-            (
+    fn attention_svg(&self, s: f32, count: usize, away: bool, mood: SummaryMood) -> String {
+        // Colour follows the mood, never the raw count, so the key cannot read "working" in red.
+        // Clear borrows the neutral background rather than a status colour: nothing is happening,
+        // and a lit key claiming otherwise is how a glanceable surface stops being trusted.
+        let (bg, fg, accent) = match mood {
+            SummaryMood::Clear => (
                 self.theme.neutral_background(),
                 self.theme.dim_foreground(),
                 self.theme.dim_foreground(),
-            )
-        } else {
-            let style = self.theme.status(AgentStatus::Blocked);
-            (style.background, style.foreground, style.accent)
+            ),
+            SummaryMood::Blocked => {
+                let style = self.theme.status(AgentStatus::Blocked);
+                (style.background, style.foreground, style.accent)
+            }
+            SummaryMood::Done => {
+                let style = self.theme.status(AgentStatus::Done);
+                (style.background, style.foreground, style.accent)
+            }
+            SummaryMood::Working => {
+                let style = self.theme.status(AgentStatus::Working);
+                (style.background, style.foreground, style.accent)
+            }
         };
-        // Three captions for one key, because it has one meaning with two halves and which half
-        // matters depends on where you are. Something waiting always wins: that is the sentence
-        // this deck exists to say.
-        let caption = match (count, away) {
-            (0, false) => "all clear",
-            (0, true) => "◀ agents",
-            _ => "need you",
+        // The caption is what keeps this readable without colour, and it names the state rather
+        // than the count: "3" over "working" is a sentence, "3" alone is a riddle. Getting back to
+        // the agents page still wins the caption when there is nothing else to say, because that
+        // is the only time the key's second job is worth spelling out.
+        let caption = match (mood, away) {
+            (SummaryMood::Blocked, _) => "need you",
+            (SummaryMood::Done, _) => "done",
+            (SummaryMood::Working, _) => "working",
+            (SummaryMood::Clear, true) => "◀ agents",
+            (SummaryMood::Clear, false) if count == 0 => "all clear",
+            (SummaryMood::Clear, false) => "agents",
         };
         format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
@@ -491,6 +541,41 @@ impl TileRenderer {
             cfs = s * 0.125,
             accent = accent,
             caption = caption,
+        )
+    }
+
+    /// A count over the name of the state it counts, in that state's own palette.
+    ///
+    /// Deliberately quieter than an agent tile — smaller number, no glyph badge — because a chip
+    /// is a summary and an agent tile is a thing you can act on. They sit next to each other, and
+    /// the difference has to be legible without reading either.
+    fn state_chip_svg(&self, s: f32, status: AgentStatus, count: usize) -> String {
+        let style = self.theme.status(status);
+        let label = match status {
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Working => "working",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Unknown => "unknown",
+        };
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
+<rect width="{s}" height="{s}" fill="{bg}"/>
+<text x="{cx:.2}" y="{ny:.2}" font-family="{font}" font-size="{nfs:.2}" font-weight="bold" fill="{fg}" text-anchor="middle">{count}</text>
+<text x="{cx:.2}" y="{cy:.2}" font-family="{font}" font-size="{cfs:.2}" fill="{accent}" text-anchor="middle">{label}</text>
+</svg>"##,
+            s = s,
+            bg = style.background,
+            cx = s / 2.0,
+            ny = s * 0.50,
+            font = FONT_FAMILY,
+            nfs = s * 0.34,
+            fg = style.foreground,
+            count = count,
+            cy = s * 0.74,
+            cfs = s * 0.12,
+            accent = style.accent,
+            label = label,
         )
     }
 
@@ -1103,10 +1188,12 @@ mod tests {
             Tile::Attention {
                 count: 3,
                 away: false,
+                mood: SummaryMood::Blocked,
             },
             Tile::Attention {
                 count: 0,
                 away: false,
+                mood: SummaryMood::Clear,
             },
             Tile::Label {
                 label: "agents".into(),

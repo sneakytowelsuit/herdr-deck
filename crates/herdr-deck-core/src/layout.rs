@@ -15,10 +15,10 @@
 use crate::capabilities::DeckCapabilities;
 use crate::command::DeckCommand;
 use crate::config::{Config, Presets};
-use crate::render::{KeyGlyph, Tile};
+use crate::render::{KeyGlyph, SummaryMood, Tile};
 use crate::state::{Acknowledged, DeckState};
 use herdr_deck_herdr::wire::{
-    AgentInfo, CreateSpec, PaneDirection, SplitDirection, WorktreeInfo, ZoomMode,
+    AgentInfo, AgentStatus, CreateSpec, PaneDirection, SplitDirection, WorktreeInfo, ZoomMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -903,12 +903,17 @@ impl<'a> ResolvedDeck<'a> {
                 },
                 self.removable_worktree().is_some(),
             ),
-            KeyBinding::Attention => Tile::Attention {
-                count: self.attention_count(),
-                // The key is also the way back, and on a page that is not the agents page it has
-                // to say so — a key whose second job is invisible is a key nobody presses for it.
-                away: self.page != Page::Agents || self.screen > 0,
-            },
+            KeyBinding::Attention => {
+                let (count, mood) = self.summary();
+                Tile::Attention {
+                    count,
+                    mood,
+                    // The key is also the way back, and on a page that is not the agents page it
+                    // has to say so — a key whose second job is invisible is a key nobody presses
+                    // for it.
+                    away: self.page != Page::Agents || self.screen > 0,
+                }
+            }
             // Where you are, in the size it is read at, and where the next press goes underneath
             // it. Naming only the destination — which is what this key used to do — answers
             // "what happens if I press this" and leaves "which page am I on" to be worked out by
@@ -944,7 +949,10 @@ impl<'a> ResolvedDeck<'a> {
             Page::Agents => self
                 .agent_at(index)
                 .map(|agent| agent_tile(self.state, agent, self.acked))
-                .unwrap_or(Tile::Empty),
+                .unwrap_or_else(|| match self.spare_chip(index) {
+                    Some((status, count)) => Tile::StateChip { status, count },
+                    None => Tile::Empty,
+                }),
             Page::Spaces => self
                 .state
                 .workspaces
@@ -1125,6 +1133,19 @@ impl<'a> ResolvedDeck<'a> {
                 .map(|a| SlotAction::FocusAgent {
                     terminal_id: a.terminal_id.clone(),
                 })
+                // A chip is pressable, and presses like the agent tile beside it: it takes you to
+                // the first agent in that state. A key that shows a number and does nothing when
+                // pressed is a key people stop believing.
+                .or_else(|| {
+                    let (status, _) = self.spare_chip(index)?;
+                    self.state
+                        .agents
+                        .iter()
+                        .find(|a| a.agent_status == status)
+                        .map(|a| SlotAction::FocusAgent {
+                            terminal_id: a.terminal_id.clone(),
+                        })
+                })
                 .unwrap_or(SlotAction::None),
             Page::Spaces => self
                 .state
@@ -1285,6 +1306,77 @@ impl<'a> ResolvedDeck<'a> {
     }
 
     /// Title and value for the touchstrip segment above `dial`.
+    /// Which state chip, if any, belongs in the `index`th slot of the agents page.
+    ///
+    /// Only the slots past the last agent, and only on the first screen: a chip appearing in the
+    /// middle of a paged list would put a summary where the user is expecting the next agent. The
+    /// order is fixed — blocked, done, working, idle — so a chip never changes meaning under a
+    /// finger as counts move, and empty states are skipped because "0 blocked" is a fact nobody
+    /// needs a key for.
+    fn spare_chip(&self, index: usize) -> Option<(AgentStatus, usize)> {
+        if self.screen > 0 {
+            return None;
+        }
+        let agents = self.page_len(Page::Agents);
+        let slot = index.checked_sub(agents)?;
+        let counts = self.state.status_counts();
+        // Whatever the summary key is already saying, the chips do not repeat. Two red keys side
+        // by side both reading "1" is worse than one: it reads as two problems, and the second
+        // key was meant to be telling you something you did not already know.
+        let spoken_for = match self.summary().1 {
+            SummaryMood::Blocked => Some(AgentStatus::Blocked),
+            SummaryMood::Done => Some(AgentStatus::Done),
+            SummaryMood::Working => Some(AgentStatus::Working),
+            SummaryMood::Clear => None,
+        };
+        [
+            (AgentStatus::Blocked, counts.blocked),
+            (AgentStatus::Done, counts.done),
+            (AgentStatus::Working, counts.working),
+            (AgentStatus::Idle, counts.idle),
+        ]
+        .into_iter()
+        .filter(|(status, n)| *n > 0 && Some(*status) != spoken_for)
+        .nth(slot)
+    }
+
+    /// What the summary key reports, as a count and the mood that explains it.
+    ///
+    /// Strictly ordered, because the whole value of one key is that it answers "is anything
+    /// wrong" before you have finished looking at it:
+    ///
+    /// 1. **Blocked** — an agent needs a decision. Nothing may outrank this.
+    /// 2. **Done** — nothing is blocked, but work finished and nobody has looked. Still an
+    ///    attention state, so it still counts itself rather than the session.
+    /// 3. **Working** — nothing wants you and something is running. The count is the whole
+    ///    session, because "3 working" and "3 agents, all running" are the same sentence.
+    /// 4. **Clear** — nothing waiting, nothing running: the count is simply how many agents exist.
+    ///
+    /// Acknowledged agents are excluded from the first two exactly as they are from the attention
+    /// queue: dismissing an agent has to actually dismiss it, or the gesture is a lie.
+    fn summary(&self) -> (usize, SummaryMood) {
+        let waiting = self.attention_count();
+        if waiting > 0 {
+            let blocked = self
+                .state
+                .attention_order_with(self.acked)
+                .into_iter()
+                .filter(|a| a.agent_status == AgentStatus::Blocked)
+                .count();
+            return if blocked > 0 {
+                (blocked, SummaryMood::Blocked)
+            } else {
+                (waiting, SummaryMood::Done)
+            };
+        }
+        let counts = self.state.status_counts();
+        if counts.working > 0 {
+            (counts.total(), SummaryMood::Working)
+        } else {
+            (counts.total(), SummaryMood::Clear)
+        }
+    }
+
     pub fn dial_feedback(
         &self,
         dial: usize,
@@ -2455,7 +2547,8 @@ mod tests {
             deck.tile(next_key),
             Tile::Attention {
                 count: 1,
-                away: false
+                away: false,
+                mood: SummaryMood::Blocked
             }
         );
         assert_eq!(
@@ -2691,11 +2784,15 @@ mod tests {
             deck.key_action(next_key),
             SlotAction::Attention { terminal_id: None }
         );
+        // With nothing asking, the key reports the session rather than a bare zero: one agent
+        // exists and it is quiet. A "0" here used to be ambiguous between "nothing needs you" and
+        // "nothing is running", which are very different things to learn at a glance.
         assert_eq!(
             deck.tile(next_key),
             Tile::Attention {
-                count: 0,
-                away: false
+                count: 1,
+                away: false,
+                mood: SummaryMood::Clear
             }
         );
     }
@@ -3146,7 +3243,7 @@ mod tests {
         for page in Page::ALL {
             let deck = ResolvedDeck::new(&profile, &state, page, 0, Selection::default(), &acked);
             match deck.tile(home) {
-                Tile::Attention { count, away } => {
+                Tile::Attention { count, away, .. } => {
                     assert_eq!(count, 1, "the count must survive leaving the agents page");
                     assert_eq!(
                         away,
@@ -3334,6 +3431,140 @@ mod tests {
                 !value.trim().is_empty(),
                 "dial `{title}` renders nothing at all for an empty list"
             );
+        }
+    }
+
+    /// The summary key's whole job is to be readable in a glance, and these are the four things
+    /// it can say. Blocked outranking everything is the product's core promise.
+    #[test]
+    fn the_summary_key_says_blocked_first_then_done_then_working_then_the_plain_count() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let acked = Acknowledged::default();
+        let summary = |agents: Vec<AgentInfo>| {
+            let state = state_with(agents);
+            let deck = ResolvedDeck::new(
+                &profile,
+                &state,
+                Page::Agents,
+                0,
+                Selection::default(),
+                &acked,
+            );
+            deck.summary()
+        };
+
+        // Blocked wins even while other work is finished and running around it.
+        assert_eq!(
+            summary(vec![
+                agent("a", AgentStatus::Blocked, 1),
+                agent("b", AgentStatus::Done, 2),
+                agent("c", AgentStatus::Working, 3),
+            ]),
+            (1, SummaryMood::Blocked)
+        );
+        // Nothing blocked, but something finished and unseen: still a queue, still counts itself.
+        assert_eq!(
+            summary(vec![
+                agent("a", AgentStatus::Done, 1),
+                agent("b", AgentStatus::Working, 2),
+            ]),
+            (1, SummaryMood::Done)
+        );
+        // Nothing wants you and work is happening: the number becomes the session.
+        assert_eq!(
+            summary(vec![
+                agent("a", AgentStatus::Working, 1),
+                agent("b", AgentStatus::Idle, 2),
+            ]),
+            (2, SummaryMood::Working)
+        );
+        // Nothing waiting and nothing running: how many agents there are, which is the only
+        // useful thing left to say.
+        assert_eq!(
+            summary(vec![
+                agent("a", AgentStatus::Idle, 1),
+                agent("b", AgentStatus::Idle, 2),
+            ]),
+            (2, SummaryMood::Clear)
+        );
+    }
+
+    /// The point of the chips: keys the agents are not using say what the session is doing, and
+    /// they give those keys back as agents are started.
+    #[test]
+    fn spare_keys_carry_state_counts_and_hand_them_back_as_agents_take_the_slots() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let acked = Acknowledged::default();
+        let chips = |agents: Vec<AgentInfo>| {
+            let state = state_with(agents);
+            let deck = ResolvedDeck::new(
+                &profile,
+                &state,
+                Page::Agents,
+                0,
+                Selection::default(),
+                &acked,
+            );
+            (0..16)
+                .filter_map(|i| deck.spare_chip(i))
+                .collect::<Vec<_>>()
+        };
+
+        // Working and idle agents: the summary key is already saying "working", so the chips say
+        // what it is not. Repeating it would spend a key telling you what the key beside it just
+        // told you, in the same colour.
+        assert_eq!(
+            chips(vec![
+                agent("a", AgentStatus::Working, 1),
+                agent("b", AgentStatus::Idle, 2),
+            ]),
+            vec![(AgentStatus::Idle, 1)]
+        );
+        // The same rule at the sharp end: with something blocked the summary carries it, and no
+        // chip repeats it in the same red immediately next to it.
+        assert!(chips(vec![
+            agent("a", AgentStatus::Blocked, 1),
+            agent("b", AgentStatus::Idle, 2),
+        ])
+        .iter()
+        .all(|(status, _)| *status != AgentStatus::Blocked));
+        // One working agent is entirely described by the summary key: no chip earns a slot.
+        assert!(chips(vec![agent("a", AgentStatus::Working, 1)]).is_empty());
+        // No agents, nothing to summarise.
+        assert!(chips(vec![]).is_empty());
+    }
+
+    /// A chip that did nothing when pressed would teach people the summaries are decoration.
+    #[test]
+    fn pressing_a_state_chip_takes_you_to_the_first_agent_in_that_state() {
+        let caps = DeckModel::Plus.capabilities();
+        let profile = Profile::for_capabilities(&caps);
+        let acked = Acknowledged::default();
+        let state = state_with(vec![
+            agent("busy", AgentStatus::Working, 1),
+            agent("quiet", AgentStatus::Idle, 2),
+        ]);
+        let deck = ResolvedDeck::new(
+            &profile,
+            &state,
+            Page::Agents,
+            0,
+            Selection::default(),
+            &acked,
+        );
+        let slot = (0..16)
+            .find(|i| matches!(deck.spare_chip(*i), Some((AgentStatus::Idle, _))))
+            .expect("an idle chip is on a spare key");
+        match deck.entry_action(Page::Agents, slot) {
+            SlotAction::FocusAgent { terminal_id } => {
+                let agent = state
+                    .agent_by_terminal_id(&terminal_id)
+                    .expect("a real agent");
+                assert_eq!(agent.agent_status, AgentStatus::Idle);
+            }
+            other => panic!("a chip must focus, got {other:?}"),
         }
     }
 }

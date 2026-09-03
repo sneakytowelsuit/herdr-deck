@@ -460,24 +460,34 @@ async fn a_change_in_herdr_repaints_the_deck_unasked_and_resends_only_the_keys_t
     let before = key_images(&greeting);
 
     // The second agent starts working. It keeps its place in the attention order (blocked still
-    // sorts first) and it is not an attention state, so exactly one tile can have changed.
+    // sorts first), so its own tile changes — and so does anything summarising the session, since
+    // the spare keys carry per-state counts and one of those counts just moved.
     mock.serve_session(&two_agents(AgentStatus::Working)).await;
 
     // Nobody asked for this: the frontend is not polling, the daemon pushes.
     let repaint = frontend.read(1).await;
-    let after = key_images(&repaint);
-    assert_eq!(after.len(), 1, "expected one key image, got {repaint:?}");
-    assert_eq!(after[0].0, 1, "key 1 is the agent whose status changed");
-    assert_ne!(
-        after[0].1, before[1].1,
-        "the repainted key should carry a different image"
-    );
+    let mut after = key_images(&repaint);
+    after.extend(key_images(&frontend.drain_to_pong().await));
 
+    let changed: Vec<usize> = after.iter().map(|(index, _)| *index).collect();
     assert!(
-        frontend.drain_to_pong().await.is_empty(),
-        "keys that did not change must not be resent — the deck is a serial device and \
-         redundant traffic shows up as lag"
+        changed.contains(&1),
+        "key 1 is the agent whose status changed, got {changed:?}"
     );
+    assert!(
+        !changed.contains(&0),
+        "the other agent did not change and must not be resent — the deck is a serial device \
+         and redundant traffic shows up as lag, got {changed:?}"
+    );
+    // The invariant is not "one key" but "no key whose picture is the same": every repaint here
+    // has to be carrying something new.
+    for (index, image) in &after {
+        assert_ne!(
+            Some(image),
+            before.iter().find(|(i, _)| i == index).map(|(_, img)| img),
+            "key {index} was resent with the picture it already had"
+        );
+    }
 }
 
 #[tokio::test]
