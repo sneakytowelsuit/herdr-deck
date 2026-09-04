@@ -173,9 +173,7 @@ fn check_deck(detection: &Detection) -> Check {
 #[cfg(target_os = "macos")]
 fn check_streamdeck_plugin() -> Option<Check> {
     const UUID: &str = "com.sneakytowelsuit.herdr-deck";
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-        return None;
-    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let linked = home
         .join("Library/Application Support/com.elgato.StreamDeck/Plugins")
         .join(format!("{UUID}.sdPlugin"));
