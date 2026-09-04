@@ -44,6 +44,10 @@ herdr plugin action invoke install --plugin sneakytowelsuit.herdr-deck
 herdr-deck doctor
 ```
 
+That is the whole install. On macOS the first command also builds the Stream Deck plugin and links
+it into Elgato's app; on Linux the daemon drives the deck itself and only needs a udev rule, which
+`doctor` will tell you about. Re-running the first command is the update.
+
 On macOS you also install the Stream Deck plugin; on Linux you add a udev rule. Both are covered
 in the [install guide](https://sneakytowelsuit.github.io/herdr-deck/getting-started/install.html),
 and `herdr-deck doctor` tells you if either is missing.

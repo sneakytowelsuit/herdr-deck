@@ -141,6 +141,9 @@ pub async fn run(config_path: &Path, config: &Config, session: Option<&str>) -> 
         .checks
         .push(check_daemon_socket(&daemon_socket_path()).await);
     report.checks.push(check_deck(&hardware::detect()));
+    if let Some(check) = check_streamdeck_plugin() {
+        report.checks.push(check);
+    }
     report.checks.extend(check_focus(config));
     report
 }
@@ -157,6 +160,43 @@ fn check_deck(detection: &Detection) -> Check {
         detail: detection.summary(),
         remedy: detection.remedy(),
     }
+}
+
+/// On macOS, is the Stream Deck plugin actually linked into Elgato's app?
+///
+/// Installing links it automatically, but that step is deliberately best-effort — it must never
+/// abort the install and leave the user with no daemon. So something has to say when it was
+/// skipped, or the failure mode is a deck that draws nothing and an install that reported success.
+///
+/// There is no Linux equivalent: `herdr-deckd` drives the deck over HID itself there, and the
+/// Elgato app does not exist for it.
+#[cfg(target_os = "macos")]
+fn check_streamdeck_plugin() -> Option<Check> {
+    const UUID: &str = "com.sneakytowelsuit.herdr-deck";
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let linked = home
+        .join("Library/Application Support/com.elgato.StreamDeck/Plugins")
+        .join(format!("{UUID}.sdPlugin"));
+    // `symlink_metadata`, not `exists`: a link pointing at a checkout that has since been removed
+    // is exactly the broken case worth reporting, and `exists` follows the link and calls it gone.
+    Some(match std::fs::symlink_metadata(&linked) {
+        Ok(_) => Check::ok(
+            "stream deck plugin",
+            format!("linked at {}", linked.display()),
+        ),
+        Err(_) => Check::warn(
+            "stream deck plugin",
+            "not linked into the Stream Deck app, so the deck will stay blank",
+            "Re-run `herdr plugin install sneakytowelsuit/herdr-deck --yes`, which builds and \
+             links it. If that reported a warning, it will say what was missing — usually Node or \
+             the Stream Deck app itself.",
+        ),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_streamdeck_plugin() -> Option<Check> {
+    None
 }
 
 fn check_config(path: &Path) -> Check {
