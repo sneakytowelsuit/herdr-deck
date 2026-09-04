@@ -17,8 +17,34 @@ herdr plugin install sneakytowelsuit/herdr-deck --yes
 herdr plugin action invoke install --plugin sneakytowelsuit.herdr-deck
 ```
 
-The second command writes the service unit and starts the daemon. Then follow the
-platform-specific step below.
+That is the whole install on both platforms. The first command builds the daemon and, **on
+macOS**, also builds the Stream Deck plugin and links it into Elgato's app; the second writes the
+service unit and starts the daemon. On Linux there is no Elgato app to link into — `herdr-deckd`
+drives the deck itself — so the first command has nothing extra to do, and only the udev rule
+below is left.
+
+### Updating
+
+The same first command again:
+
+```sh
+herdr plugin install sneakytowelsuit/herdr-deck --yes
+herdr plugin action invoke restart --plugin sneakytowelsuit.herdr-deck
+```
+
+herdr re-clones, rebuilds, and swaps the result into the same place. The Stream Deck plugin is
+*linked* rather than copied, so the app picks up the rebuilt code without being touched again.
+
+herdr has no `plugin update` command and does not check for new versions on its own — build steps
+run at install time and nowhere else — so this is the update, and it is a deliberate re-run rather
+than something that happens behind you.
+
+### If the Stream Deck step is skipped
+
+Linking is best effort: it will never abort the install and leave you with no daemon, which is the
+half that does the work. If Node or the Stream Deck app is missing it says so and carries on, and
+`herdr-deck doctor` reports `stream deck plugin: not linked` until you fix it and re-run the
+install.
 
 `invoke` is not optional: `herdr plugin action <something>` only understands `list` and `invoke`,
 and anything else prints the help text and exits without doing a thing — quietly enough to look
@@ -45,23 +71,23 @@ cargo build --release -p herdr-deckd -p herdr-deck-cli
 
 ## macOS
 
-The daemon does not talk to the hardware on macOS — Elgato's app owns the device — so you also
-need the Stream Deck plugin.
+The daemon does not talk to the hardware on macOS — Elgato's app owns the device — so a Stream
+Deck plugin does the drawing. Installing via herdr builds and links it for you; this section is
+what that automation does, and what to run if you are working from a source checkout.
 
-1. Build it:
+1. Build and link it:
 
    ```sh
-   cd plugin
-   npm install
-   npm run build
+   scripts/install-streamdeck-plugin.sh
    ```
 
-2. Double-click `plugin/com.sneakytowelsuit.herdr-deck.sdPlugin` to install it, or copy that
-   folder into
-   `~/Library/Application Support/com.elgato.StreamDeck/Plugins/`.
+   That builds the plugin and runs `streamdeck link`, which **symlinks** it into
+   `~/Library/Application Support/com.elgato.StreamDeck/Plugins/`. The symlink is the reason
+   updates need nothing more than a rebuild.
 
-3. In the Stream Deck app, drag **herdr Agent** onto every key you want herdr-deck to use, and
-   **herdr Dial** onto each dial.
+2. In the Stream Deck app, drag **herdr Agent** onto every key you want herdr-deck to use, and
+   **herdr Dial** onto each dial. These are two separate actions — placing the key action does
+   not give you the dials.
 
 You do not have to configure the keys. The daemon decides what each one shows, so a key placed
 anywhere just works.

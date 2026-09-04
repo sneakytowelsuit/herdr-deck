@@ -20,6 +20,14 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["cargo", "build", "--release", "-p", "herdr-deckd", "-p", "herdr-deck-cli"]
 
+# macOS only: build the Stream Deck plugin and link it into Elgato's app, so one install command
+# leaves nothing to do by hand. Linux has no Elgato app — the daemon drives the deck itself — and
+# the script exits cleanly there. It never fails the install: the daemon is the half that does the
+# work, and `herdr-deck doctor` reports anything the app side is missing.
+[[build]]
+platforms = ["macos"]
+command = ["scripts/install-streamdeck-plugin.sh"]
+
 # Install the service unit and start the daemon under the platform's service manager.
 [[actions]]
 id = "install"
